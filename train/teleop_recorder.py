@@ -142,8 +142,6 @@ class TeleopRecorder:
         # Window
         self._window_name = "RoArm Teleop"
 
-        self._arm.set_led(255)
-
     def _count_existing_episodes(self) -> int:
         """Zählt bereits vorhandene Episoden im Output-Verzeichnis."""
         count = 0
@@ -228,6 +226,9 @@ class TeleopRecorder:
         self._arm_state = ArmState(
             base_deg=0, shoulder_deg=0, elbow_deg=90, hand_deg=180, gripper_open=True
         )
+
+        self._arm.set_led(255)
+
         print("  ✓ Bereit")
 
         print("\n" + "=" * 60)
