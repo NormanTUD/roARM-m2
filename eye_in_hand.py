@@ -543,32 +543,48 @@ class EyeInHandController:
 
     def _center_over(self, target_class: str, max_iter: int = 12) -> bool:
         """
-        Iterativ über dem Objekt zentrieren.
+        Zentriert das Objekt in der Bildmitte.
         
-        Nutzt:
-        - Pixel-Offset für Y/Z-Korrektur (links/rechts, hoch/runter)
-        - Bounding-Box-Größe (gemittelt über N Frames) für X-Korrektur (näher/weiter)
-        - Größenänderung nach Bewegung → Feedback ob Richtung stimmt
+        Kamera schaut nach vorne:
+        - Objekt rechts im Bild → Base nach rechts drehen (b+)
+        - Objekt unten im Bild → Arm nach unten neigen (shoulder/elbow)
+        - Objekt zu klein (weit weg) → nach vorne fahren (X+)
+        
+        Nutzt RELATIVE Joint-Korrekturen statt absoluter Cartesian-Befehle!
         """
         
         # --- Parameter ---
-        TARGET_BB_HEIGHT = 200.0  # Ziel-Höhe der BBox in Pixeln (= "nah genug zum Greifen")
-        DEPTH_STEP_MM = 15.0     # Wie viel mm pro Schritt in X (vor/zurück)
-        SMOOTHING_FRAMES = 4     # Über wie viele Frames mitteln
-        MIN_MOVE_PX = 5.0        # Minimaler Offset bevor bewegt wird
+        TARGET_BB_HEIGHT = 200.0
+        SMOOTHING_FRAMES = 4
+        MIN_MOVE_PX = 8.0
         
-        prev_bb_height = None  # Für Richtungs-Feedback
+        # Umrechnungsfaktoren (KALIBRIEREN!)
+        # Wie viel Grad Base-Rotation pro Pixel horizontaler Offset
+        DEG_PER_PIXEL_H = 0.08  # ~0.08°/px bei 640px Breite ≈ ±25° FOV
+        # Wie viel Grad Shoulder-Neigung pro Pixel vertikaler Offset  
+        DEG_PER_PIXEL_V = 0.06
+        # Wie viel mm X-Bewegung pro Pixel Größen-Differenz
+        MM_PER_PIXEL_DEPTH = 0.15
+        
+        DAMPING = 0.5
+        
+        # Aktuelle Joint-Winkel tracken (starten bei Scan-Position)
+        cur_base = self._tracker.pos.base_deg
+        cur_shoulder = self._tracker.pos.shoulder_deg
+        cur_elbow = self._tracker.pos.elbow_deg
+        
+        prev_bb_height = None
         
         for i in range(max_iter):
-            # --- Stabile Detection: über mehrere Frames mitteln ---
+            # --- Stabile Detection über mehrere Frames ---
             centers = []
             bb_heights = []
             bb_widths = []
             
-            for _ in range(SMOOTHING_FRAMES * 2):  # Mehr Versuche als nötig
+            for _ in range(SMOOTHING_FRAMES * 3):
                 detections, key = self._update(
                     [target_class],
-                    f"Zentriere... (Iter {i+1}/{max_iter})"
+                    f"Zentriere (Iter {i+1}/{max_iter}) | B={cur_base:.1f} S={cur_shoulder:.1f} E={cur_elbow:.1f}"
                 )
                 if key == ord('q'):
                     return False
@@ -582,7 +598,7 @@ class EyeInHandController:
                 time.sleep(0.05)
             
             if len(centers) < 2:
-                _info(f"Iter {i+1}: Objekt verloren! ({len(centers)} Frames)")
+                _info(f"Iter {i+1}: Objekt verloren!")
                 time.sleep(0.5)
                 continue
             
@@ -598,83 +614,76 @@ class EyeInHandController:
             offset_px_y = avg_cy - (h / 2)   # positiv = unten im Bild
             pixel_dist = (offset_px_x**2 + offset_px_y**2) ** 0.5
             
-            # --- Tiefe (X) über BBox-Größe ---
-            # Große BBox = nah, kleine BBox = weit weg
+            # --- Tiefe über BBox ---
             depth_error = TARGET_BB_HEIGHT - avg_bb_h  # positiv = zu weit weg
             
-            _info(f"Iter {i+1}: Center=({offset_px_x:.0f},{offset_px_y:.0f})px, "
-                  f"BBox={avg_bb_w:.0f}x{avg_bb_h:.0f}px, "
-                  f"Dist={pixel_dist:.0f}px, DepthErr={depth_error:.0f}px")
+            _info(f"Iter {i+1}: Offset=({offset_px_x:.0f},{offset_px_y:.0f})px, "
+                  f"BBox={avg_bb_w:.0f}x{avg_bb_h:.0f}px, Dist={pixel_dist:.0f}px, "
+                  f"Depth={depth_error:+.0f}px")
             
-            # --- Prüfe ob zentriert UND nah genug ---
+            # --- Prüfe ob fertig ---
             centered = pixel_dist < self.cal.center_threshold_px
-            close_enough = abs(depth_error) < 30  # ±30px Toleranz
+            close_enough = abs(depth_error) < 40
             
             if centered and close_enough:
-                _success(f"Zentriert & nah genug! (Dist={pixel_dist:.0f}px, BBox_H={avg_bb_h:.0f}px)")
+                _success(f"Zentriert! (Dist={pixel_dist:.0f}px, BBox_H={avg_bb_h:.0f}px)")
                 return True
             
-            # --- Bewegung berechnen ---
-            cur_x, cur_y, cur_z = self._get_position()
+            # --- RELATIVE Joint-Korrekturen berechnen ---
             
-            # Y-Korrektur (links/rechts): Pixel-X → Arm-Y
-            dy_mm = 0.0
+            # Horizontal: Base drehen
+            # Objekt rechts im Bild → Base muss nach rechts (positiv) drehen
+            d_base = 0.0
             if abs(offset_px_x) > MIN_MOVE_PX:
-                dy_mm = -offset_px_x * self.cal.pixel_to_mm * self.cal.damping
+                d_base = -offset_px_x * DEG_PER_PIXEL_H * DAMPING
             
-            # Z-Korrektur (hoch/runter): Pixel-Y → Arm-Z
-            dz_mm = 0.0
+            # Vertikal: Shoulder anpassen
+            # Objekt unten im Bild → Arm muss nach unten schauen → Shoulder erhöhen
+            d_shoulder = 0.0
             if abs(offset_px_y) > MIN_MOVE_PX:
-                dz_mm = -offset_px_y * self.cal.pixel_to_mm * self.cal.damping  # NICHT offset_py!
-
+                d_shoulder = offset_px_y * DEG_PER_PIXEL_V * DAMPING
             
-            # X-Korrektur (näher/weiter): BBox-Größe → Arm-X
-            dx_mm = 0.0
+            # Tiefe: Elbow strecken (Arm nach vorne) oder beugen (zurück)
+            d_elbow = 0.0
             if not close_enough:
-                # Richtung: depth_error > 0 → zu weit weg → X erhöhen (nach vorne)
-                # Aber: Feedback nutzen! Wenn BBox kleiner wurde obwohl wir
-                # nach vorne gefahren sind → Richtung umkehren
-                direction = 1.0 if depth_error > 0 else -1.0
+                # Zu weit weg (depth_error > 0) → Elbow strecken (Winkel verkleinern)
+                # Feedback: wenn BBox kleiner wurde, Richtung umkehren
+                direction = -1.0 if depth_error > 0 else 1.0  # Elbow kleiner = gestreckter = weiter vorne
                 
-                # Feedback von letzter Iteration
-                if prev_bb_height is not None:
+                if prev_bb_height is not None and hasattr(self, '_last_depth_dir'):
                     bb_change = avg_bb_h - prev_bb_height
-                    # Wenn wir nach vorne gefahren sind (dx war positiv)
-                    # und BBox KLEINER wurde → falsche Richtung!
-                    if hasattr(self, '_last_dx_direction'):
-                        if self._last_dx_direction > 0 and bb_change < -5:
-                            direction = -1.0
-                            _info("  [Feedback] Richtung korrigiert! (BBox wurde kleiner)")
-                        elif self._last_dx_direction < 0 and bb_change < -5:
-                            direction = 1.0
-                            _info("  [Feedback] Richtung korrigiert! (BBox wurde kleiner)")
+                    if self._last_depth_dir * bb_change < 0 and abs(bb_change) > 5:
+                        direction = -direction
+                        _info("  [Feedback] Tiefe-Richtung korrigiert!")
                 
-                # Proportional zur Abweichung, aber begrenzt
-                magnitude = min(abs(depth_error) / TARGET_BB_HEIGHT, 1.0) * DEPTH_STEP_MM
-                dx_mm = direction * magnitude
-                self._last_dx_direction = direction
+                magnitude = min(abs(depth_error) / TARGET_BB_HEIGHT, 1.0) * 5.0  # max 5° pro Schritt
+                d_elbow = direction * magnitude * DAMPING
+                self._last_depth_dir = direction
             
             prev_bb_height = avg_bb_h
             
-            # --- Neue Position ---
-            new_x = cur_x + dx_mm
-            new_y = cur_y + dy_mm
-            new_z = cur_z + dz_mm
+            # --- Neue Winkel ---
+            new_base = cur_base + d_base
+            new_shoulder = cur_shoulder + d_shoulder
+            new_elbow = cur_elbow + d_elbow
             
-            # Sicherheitscheck
-            reach = (new_x**2 + new_y**2) ** 0.5
-            if reach > self.arm.MAX_REACH:
-                _error(f"Außerhalb Reichweite ({reach:.0f}mm)!")
-                return False
-            if new_z < self.arm.MIN_Z or new_z > self.arm.MAX_Z:
-                _error(f"Z außerhalb Limits ({new_z:.0f}mm)!")
-                return False
+            # Limits
+            new_base = max(-90, min(90, new_base))
+            new_shoulder = max(-30, min(60, new_shoulder))
+            new_elbow = max(20, min(160, new_elbow))
             
-            _info(f"  → Bewege: dX={dx_mm:+.1f} dY={dy_mm:+.1f} dZ={dz_mm:+.1f}mm")
-            _info(f"  → Ziel:   X={new_x:.1f} Y={new_y:.1f} Z={new_z:.1f}")
+            _info(f"  → dBase={d_base:+.1f}° dShoulder={d_shoulder:+.1f}° dElbow={d_elbow:+.1f}°")
+            _info(f"  → Neu: B={new_base:.1f} S={new_shoulder:.1f} E={new_elbow:.1f}")
             
-            self._move_cartesian(new_x, new_y, new_z, t=3.14, spd=0.15)
-            self._update_for(1.0, [target_class], "Bewege...")
+            # --- Bewegen ---
+            self._move_joints(b=new_base, s=new_shoulder, e=new_elbow, h=180, spd=15, acc=10)
+            
+            cur_base = new_base
+            cur_shoulder = new_shoulder
+            cur_elbow = new_elbow
+            
+            # Warten + Frames verwerfen
+            self._update_for(1.2, [target_class], "Bewege...")
         
         _error(f"Max Iterationen ({max_iter}) erreicht!")
         return False
