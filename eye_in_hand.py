@@ -84,15 +84,14 @@ def _step(num: int, msg: str):
 @dataclass
 class Calibration:
     """Eye-in-Hand Kalibrierungsparameter. ANPASSEN FÜR DEIN SETUP!"""
-    pixel_to_mm: float = 0.5       # mm pro Pixel bei Scan-Höhe
-    grab_height: float = 75.0      # mm über Tisch zum Greifen
-    scan_height: float = 200.0     # mm Scan-Höhe
-    scan_forward: float = 180.0    # mm nach vorne in Scan-Position
-    center_threshold_px: float = 20.0  # Pixel-Toleranz für "zentriert"
-    damping: float = 0.6           # Dämpfung bei Zentrierung (0-1)
-    base_scan_range: Tuple[float, float] = (-80.0, 80.0)  # Grad
-    base_scan_step: float = 25.0   # Grad pro Schritt bei 360°-Suche
-
+    pixel_to_mm: float = 0.5
+    grab_height: float = 75.0
+    scan_height: float = 200.0
+    scan_forward: float = 180.0
+    center_threshold_px: float = 20.0
+    damping: float = 0.6
+    base_scan_range: Tuple[float, float] = (-90.0, 90.0)  # VOLLER Bereich
+    base_scan_step: float = 20.0  # Kleinere Schritte = gründlicher
 
 # ─── Controller ──────────────────────────────────────────────────────────────
 
@@ -162,20 +161,43 @@ class EyeInHandController:
     # ─── Kamera-Auswahl ──────────────────────────────────────────────────
 
     def _find_working_cameras(self) -> Dict[int, str]:
-        """Findet Kameras die tatsächlich Frames liefern."""
+        """Findet Kameras die tatsächlich Frames liefern. Nutzt /dev/video* direkt."""
+        import os
         cameras = {}
-        # Nur typische Indizes, nicht blind 0-7
-        for i in range(8):
-            cap = cv2.VideoCapture(i)
+
+        # Finde echte Video-Devices über v4l2
+        real_devices = []
+        for i in range(10):
+            dev = f"/dev/video{i}"
+            if os.path.exists(dev):
+                # Prüfe ob es ein CAPTURE device ist (nicht metadata)
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ["v4l2-ctl", f"--device={dev}", "--all"],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if "Video Capture" in result.stdout:
+                        real_devices.append(i)
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    # v4l2-ctl nicht verfügbar → Fallback
+                    real_devices.append(i)
+
+        # Fallback wenn v4l2-ctl nicht da ist: nur 0 und 2 probieren
+        if not real_devices:
+            real_devices = [0, 2]
+
+        for i in real_devices:
+            cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
             if cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None and frame.size > 0:
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    backend = cap.getBackendName()
-                    cameras[i] = f"{w}x{h} ({backend})"
+                    cameras[i] = f"{w}x{h} (V4L2)"
                 cap.release()
             time.sleep(0.05)
+
         return cameras
 
     def _select_camera(self, preferred: Optional[int] = None) -> Optional[cv2.VideoCapture]:
@@ -382,8 +404,12 @@ class EyeInHandController:
         return detections, key
 
     def _update_for(self, seconds: float, target_classes: List[str] = None,
-                    status_text: str = "") -> None:
-        """Zeigt Live-Preview für eine bestimmte Dauer."""
+                    status_text: str = "", discard_first: int = 3) -> None:
+        """Zeigt Live-Preview für eine bestimmte Dauer. Verwirft erste Frames."""
+        # Erste Frames verwerfen (Bewegungs-Artefakte / Kamera-Buffer)
+        for _ in range(discard_first):
+            self.get_frame()
+
         start = time.time()
         while time.time() - start < seconds:
             _, key = self._update(target_classes, status_text)
@@ -428,35 +454,51 @@ class EyeInHandController:
     def _search_rotate(self, target_class: str) -> Optional[Dict]:
         """
         Dreht den Arm schrittweise und sucht das Objekt.
-        Zeigt dabei Live-Preview.
+        Dreht aus NORMALER Position (nicht nach oben geneigt).
+        Wartet bis Arm still steht bevor Frames ausgewertet werden.
         """
         _info("Starte Rotations-Suche...")
         start_deg, end_deg = self.cal.base_scan_range
         step = self.cal.base_scan_step
         current = start_deg
 
+        if HAS_RICH:
+            console.print(f"  [dim]Bereich: {start_deg:.0f}° → {end_deg:.0f}° "
+                          f"(Schritt: {step:.0f}°)[/dim]")
+
         while current <= end_deg:
-            # Drehen
+            # Drehen – NORMALE Position (s=0, e=90, h=180 = geradeaus schauen)
+            # Nicht e=45 (das neigt den Arm nach oben/unten)
             self.arm.move_joints_degrees(
-                b=current, s=0, e=45, h=180, spd=30, acc=15
+                b=current, s=0, e=90, h=180, spd=25, acc=10
             )
 
-            # Warte + zeige Preview + suche
-            start_t = time.time()
-            while time.time() - start_t < 1.5:
+            # WICHTIG: Warte bis Arm WIRKLICH still steht
+            # move_joints_degrees hat intern 2s wait, aber der Arm braucht
+            # noch etwas um mechanisch zur Ruhe zu kommen
+            time.sleep(0.5)
+
+            # Frames verwerfen die während Bewegung aufgenommen wurden
+            for _ in range(5):
+                self.get_frame()
+
+            # Jetzt stabile Frames auswerten + anzeigen
+            found = False
+            for frame_i in range(15):  # ~1.5s bei 10fps
                 detections, key = self._update(
                     [target_class],
-                    f"Suche '{target_class}' @ {current:.0f} deg"
+                    f"Suche '{target_class}' | Base: {current:.0f} deg"
                 )
                 if key == ord('q'):
                     return None
                 if detections:
                     _success(f"'{target_class}' gefunden bei Base={current:.0f}°!")
                     return detections[0]
+                time.sleep(0.05)
 
             current += step
 
-        _error(f"'{target_class}' nicht gefunden im Bereich {start_deg}°..{end_deg}°")
+        _error(f"'{target_class}' nicht gefunden ({start_deg:.0f}° bis {end_deg:.0f}°)")
         return None
 
     # ─── Zentrieren ───────────────────────────────────────────────────────
@@ -533,14 +575,18 @@ class EyeInHandController:
 
         _header(f"GRAB: '{target_class}'")
 
-        # 1. Scan-Position
+        # 1. Normale Scan-Position (geradeaus schauen, NICHT nach oben)
         _step(1, "Scan-Position...")
-        self.arm.move_joints_degrees(b=0, s=0, e=45, h=180, spd=20, acc=10)
+        self.arm.move_joints_degrees(b=0, s=0, e=90, h=180, spd=20, acc=10)
         self._update_for(2.5, [target_class], "Fahre Scan-Position...")
 
         # 2. Suche
         _step(2, f"Suche '{target_class}'...")
         detection = None
+
+        # Frames verwerfen (Bewegungs-Artefakte)
+        for _ in range(5):
+            self.get_frame()
 
         # Erst direkt schauen (mehrere Frames)
         for _ in range(20):
