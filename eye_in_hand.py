@@ -144,6 +144,141 @@ class _VisionInterface:
         ret, frame = self._camera.retrieve()
         return frame if ret else None  # ← DAS FEHLTE!
 
+    def annotate_frame(self, frame, detections: list, target_classes: list = None,
+                       info_text: str = "") -> None:
+        """Zeichnet Detections + Zentrierbereich + Greifer-Zone auf den Frame (in-place)."""
+        cv2 = self._cv2
+        if frame is None:
+            return
+
+        h_f, w_f = frame.shape[:2]
+        cx_img, cy_img = w_f // 2, h_f // 2
+
+        # ─── ZENTRIERBEREICH (grün): Objekt gilt als "zentriert" ───
+        center_threshold = 20  # Pixel
+        cv2.circle(frame, (cx_img, cy_img), int(center_threshold), (0, 255, 0), 2)
+        cv2.putText(frame, "ZENTRIERT", (cx_img - 45, cy_img - int(center_threshold) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+        # ─── GREIFER-ÖFFNUNGSZONE (gelb): Ab hier wird Greifer geöffnet ───
+        gripper_zone_radius = int(center_threshold * 1.5)
+        cv2.circle(frame, (cx_img, cy_img), gripper_zone_radius, (0, 255, 255), 1)
+        cv2.putText(frame, "GREIFER OEFFNET", (cx_img - 65, cy_img + gripper_zone_radius + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+        # ─── Fadenkreuz Bildmitte ───
+        cv2.drawMarker(frame, (cx_img, cy_img),
+                       (128, 128, 128), cv2.MARKER_CROSS, 30, 1)
+
+        # ─── Detections ───
+        for det in detections:
+            x1, y1, x2, y2 = [int(v) for v in det['bbox']]
+            label = f"{det['class']} {det['confidence']:.2f}"
+            color = (0, 255, 0)
+
+            if target_classes and det['class'] in target_classes:
+                color = (0, 0, 255)
+                label = f"TARGET: {label}"
+
+                # Linie + Distanz zum Zentrum
+                det_cx, det_cy = int(det['center_px'][0]), int(det['center_px'][1])
+                dist_to_center = ((det_cx - cx_img)**2 + (det_cy - cy_img)**2) ** 0.5
+                line_color = (0, 255, 0) if dist_to_center < center_threshold else (0, 0, 255)
+                cv2.line(frame, (det_cx, det_cy), (cx_img, cy_img), line_color, 1)
+                cv2.putText(frame, f"{dist_to_center:.0f}px",
+                            ((det_cx + cx_img) // 2 + 5, (det_cy + cy_img) // 2 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, line_color, 1)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cx, cy = int(det['center_px'][0]), int(det['center_px'][1])
+            cv2.circle(frame, (cx, cy), 5, color, -1)
+
+        # ─── Info-Text ───
+        if info_text:
+            cv2.putText(frame, info_text, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # ─── Legende ───
+        cv2.putText(frame, "Gruen=Zentriert | Gelb=Greifer oeffnet", (10, h_f - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+
+    def _annotate(self, frame, detections: List[Dict], target_classes: List[str] = None,
+                  status_text: str = "") -> None:
+        """Zeichnet Detections + Zentrierbereich + Greifer-Zone auf Frame."""
+        if frame is None:
+            return
+
+        h_f, w_f = frame.shape[:2]
+        cx_img, cy_img = w_f // 2, h_f // 2
+
+        # ─── ZENTRIERBEREICH: Grüner Kreis/Rechteck wo "zentriert" gilt ───
+        # Das ist der Bereich innerhalb center_threshold_px (default 20px)
+        center_threshold = 20  # Pixel – entspricht GrabConfig.center_threshold_px
+        # Grüner Kreis = "hier muss das Objekt-Zentrum sein"
+        cv2.circle(frame, (cx_img, cy_img), int(center_threshold), (0, 255, 0), 2)
+        cv2.putText(frame, "ZENTRIERT", (cx_img - 45, cy_img - int(center_threshold) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+        # ─── GREIFER-ÖFFNUNGSZONE: Gelber Bereich ───
+        # Der Greifer wird geöffnet wenn das Objekt VERIFIZIERT zentriert ist
+        # (innerhalb threshold * 1.5 über mehrere Frames)
+        # Markiere diesen erweiterten Bereich als "Greifer öffnet ab hier"
+        gripper_zone_radius = int(center_threshold * 1.5)  # verify nutzt threshold * 1.5
+        cv2.circle(frame, (cx_img, cy_img), gripper_zone_radius, (0, 255, 255), 1)
+        cv2.putText(frame, "GREIFER OEFFNET", (cx_img - 65, cy_img + gripper_zone_radius + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+        # ─── Fadenkreuz Bildmitte ───
+        cv2.drawMarker(frame, (cx_img, cy_img),
+                       (128, 128, 128), cv2.MARKER_CROSS, 30, 1)
+
+        # ─── Detections ───
+        for det in detections:
+            x1, y1, x2, y2 = [int(v) for v in det['bbox']]
+            label = f"{det['class']} {det['confidence']:.2f}"
+            is_target = target_classes and det['class'] in target_classes
+            color = (0, 0, 255) if is_target else (0, 255, 0)
+
+            if is_target:
+                label = f"TARGET: {label}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
+                # Zeige Abstand zur Mitte für Target
+                det_cx, det_cy = int(det['center_px'][0]), int(det['center_px'][1])
+                dist_to_center = ((det_cx - cx_img)**2 + (det_cy - cy_img)**2) ** 0.5
+
+                # Linie vom Objekt-Zentrum zur Bildmitte
+                line_color = (0, 255, 0) if dist_to_center < center_threshold else (0, 0, 255)
+                cv2.line(frame, (det_cx, det_cy), (cx_img, cy_img), line_color, 1)
+
+                # Distanz-Anzeige
+                dist_text = f"{dist_to_center:.0f}px"
+                mid_x = (det_cx + cx_img) // 2
+                mid_y = (det_cy + cy_img) // 2
+                cv2.putText(frame, dist_text, (mid_x + 5, mid_y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, line_color, 1)
+            else:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            cv2.putText(frame, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            det_cx, det_cy = int(det['center_px'][0]), int(det['center_px'][1])
+            cv2.circle(frame, (det_cx, det_cy), 5, color, -1)
+
+        # ─── Status-Text ───
+        if status_text:
+            cv2.putText(frame, status_text, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # ─── Legende unten links ───
+        legend_y = h_f - 40
+        cv2.putText(frame, "Gruen=Zentriert | Gelb=Greifer oeffnet", (10, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+
     def detect(self, target_classes: List[str] = None) -> List[Dict]:
         """Detect ohne GUI."""
         frame = self.get_frame()
@@ -233,36 +368,6 @@ class _VisionInterface:
                     _debug(f"Kein '{target_classes}' aber sehe: {all_classes}")
 
         return detections
-
-    def _annotate(self, frame, detections: List[Dict], target_classes: List[str] = None,
-                  status_text: str = "") -> None:
-        if frame is None:
-            return
-
-        for det in detections:
-            x1, y1, x2, y2 = [int(v) for v in det['bbox']]
-            label = f"{det['class']} {det['confidence']:.2f}"
-            is_target = target_classes and det['class'] in target_classes
-            color = (0, 0, 255) if is_target else (0, 255, 0)
-
-            if is_target:
-                label = f"TARGET: {label}"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            else:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            cx, cy = int(det['center_px'][0]), int(det['center_px'][1])
-            cv2.circle(frame, (cx, cy), 5, color, -1)
-
-        h_f, w_f = frame.shape[:2]
-        cv2.drawMarker(frame, (w_f // 2, h_f // 2),
-                       (128, 128, 128), cv2.MARKER_CROSS, 30, 1)
-
-        if status_text:
-            cv2.putText(frame, status_text, (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     def _show(self, frame, wait_ms: int = 1) -> int:
         if self._headless or frame is None:
