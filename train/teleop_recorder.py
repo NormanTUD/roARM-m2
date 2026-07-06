@@ -97,9 +97,6 @@ class TeleopRecorder:
     MOVE_SPEED = 50
     MOVE_ACC = 100
     
-    # Key hold detection
-    KEY_HOLD_TIMEOUT = 0.20    # ONLY defined once! 200ms forgiveness for key-repeat gaps
-
     # Limits
     BASE_MIN, BASE_MAX = -90.0, 90.0
     SHOULDER_MIN, SHOULDER_MAX = -30.0, 60.0
