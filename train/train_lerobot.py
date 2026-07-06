@@ -28,9 +28,87 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+try:
+    import matplotlib
+    matplotlib.use('TkAgg')  # or 'Qt5Agg' depending on your system
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
 import numpy as np
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+class LiveTrainingPlot:
+    """Live matplotlib plot showing training loss curve."""
+
+    def __init__(self, total_epochs: int):
+        if not HAS_MATPLOTLIB:
+            self._enabled = False
+            return
+        self._enabled = True
+        self._total_epochs = total_epochs
+        self._losses = []
+        self._best_losses = []
+
+        plt.ion()  # Interactive mode
+        self._fig, self._ax = plt.subplots(1, 1, figsize=(10, 5))
+        self._fig.suptitle('🤖 LeRobot ACT Training', fontsize=14, fontweight='bold')
+        self._ax.set_xlabel('Epoch')
+        self._ax.set_ylabel('Loss')
+        self._ax.set_xlim(0, total_epochs)
+        self._ax.grid(True, alpha=0.3)
+        self._line_loss, = self._ax.plot([], [], 'b-', linewidth=1.5, label='Train Loss')
+        self._line_best, = self._ax.plot([], [], 'r--', linewidth=1, alpha=0.7, label='Best Loss')
+        self._ax.legend(loc='upper right')
+        self._fig.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.01)
+
+    def update(self, epoch: int, loss: float, best_loss: float):
+        """Update the plot with new data."""
+        if not self._enabled:
+            return
+        self._losses.append(loss)
+        self._best_losses.append(best_loss)
+
+        epochs = list(range(1, len(self._losses) + 1))
+        self._line_loss.set_data(epochs, self._losses)
+        self._line_best.set_data(epochs, self._best_losses)
+
+        # Auto-scale Y axis
+        if self._losses:
+            valid_losses = [l for l in self._losses if np.isfinite(l)]
+            if valid_losses:
+                ymin = min(valid_losses) * 0.9
+                ymax = max(valid_losses) * 1.1
+                self._ax.set_ylim(max(0, ymin), ymax)
+
+        self._ax.set_xlim(0, max(self._total_epochs, epoch + 1))
+
+        # Add text annotation for current values
+        self._ax.set_title(
+            f'Epoch {epoch}/{self._total_epochs} | '
+            f'Loss: {loss:.6f} | Best: {best_loss:.6f}',
+            fontsize=11
+        )
+
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+        plt.pause(0.01)
+
+    def save(self, path: str):
+        """Save the final plot."""
+        if not self._enabled:
+            return
+        self._fig.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"  📊 Plot saved to: {path}")
+
+    def close(self):
+        if self._enabled:
+            plt.ioff()
+            plt.close(self._fig)
 
 # ─── Rich Console ─────────────────────────────────────────────────────────────
 try:
@@ -187,7 +265,14 @@ class LeRobotArmDataset(Dataset):
         stats_path = self.meta_dir / "stats.json"
         if stats_path.exists():
             with open(stats_path) as f:
-                return json.load(f)
+                stats = json.load(f)
+            # Clamp all std values to prevent division by zero
+            for key in stats:
+                if "std" in stats[key]:
+                    stats[key]["std"] = np.maximum(
+                        np.array(stats[key]["std"]), 1e-6
+                    ).tolist()
+            return stats
 
         # Compute from data
         all_states = []
@@ -222,6 +307,7 @@ class LeRobotArmDataset(Dataset):
             stats = {}
 
         return stats
+
 
     def _extract_state(self, frame: dict) -> Optional[np.ndarray]:
         """Extract state vector from frame data."""
@@ -280,7 +366,7 @@ class LeRobotArmDataset(Dataset):
         return None
 
     def _normalize(self, data: np.ndarray, key: str) -> np.ndarray:
-        """Normalize data using stored statistics."""
+        """Normalize data using stored statistics. Clamps std to avoid div-by-zero."""
         if key in self.stats:
             mean = np.array(self.stats[key]["mean"], dtype=np.float32)
             std = np.array(self.stats[key]["std"], dtype=np.float32)
@@ -291,6 +377,8 @@ class LeRobotArmDataset(Dataset):
             elif len(mean) > len(data):
                 mean = mean[:len(data)]
                 std = std[:len(data)]
+            # *** FIX: Clamp std to prevent division by zero ***
+            std = np.maximum(std, 1e-6)
             return (data - mean) / std
         return data
 
@@ -1049,6 +1137,9 @@ class Trainer:
 
     def _train_simple(self, best_loss, loss_history, start_time):
         """Training loop without rich (fallback)."""
+        # Initialize live plot
+        plot = LiveTrainingPlot(self.args.epochs) if HAS_MATPLOTLIB else None
+
         for epoch in range(self.args.epochs):
             avg_loss, best_batch = self._train_epoch(epoch)
             loss_history.append(avg_loss)
@@ -1058,6 +1149,10 @@ class Trainer:
                 best_loss = avg_loss
                 improved = " *"
                 self._save_checkpoint("best")
+
+            # Update live plot
+            if plot:
+                plot.update(epoch + 1, avg_loss, best_loss)
 
             # Print every N epochs
             if (epoch + 1) % max(1, self.args.epochs // 20) == 0 or epoch == 0:
@@ -1073,6 +1168,13 @@ class Trainer:
 
             if (epoch + 1) % self.args.save_every == 0:
                 self._save_checkpoint(f"epoch_{epoch+1}")
+
+        # Save plot
+        if plot:
+            output_dir = Path(self.args.output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            plot.save(str(output_dir / "training_loss.png"))
+            plot.close()
 
         self._save_final(best_loss, loss_history, start_time)
 
