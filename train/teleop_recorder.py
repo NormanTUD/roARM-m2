@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Teleop Recorder – Fernsteuerung des RoArm-M2-S mit Tastatur + Aufzeichnung.
 
@@ -9,9 +8,8 @@ Steuerung:
   A/D                        → Hand/Wrist Rotation (A = links, D = rechts)
   O                          → Gripper öffnen
   C                          → Gripper schließen
-  CTRL R                          → Aufnahme starten (neue Episode)
-  CTRL S (nur bei Aufnahme)       → Episode speichern & beenden
-  F                          → Episode als fehlgeschlagen markieren & speichern
+  R                          → Aufnahme starten / stoppen (Toggle)
+  Ctrl+F                     → Episode als fehlgeschlagen markieren & speichern
   P                          → Letzte Episode 1:1 abspielen (Replay)
   Q                          → Beenden
 
@@ -780,14 +778,14 @@ class TeleopRecorder:
         self._arm.set_led(255)
         self._led_brightness = 255
 
-        # ─── LeRobot Saver initialisieren ───
+        # ——— LeRobot Saver initialisieren ———
         self._lerobot_saver = LeRobotSaver(
             output_dir=self._output_dir / "lerobot_dataset",
             fps=30.0
         )
         print(f"  ✔ LeRobot Saver → {self._output_dir / 'lerobot_dataset'}")
 
-        # ─── Replay Engine initialisieren ───
+        # ——— Replay Engine initialisieren ———
         self._replay_engine = ReplayEngine(self._arm, self._camera)
         print("  ✔ Replay Engine bereit")
 
@@ -800,14 +798,13 @@ class TeleopRecorder:
         print("    ↑         Shoulder hoch (Arm hebt sich)")
         print("    ↓         Shoulder runter (Arm senkt sich)")
         print("    W         Elbow hoch")
-        print("    S         Elbow runter (ohne Aufnahme) / Save (bei Aufnahme)")
+        print("    S         Elbow runter")
         print("    A         Hand/Wrist nach links")
         print("    D         Hand/Wrist nach rechts")
         print("    O         Gripper öffnen")
         print("    C         Gripper schließen")
-        print("    R         Aufnahme starten")
-        print("    S         Aufnahme speichern (nur während Aufnahme)")
-        print("    F         Aufnahme als fehlgeschlagen speichern")
+        print("    R         Aufnahme starten / stoppen (Toggle)")
+        print("    Ctrl+F    Aufnahme als fehlgeschlagen markieren & speichern")
         print("    P         Letzte Episode 1:1 abspielen (Replay)")
         print("    +/=       Geschwindigkeit erhöhen")
         print("    -         Geschwindigkeit verringern")
@@ -968,6 +965,7 @@ class TeleopRecorder:
     def _process_key(self, key: int) -> str:
         """
         Verarbeitet Tastendruck. Updates persistent key state.
+        R = Toggle Recording (startet wenn nicht aktiv, stoppt+speichert wenn aktiv).
         """
         if key == -1 or key == 0xFFFF:
             return ""
@@ -994,13 +992,8 @@ class TeleopRecorder:
             self._key_last_seen["shoulder_down"] = now
             action = "shoulder_down"
 
-        # ——— Ctrl+S → Save Recording (key code 19) ———
-        elif key_low == 19:
-            if self._recording:
-                self._stop_recording(success=True)
-            action = ""
-
-        # ——— Ctrl+F → Fail Recording (key code 6) ———
+        # ——— Ctrl+F → Fail Recording (key code 6 = 0x06) ———
+        # ord('f') & 0x1F = 6, ord('F') & 0x1F = 6
         elif key_low == 6:
             if self._recording:
                 self._stop_recording(success=False)
@@ -1012,7 +1005,6 @@ class TeleopRecorder:
             self._key_last_seen["elbow_up"] = now
             action = "elbow_up"
         elif key_low == ord('s'):
-            # Plain 's' is ALWAYS elbow_down now (no conflict with save)
             self._keys_down.add("elbow_down")
             self._key_last_seen["elbow_down"] = now
             action = "elbow_down"
@@ -1074,11 +1066,14 @@ class TeleopRecorder:
             self._speed_level = 4
             print(f"  ⚡ Speed: {self._current_speed['label']}")
 
-        # ——— Recording ———
+        # ——— Recording Toggle (R) ———
         elif key_low == ord('r'):
-            self._start_recording()
+            if self._recording:
+                self._stop_recording(success=True)
+            else:
+                self._start_recording()
 
-        # ——— Plain 'f' is now free (no action, or you could assign it to something else) ———
+        # ——— Plain 'f' is now free ———
         elif key_low == ord('f'):
             pass  # No longer stops recording; Ctrl+F does that now
 
@@ -1373,7 +1368,7 @@ class TeleopRecorder:
                             ((det_cx + cx_img) // 2, (det_cy + cy_img) // 2 - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-        # ─── Status-Leiste oben ───
+        # ——— Status-Leiste oben ———
         state = self._arm_state
         spd_label = self._current_speed["label"]
         led_pct = int(self._led_brightness / 255 * 100)
@@ -1398,7 +1393,7 @@ class TeleopRecorder:
             cv2.putText(frame, f"Action: {action}", (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
 
-        # ─── Recording-Indikator ───
+        # ——— Recording-Indikator ———
         if self._recording:
             cv2.circle(frame, (w_f - 30, 25), 10, (0, 0, 255), -1)
             ep = self._current_episode
@@ -1407,15 +1402,18 @@ class TeleopRecorder:
                 rec_text = f"REC {elapsed:.1f}s | {len(ep.frames)} frames"
                 cv2.putText(frame, rec_text, (w_f - 250, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            # Hinweis: R zum Stoppen
+            cv2.putText(frame, "R=Stop Recording  Ctrl+F=Fail",
+                        (10, h_f - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         else:
             cv2.putText(frame, f"Episodes: {self._episode_count} | R=Record P=Replay Q=Quit",
                         (10, h_f - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
-        # ─── Steuerungs-Overlay ───
+        # ——— Steuerungs-Overlay ———
         help_y = h_f - 40
         cv2.putText(frame, "Arrows=Base/Shoulder  W/S=Elbow  A/D=Hand  O/C=Grip  +/-=Speed  1-5=Level",
                     (10, help_y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
-        cv2.putText(frame, "LED: Shift+1=OFF  Shift+2..6=Brightness Steps  |  P=Replay last episode",
+        cv2.putText(frame, "LED: Shift+1=OFF  Shift+2..6=Brightness Steps  |  R=Record/Stop  P=Replay",
                     (10, help_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
 
     # ─── Replay ───────────────────────────────────────────────────────────────
