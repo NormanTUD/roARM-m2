@@ -85,9 +85,6 @@ class TeleopRecorder:
     MOVE_SPEED = 50        # Servo-Speed
     MOVE_ACC = 20          # Servo-Acceleration
 
-    GRIPPER_OPEN_DEG = 61.88    # 1.08 rad = open
-    GRIPPER_CLOSED_DEG = 180.0  # 3.14 rad = closed
-
     # Limits
     BASE_MIN, BASE_MAX = -90.0, 90.0
     SHOULDER_MIN, SHOULDER_MAX = -30.0, 60.0
