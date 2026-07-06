@@ -1194,8 +1194,8 @@ class Trainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "config": {
                 "policy": self.args.policy,
-                "state_dim": 5,
-                "action_dim": 5,
+                "state_dim": 6,
+                "action_dim": 6,
                 "chunk_size": self.args.chunk_size,
                 "hidden_dim": self.args.hidden_dim,
                 "num_heads": getattr(self.args, "num_heads", 4),
@@ -1221,8 +1221,8 @@ class Trainer:
             "model_state_dict": self.model.state_dict(),
             "config": {
                 "policy": self.args.policy,
-                "state_dim": 5,
-                "action_dim": 5,
+                "state_dim": 6,
+                "action_dim": 6,
                 "chunk_size": self.args.chunk_size,
                 "hidden_dim": self.args.hidden_dim,
                 "num_heads": getattr(self.args, "num_heads", 4),
