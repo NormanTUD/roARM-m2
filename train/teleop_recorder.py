@@ -405,6 +405,10 @@ class ReplayEngine:
         self._replaying = True
         start_time = time.time()
         
+        # Tracking für Zustandsänderungen
+        last_gripper_state = None
+        last_led_brightness = None
+        
         for i, frame_data in enumerate(frames_data):
             if not self._replaying:
                 print("  [!] Replay abgebrochen")
@@ -420,21 +424,32 @@ class ReplayEngine:
             # Gelenkwinkel setzen
             arm_state = self._get_arm_state(frame_data)
             if arm_state:
-                self._arm.move_joints_degrees(
-                    b=arm_state["base_deg"],
-                    s=arm_state["shoulder_deg"],
-                    e=arm_state["elbow_deg"],
-                    h=arm_state["hand_deg"],
-                    spd=50,
-                    acc=100
-                )
+                # Hohe spd/acc damit Arm Position rechtzeitig erreicht
+                cmd = {
+                    "T": 122,
+                    "b": round(arm_state["base_deg"], 1),
+                    "s": round(arm_state["shoulder_deg"], 1),
+                    "e": round(arm_state["elbow_deg"], 1),
+                    "h": round(arm_state["hand_deg"], 1),
+                    "spd": 100,
+                    "acc": 200
+                }
+                self._arm._send_nowait(cmd)
                 
-                # Gripper
-                if "gripper_open" in arm_state:
-                    if arm_state["gripper_open"]:
+                # Gripper NUR bei Zustandsänderung
+                gripper_open = arm_state.get("gripper_open", True)
+                if gripper_open != last_gripper_state:
+                    if gripper_open:
                         self._arm.gripper_open()
                     else:
                         self._arm.gripper_close()
+                    last_gripper_state = gripper_open
+            
+            # LED wiederherstellen (nur bei Änderung)
+            led_brightness = frame_data.get("led_brightness", None)
+            if led_brightness is not None and led_brightness != last_led_brightness:
+                self._arm.set_led(led_brightness)
+                last_led_brightness = led_brightness
             
             # Live-Anzeige
             if self._camera:
@@ -1229,7 +1244,7 @@ class TeleopRecorder:
         self._current_episode = None
 
     def _record_frame(self, detections: List[Dict], action: str):
-        """Zeichnet einen Frame auf."""
+        """Zeichnet einen Frame auf — inkl. Speed-Level und LED-Brightness."""
         if not self._current_episode:
             return
 
@@ -1266,6 +1281,8 @@ class TeleopRecorder:
                 "hand_deg": state.hand_deg,
                 "gripper_open": state.gripper_open,
             },
+            "speed_level": self._speed_level,
+            "led_brightness": self._led_brightness,
             "detections": detections,
             "action": action,
             "rel_to_target": rel_to_target,
@@ -1426,7 +1443,12 @@ class TeleopRecorder:
 
     def _do_replay(self, episode_path: Path):
         """
-        Spielt eine Episode 1:1 ab – exakt gleiche Gelenkwinkel, gleiches Timing.
+        Spielt eine Episode 1:1 ab — exakt gleiche Gelenkwinkel, gleiches Timing.
+        Fixes:
+          - Gripper-Befehl nur bei Zustandsänderung (verhindert Blockierung)
+          - Hohe spd/acc damit Arm Position rechtzeitig erreicht (verhindert Stückelung)
+          - LED-Brightness wird wiederhergestellt
+          - Speed-Level wird angezeigt (aber Replay nutzt immer hohe Servo-Geschwindigkeit)
         """
         # Lade Episode
         with open(episode_path, 'r') as f:
@@ -1441,6 +1463,10 @@ class TeleopRecorder:
         duration = data.get("duration_s", 0)
         print(f"    {num_frames} Frames | {duration:.1f}s Dauer")
         print(f"    Q = Abbrechen")
+
+        # Tracking für Zustandsänderungen
+        last_gripper_state = None
+        last_led_brightness = None
 
         start_time = time.time()
 
@@ -1461,13 +1487,36 @@ class TeleopRecorder:
                 self._arm_state.hand_deg = arm.get("hand_deg", self._arm_state.hand_deg)
                 self._arm_state.gripper_open = arm.get("gripper_open", self._arm_state.gripper_open)
 
-                self._send_arm_command()
+                # Arm-Befehl mit HOHER Geschwindigkeit senden (damit er rechtzeitig ankommt)
+                cmd = {
+                    "T": 122,
+                    "b": round(self._arm_state.base_deg, 1),
+                    "s": round(self._arm_state.shoulder_deg, 1),
+                    "e": round(self._arm_state.elbow_deg, 1),
+                    "h": round(self._arm_state.hand_deg, 1),
+                    "spd": 100,
+                    "acc": 200
+                }
+                self._arm._send_nowait(cmd)
 
-                # Gripper
-                if arm.get("gripper_open", True):
-                    self._arm.gripper_open()
-                else:
-                    self._arm.gripper_close()
+                # Gripper NUR bei Zustandsänderung senden
+                gripper_open = arm.get("gripper_open", True)
+                if gripper_open != last_gripper_state:
+                    if gripper_open:
+                        self._arm.gripper_open()
+                    else:
+                        self._arm.gripper_close()
+                    last_gripper_state = gripper_open
+
+            # LED-Brightness wiederherstellen (nur bei Änderung)
+            led_brightness = frame_data.get("led_brightness", None)
+            if led_brightness is not None and led_brightness != last_led_brightness:
+                self._arm.set_led(led_brightness)
+                self._led_brightness = led_brightness
+                last_led_brightness = led_brightness
+
+            # Speed-Level aus Aufnahme anzeigen (informativ)
+            recorded_speed_level = frame_data.get("speed_level", None)
 
             # Live-Anzeige
             frame = self._get_frame()
@@ -1485,16 +1534,25 @@ class TeleopRecorder:
                 cv2.rectangle(frame, (10, 45), (10 + int(bar_w * progress), 55), (0, 200, 0), -1)
 
                 # Arm-State
+                gripper_char = 'O' if arm.get('gripper_open', True) else 'C'
                 state_str = (f"B:{arm.get('base_deg', 0):.0f} S:{arm.get('shoulder_deg', 0):.0f} "
                             f"E:{arm.get('elbow_deg', 0):.0f} H:{arm.get('hand_deg', 0):.0f} "
-                            f"G:{'O' if arm.get('gripper_open', True) else 'C'}")
+                            f"G:{gripper_char}")
                 cv2.putText(frame, state_str, (10, 75),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                # Speed + LED Info
+                spd_label = ""
+                if recorded_speed_level is not None and 0 <= recorded_speed_level < len(self.SPEED_LEVELS):
+                    spd_label = self.SPEED_LEVELS[recorded_speed_level]["label"]
+                led_info = f"LED:{led_brightness if led_brightness is not None else '?'}"
+                cv2.putText(frame, f"Rec-Speed: {spd_label} | {led_info}", (10, 95),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
 
                 # Action
                 action = frame_data.get("action", "")
                 if action:
-                    cv2.putText(frame, f"Action: {action}", (10, 95),
+                    cv2.putText(frame, f"Action: {action}", (10, 115),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
                 # Detections aus der Aufnahme anzeigen
