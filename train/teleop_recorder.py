@@ -378,64 +378,60 @@ class ReplayEngine:
 
     def replay_episode(self, episode_path: Path, window_name: str = "RoArm Replay") -> bool:
         """
-        Spielt eine Episode 1:1 ab.
-        
-        Args:
-            episode_path: Pfad zur Episode-Datei (JSON oder Parquet)
-            window_name: Name des Anzeigefensters
-            
-        Returns:
-            True wenn erfolgreich abgespielt
+        Spielt eine Episode 1:1 ab – mit exakt den aufgezeichneten spd/acc Werten.
         """
         # Lade Episode
         frames_data = self._load_episode(episode_path)
         if not frames_data:
             print(f"  [!] Keine Frames in {episode_path}")
             return False
-        
+
         print(f"\n  ▶ REPLAY START: {episode_path.name}")
         print(f"    {len(frames_data)} Frames")
-        
+
         if frames_data and "timestamp" in frames_data[0]:
             duration = frames_data[-1]["timestamp"]
             if isinstance(duration, list):
                 duration = duration[0]
             print(f"    Dauer: {duration:.1f}s")
-        
+
         self._replaying = True
         start_time = time.time()
-        
+
         # Tracking für Zustandsänderungen
         last_gripper_state = None
         last_led_brightness = None
-        
+
         for i, frame_data in enumerate(frames_data):
             if not self._replaying:
                 print("  [!] Replay abgebrochen")
                 break
-            
+
             # Timing einhalten
             target_time = self._get_timestamp(frame_data)
             elapsed = time.time() - start_time
             wait_time = target_time - elapsed
             if wait_time > 0:
                 time.sleep(wait_time)
-            
+
             # Gelenkwinkel setzen
             arm_state = self._get_arm_state(frame_data)
             if arm_state:
-                # Hohe spd/acc damit Arm Position rechtzeitig erreicht
+                # Aufgezeichnete Servo-Parameter verwenden (Fallback für alte Aufnahmen)
+                replay_spd = frame_data.get("servo_spd", 100)
+                replay_acc = frame_data.get("servo_acc", 200)
+
                 cmd = {
                     "T": 122,
                     "b": round(arm_state["base_deg"], 1),
                     "s": round(arm_state["shoulder_deg"], 1),
                     "e": round(arm_state["elbow_deg"], 1),
                     "h": round(arm_state["hand_deg"], 1),
-                    "spd": 100,
-                    "acc": 200
+                    "spd": replay_spd,   # <-- EXAKT wie bei Aufnahme
+                    "acc": replay_acc    # <-- EXAKT wie bei Aufnahme
                 }
                 self._arm._send_nowait(cmd)
-                
+
                 # Gripper NUR bei Zustandsänderung
                 gripper_open = arm_state.get("gripper_open", True)
                 if gripper_open != last_gripper_state:
@@ -444,13 +440,13 @@ class ReplayEngine:
                     else:
                         self._arm.gripper_close()
                     last_gripper_state = gripper_open
-            
+
             # LED wiederherstellen (nur bei Änderung)
             led_brightness = frame_data.get("led_brightness", None)
             if led_brightness is not None and led_brightness != last_led_brightness:
                 self._arm.set_led(led_brightness)
                 last_led_brightness = led_brightness
-            
+
             # Live-Anzeige
             if self._camera:
                 self._camera.grab()
@@ -458,14 +454,14 @@ class ReplayEngine:
                 if ret:
                     self._annotate_replay_frame(frame, frame_data, i, len(frames_data))
                     cv2.imshow(window_name, frame)
-            
+
             # Abbruch mit Q
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 self._replaying = False
                 print("  [!] Replay durch Benutzer abgebrochen")
                 break
-        
+
         self._replaying = False
         actual_duration = time.time() - start_time
         print(f"  ■ REPLAY BEENDET ({actual_duration:.1f}s)")
@@ -1244,12 +1240,13 @@ class TeleopRecorder:
         self._current_episode = None
 
     def _record_frame(self, detections: List[Dict], action: str):
-        """Zeichnet einen Frame auf — inkl. Speed-Level und LED-Brightness."""
+        """Zeichnet einen Frame auf – inkl. Speed-Level, spd/acc und LED-Brightness."""
         if not self._current_episode:
             return
 
         state = self._arm_state
         now = time.time()
+        spd_cfg = self._current_speed  # Aktuelle Geschwindigkeits-Konfiguration
 
         # Relative Position zum nächsten Target
         rel_to_target = None
@@ -1282,6 +1279,8 @@ class TeleopRecorder:
                 "gripper_open": state.gripper_open,
             },
             "speed_level": self._speed_level,
+            "servo_spd": spd_cfg["spd"],       # <-- NEU: exakte Servo-Geschwindigkeit
+            "servo_acc": spd_cfg["acc"],       # <-- NEU: exakte Servo-Beschleunigung
             "led_brightness": self._led_brightness,
             "detections": detections,
             "action": action,
@@ -1443,12 +1442,8 @@ class TeleopRecorder:
 
     def _do_replay(self, episode_path: Path):
         """
-        Spielt eine Episode 1:1 ab — exakt gleiche Gelenkwinkel, gleiches Timing.
-        Fixes:
-          - Gripper-Befehl nur bei Zustandsänderung (verhindert Blockierung)
-          - Hohe spd/acc damit Arm Position rechtzeitig erreicht (verhindert Stückelung)
-          - LED-Brightness wird wiederhergestellt
-          - Speed-Level wird angezeigt (aber Replay nutzt immer hohe Servo-Geschwindigkeit)
+        Spielt eine Episode 1:1 ab – exakt gleiche Gelenkwinkel, gleiches Timing,
+        gleiche Servo-Geschwindigkeit und Beschleunigung wie bei der Aufnahme.
         """
         # Lade Episode
         with open(episode_path, 'r') as f:
@@ -1487,15 +1482,18 @@ class TeleopRecorder:
                 self._arm_state.hand_deg = arm.get("hand_deg", self._arm_state.hand_deg)
                 self._arm_state.gripper_open = arm.get("gripper_open", self._arm_state.gripper_open)
 
-                # Arm-Befehl mit HOHER Geschwindigkeit senden (damit er rechtzeitig ankommt)
+                # Aufgezeichnete Servo-Geschwindigkeit und Beschleunigung verwenden
+                replay_spd = frame_data.get("servo_spd", 100)  # Fallback für alte Aufnahmen
+                replay_acc = frame_data.get("servo_acc", 200)   # Fallback für alte Aufnahmen
+
                 cmd = {
                     "T": 122,
                     "b": round(self._arm_state.base_deg, 1),
                     "s": round(self._arm_state.shoulder_deg, 1),
                     "e": round(self._arm_state.elbow_deg, 1),
                     "h": round(self._arm_state.hand_deg, 1),
-                    "spd": 100,
-                    "acc": 200
+                    "spd": replay_spd,   # <-- EXAKT wie bei Aufnahme
+                    "acc": replay_acc    # <-- EXAKT wie bei Aufnahme
                 }
                 self._arm._send_nowait(cmd)
 
@@ -1541,13 +1539,15 @@ class TeleopRecorder:
                 cv2.putText(frame, state_str, (10, 75),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                # Speed + LED Info
+                # Speed + LED Info (jetzt mit tatsächlichen spd/acc Werten)
                 spd_label = ""
                 if recorded_speed_level is not None and 0 <= recorded_speed_level < len(self.SPEED_LEVELS):
                     spd_label = self.SPEED_LEVELS[recorded_speed_level]["label"]
+                replay_spd_display = frame_data.get("servo_spd", "?")
+                replay_acc_display = frame_data.get("servo_acc", "?")
                 led_info = f"LED:{led_brightness if led_brightness is not None else '?'}"
-                cv2.putText(frame, f"Rec-Speed: {spd_label} | {led_info}", (10, 95),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
+                cv2.putText(frame, f"Speed: {spd_label} (spd:{replay_spd_display} acc:{replay_acc_display}) | {led_info}",
+                            (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
 
                 # Action
                 action = frame_data.get("action", "")
