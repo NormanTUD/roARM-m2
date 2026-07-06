@@ -363,10 +363,71 @@ class RoArmM2S:
         return self._send({"T": 106, "cmd": rad, "spd": spd, "acc": acc}, 1.0)
 
     def gripper_open(self, amount=1.08) -> List[str]:
+        """Öffnet den Gripper. 1.08 = voll offen."""
         return self.gripper_set(rad=amount)
 
     def gripper_close(self, amount=3.14) -> List[str]:
+        """Schließt den Gripper. 3.14 = voll geschlossen."""
         return self.gripper_set(rad=amount)
+
+    def gripper_set_max_torque(self, torque: int = 300) -> List[str]:
+        """
+        Setzt maximales Gripper-Drehmoment.
+        torque: 200 = 20%, 500 = 50%, 1000 = 100% des Servo-Max.
+        """
+        return self._send({"T": 107, "tor": torque}, 0.5)
+
+    def gripper_close_until_resistance(self, torque_threshold: int = 80,
+                                        timeout: float = 4.0,
+                                        close_speed: int = 0,
+                                        step_rad: float = 0.05) -> bool:
+        """
+        Schließt den Gripper schrittweise bis Widerstand erkannt wird.
+
+        Strategie: Gripper in kleinen Schritten schließen, nach jedem Schritt
+        torH aus dem Feedback prüfen. Wenn |torH| > threshold → Objekt gegriffen.
+
+        Returns:
+            True wenn Objekt gegriffen, False bei Timeout (nichts gegriffen).
+        """
+        import time
+
+        # Aktuelle Position holen
+        status = self.get_status()
+        if not status:
+            # Fallback: einfach schließen
+            self.gripper_close()
+            time.sleep(1.0)
+            return True
+
+        # Aktuelle Hand-Position (Radians)
+        current_rad = status.eoat_rad
+        target_rad = 3.14  # Voll geschlossen
+
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            # Nächsten Schritt berechnen
+            current_rad = min(current_rad + step_rad, target_rad)
+
+            # Gripper ein Stück weiter schließen
+            self.gripper_set(rad=current_rad, spd=close_speed, acc=0)
+            time.sleep(0.3)
+
+            # Feedback holen
+            status = self.get_status()
+            if status:
+                hand_torque = abs(status.torque_hand)
+                if hand_torque > torque_threshold:
+                    # Widerstand erkannt! Objekt gegriffen.
+                    return True
+
+            # Schon voll geschlossen?
+            if current_rad >= target_rad - 0.01:
+                break
+
+        # Timeout oder voll geschlossen ohne Widerstand
+        return False
 
     # ─── Status ───────────────────────────────────────────────────────────
 

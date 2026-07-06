@@ -545,41 +545,34 @@ class EyeInHandController:
         """
         Zentriert das Objekt in der Bildmitte.
         
-        Kamera schaut nach vorne:
-        - Objekt rechts im Bild → Base nach rechts drehen (b+)
-        - Objekt unten im Bild → Arm nach unten neigen (shoulder/elbow)
-        - Objekt zu klein (weit weg) → nach vorne fahren (X+)
+        Vereinfachte Version: Nur horizontal (Base) und vertikal (Shoulder) zentrieren.
+        Tiefe (Annäherung) wird NICHT mehr über BBox gemacht — stattdessen
+        wird einfach zentriert und dann blind abgesenkt.
         
-        Nutzt RELATIVE Joint-Korrekturen statt absoluter Cartesian-Befehle!
+        Konvergenz-Kriterium: Pixel-Offset < threshold für 2 aufeinanderfolgende Iterationen.
         """
         
         # --- Parameter ---
-        TARGET_BB_HEIGHT = 200.0
-        SMOOTHING_FRAMES = 4
-        MIN_MOVE_PX = 8.0
+        SMOOTHING_FRAMES = 5
+        MIN_MOVE_PX = 5.0
         
-        # Umrechnungsfaktoren (KALIBRIEREN!)
-        # Wie viel Grad Base-Rotation pro Pixel horizontaler Offset
-        DEG_PER_PIXEL_H = 0.08  # ~0.08°/px bei 640px Breite ≈ ±25° FOV
-        # Wie viel Grad Shoulder-Neigung pro Pixel vertikaler Offset  
-        DEG_PER_PIXEL_V = 0.06
-        # Wie viel mm X-Bewegung pro Pixel Größen-Differenz
-        MM_PER_PIXEL_DEPTH = 0.15
+        # Umrechnungsfaktoren
+        DEG_PER_PIXEL_H = 0.04   # Konservativer als vorher
+        DEG_PER_PIXEL_V = 0.03
         
         DAMPING = 0.5
+        CONVERGE_COUNT_NEEDED = 2  # Muss 2x hintereinander zentriert sein
         
-        # Aktuelle Joint-Winkel tracken (starten bei Scan-Position)
+        # Aktuelle Joint-Winkel
         cur_base = self._tracker.pos.base_deg
         cur_shoulder = self._tracker.pos.shoulder_deg
         cur_elbow = self._tracker.pos.elbow_deg
         
-        prev_bb_height = None
+        converge_count = 0
         
         for i in range(max_iter):
             # --- Stabile Detection über mehrere Frames ---
             centers = []
-            bb_heights = []
-            bb_widths = []
             
             for _ in range(SMOOTHING_FRAMES * 3):
                 detections, key = self._update(
@@ -591,22 +584,19 @@ class EyeInHandController:
                 if detections:
                     det = detections[0]
                     centers.append(det['center_px'])
-                    bb_heights.append(det['size_px'][1])
-                    bb_widths.append(det['size_px'][0])
                     if len(centers) >= SMOOTHING_FRAMES:
                         break
                 time.sleep(0.05)
             
             if len(centers) < 2:
                 _info(f"Iter {i+1}: Objekt verloren!")
+                converge_count = 0
                 time.sleep(0.5)
                 continue
             
             # --- Gemittelte Werte ---
             avg_cx = sum(c[0] for c in centers) / len(centers)
             avg_cy = sum(c[1] for c in centers) / len(centers)
-            avg_bb_h = sum(bb_heights) / len(bb_heights)
-            avg_bb_w = sum(bb_widths) / len(bb_widths)
             
             # --- Pixel-Offset von Bildmitte ---
             w, h = self.resolution
@@ -614,65 +604,47 @@ class EyeInHandController:
             offset_px_y = avg_cy - (h / 2)   # positiv = unten im Bild
             pixel_dist = (offset_px_x**2 + offset_px_y**2) ** 0.5
             
-            # --- Tiefe über BBox ---
-            depth_error = TARGET_BB_HEIGHT - avg_bb_h  # positiv = zu weit weg
-            
             _info(f"Iter {i+1}: Offset=({offset_px_x:.0f},{offset_px_y:.0f})px, "
-                  f"BBox={avg_bb_w:.0f}x{avg_bb_h:.0f}px, Dist={pixel_dist:.0f}px, "
-                  f"Depth={depth_error:+.0f}px")
+                  f"Dist={pixel_dist:.0f}px")
             
-            # --- Prüfe ob fertig ---
-            centered = pixel_dist < self.cal.center_threshold_px
-            close_enough = abs(depth_error) < 40
-            
-            if centered and close_enough:
-                _success(f"Zentriert! (Dist={pixel_dist:.0f}px, BBox_H={avg_bb_h:.0f}px)")
-                return True
+            # --- Prüfe ob zentriert ---
+            if pixel_dist < self.cal.center_threshold_px:
+                converge_count += 1
+                _info(f"  Zentriert ({converge_count}/{CONVERGE_COUNT_NEEDED})")
+                if converge_count >= CONVERGE_COUNT_NEEDED:
+                    _success(f"Zentriert! (Dist={pixel_dist:.0f}px)")
+                    return True
+                # Nicht bewegen, nochmal prüfen
+                self._update_for(0.5, [target_class], "Verifiziere...")
+                continue
+            else:
+                converge_count = 0
             
             # --- RELATIVE Joint-Korrekturen berechnen ---
             
             # Horizontal: Base drehen
-            # Objekt rechts im Bild → Base muss nach rechts (positiv) drehen
             d_base = 0.0
             if abs(offset_px_x) > MIN_MOVE_PX:
                 d_base = -offset_px_x * DEG_PER_PIXEL_H * DAMPING
+                # Clamp einzelne Korrektur
+                d_base = max(-5.0, min(5.0, d_base))
             
             # Vertikal: Shoulder anpassen
-            # Objekt unten im Bild → Arm muss nach unten schauen → Shoulder erhöhen
             d_shoulder = 0.0
             if abs(offset_px_y) > MIN_MOVE_PX:
                 d_shoulder = offset_px_y * DEG_PER_PIXEL_V * DAMPING
-            
-            # Tiefe: Elbow strecken (Arm nach vorne) oder beugen (zurück)
-            d_elbow = 0.0
-            if not close_enough:
-                # Zu weit weg (depth_error > 0) → Elbow strecken (Winkel verkleinern)
-                # Feedback: wenn BBox kleiner wurde, Richtung umkehren
-                direction = -1.0 if depth_error > 0 else 1.0  # Elbow kleiner = gestreckter = weiter vorne
-                
-                if prev_bb_height is not None and hasattr(self, '_last_depth_dir'):
-                    bb_change = avg_bb_h - prev_bb_height
-                    if self._last_depth_dir * bb_change < 0 and abs(bb_change) > 5:
-                        direction = -direction
-                        _info("  [Feedback] Tiefe-Richtung korrigiert!")
-                
-                magnitude = min(abs(depth_error) / TARGET_BB_HEIGHT, 1.0) * 5.0  # max 5° pro Schritt
-                d_elbow = direction * magnitude * DAMPING
-                self._last_depth_dir = direction
-            
-            prev_bb_height = avg_bb_h
+                d_shoulder = max(-3.0, min(3.0, d_shoulder))
             
             # --- Neue Winkel ---
             new_base = cur_base + d_base
             new_shoulder = cur_shoulder + d_shoulder
-            new_elbow = cur_elbow + d_elbow
+            new_elbow = cur_elbow  # Elbow NICHT ändern!
             
             # Limits
             new_base = max(-90, min(90, new_base))
             new_shoulder = max(-30, min(60, new_shoulder))
-            new_elbow = max(20, min(160, new_elbow))
             
-            _info(f"  → dBase={d_base:+.1f}° dShoulder={d_shoulder:+.1f}° dElbow={d_elbow:+.1f}°")
+            _info(f"  → dBase={d_base:+.1f}° dShoulder={d_shoulder:+.1f}°")
             _info(f"  → Neu: B={new_base:.1f} S={new_shoulder:.1f} E={new_elbow:.1f}")
             
             # --- Bewegen ---
@@ -683,7 +655,7 @@ class EyeInHandController:
             cur_elbow = new_elbow
             
             # Warten + Frames verwerfen
-            self._update_for(1.2, [target_class], "Bewege...")
+            self._update_for(1.0, [target_class], "Bewege...")
         
         _error(f"Max Iterationen ({max_iter}) erreicht!")
         return False
@@ -696,8 +668,8 @@ class EyeInHandController:
         
         1. Scan-Position
         2. Suche (erst direkt, dann 360°)
-        3. Zentrieren
-        4. Absenken + Greifen
+        3. Zentrieren (nur horizontal/vertikal)
+        4. Gripper öffnen + Absenken + Greifen mit Torque-Feedback
         5. Anheben + Ablegen
         """
         if not self._active:
@@ -706,7 +678,7 @@ class EyeInHandController:
 
         _header(f"GRAB: '{target_class}'")
 
-        # 1. Normale Scan-Position (geradeaus schauen, NICHT nach oben)
+        # 1. Normale Scan-Position
         _step(1, "Scan-Position...")
         self._move_joints(b=0, s=0, e=90, h=180, spd=20, acc=10)
         self._update_for(2.5, [target_class], "Fahre Scan-Position...")
@@ -715,11 +687,11 @@ class EyeInHandController:
         _step(2, f"Suche '{target_class}'...")
         detection = None
 
-        # Frames verwerfen (Bewegungs-Artefakte)
+        # Frames verwerfen
         for _ in range(5):
             self.get_frame()
 
-        # Erst direkt schauen (mehrere Frames)
+        # Erst direkt schauen
         for _ in range(20):
             detections, key = self._update([target_class], f"Suche '{target_class}'...")
             if key == ord('q'):
@@ -736,7 +708,6 @@ class EyeInHandController:
             detection = self._search_rotate(target_class)
 
         if not detection:
-            # Zeige was stattdessen da ist
             all_dets, _ = self._update(status_text="Nichts gefunden!")
             if all_dets:
                 classes = set(d['class'] for d in all_dets)
@@ -756,32 +727,54 @@ class EyeInHandController:
             self._cleanup()
             return False
 
-        # 4. Position für Greifposition (mit Tracker-Fallback)
+        # 4. Greifen
+        _step(4, "Greife...")
+
+        # Position holen
         grab_x, grab_y, grab_z = self._get_position()
         if grab_x == 0 and grab_y == 0 and grab_z == 0:
-            _error("Position unbekannt (Tracker nicht initialisiert)!")
+            _error("Position unbekannt!")
             self.arm.park()
             self._cleanup()
             return False
 
-        _step(4, f"Greife bei X={grab_x:.0f} Y={grab_y:.0f} Z={self.cal.grab_height:.0f}...")
+        _info(f"Position: X={grab_x:.0f} Y={grab_y:.0f} Z={grab_z:.0f}")
 
-        # Gripper öffnen
-        self.arm.gripper_open()
-        self._update_for(0.5, [target_class], "Gripper offen")
+        # Gripper ÖFFNEN
+        _info("Gripper öffnen...")
+        self.arm.gripper_open(amount=1.08)
+        self._update_for(1.0, [target_class], "Gripper offen")
 
-        # Absenken
-        _info("Absenken...")
-        self._move_cartesian(grab_x, grab_y, self.cal.grab_height + 50, t=3.14, spd=0.15)
-        self._update_for(1.5, [target_class], "Absenken...")
+        # Absenken Schritt 1: Mittlere Höhe
+        _info("Absenken (Zwischenhöhe)...")
+        mid_height = self.cal.grab_height + 60
+        self._move_cartesian(grab_x, grab_y, mid_height, t=1.08, spd=0.15)
+        self._update_for(2.0, [target_class], "Absenken...")
 
-        self._move_cartesian(grab_x, grab_y, self.cal.grab_height, t=3.14, spd=0.1)
-        self._update_for(1.5, [target_class], "Greifen...")
+        # Absenken Schritt 2: Greifhöhe
+        _info("Absenken (Greifhöhe)...")
+        self._move_cartesian(grab_x, grab_y, self.cal.grab_height, t=1.08, spd=0.1)
+        self._update_for(2.0, [target_class], "Greifposition...")
 
-        # Greifen
-        _info("Greifer schließen...")
-        self.arm.gripper_close()
-        self._update_for(1.0, status_text="Greife!")
+        # Gripper SCHLIESSEN mit Torque-Feedback
+        _info("Greifer schließen (mit Widerstandserkennung)...")
+        
+        # Maximales Torque setzen (nicht zu hoch, damit Objekt nicht zerdrückt wird)
+        self.arm.gripper_set_max_torque(torque=300)
+        time.sleep(0.3)
+        
+        gripped = self.arm.gripper_close_until_resistance(
+            torque_threshold=60,
+            timeout=4.0,
+            step_rad=0.08
+        )
+        
+        if gripped:
+            _success("Objekt gegriffen! (Widerstand erkannt)")
+        else:
+            _info("Gripper geschlossen (kein Widerstand erkannt, versuche trotzdem)")
+        
+        self._update_for(0.5, status_text="Gegriffen!")
 
         # 5. Anheben
         _step(5, "Anheben...")
@@ -794,7 +787,8 @@ class EyeInHandController:
         self._move_cartesian(grab_x, place_y, self.cal.grab_height + 40, t=3.14, spd=0.2)
         self._update_for(2.0, status_text="Ablegen...")
 
-        self.arm.gripper_open()
+        # Gripper öffnen
+        self.arm.gripper_open(amount=1.08)
         self._update_for(0.5, status_text="Abgelegt!")
 
         # Zurückziehen
