@@ -74,7 +74,9 @@ class RoArmM2S:
     ]
 
     def __init__(self, port: Optional[str] = None, baudrate: int = BAUDRATE,
-                 auto_connect: bool = True, timeout: float = 1.0):
+                 auto_connect: bool = True, timeout: float = 1.0,
+                 enable_vision: bool = False, camera_index: int = 0,
+                 yolo_model: str = "yolo11n.pt", confidence: float = 0.5):
         """
         Initialize the RoArm-M2-S controller.
         
@@ -83,6 +85,10 @@ class RoArmM2S:
             baudrate: Communication baud rate (default 115200).
             auto_connect: Automatically connect on initialization.
             timeout: Serial read timeout in seconds.
+            enable_vision: Try to initialize camera + YOLO (optional).
+            camera_index: Which camera to use (0 = default).
+            yolo_model: Path to YOLO model file.
+            confidence: Minimum detection confidence.
         """
         self.port = port
         self.baudrate = baudrate
@@ -90,6 +96,15 @@ class RoArmM2S:
         self.ser: Optional[serial.Serial] = None
         self._connected = False
         self._lock = threading.Lock()
+
+        # Vision (optional – graceful degradation)
+        self.vision: Optional[VisionModule] = None
+        if enable_vision:
+            self.vision = VisionModule(
+                camera_index=camera_index,
+                model_path=yolo_model,
+                confidence=confidence
+            )
 
         if auto_connect:
             self.connect()
@@ -719,3 +734,162 @@ class RoArmM2S:
     def __repr__(self) -> str:
         status = "connected" if self.is_connected else "disconnected"
         return f"<RoArmM2S port={self.port} status={status}>"
+
+    def detect_and_grab(self, target_class: str = "cup",
+                        pixel_to_mm_func=None) -> bool:
+        """Erkennt ein Objekt und greift es (benötigt Kalibrierung)."""
+        if not self.vision or not self.vision.available:
+            print("[Vision] Nicht verfügbar.")
+            return False
+
+        detections = self.vision.detect_objects([target_class])
+        if not detections:
+            print(f"[Vision] Kein '{target_class}' erkannt.")
+            return False
+
+        best = max(detections, key=lambda d: d['confidence'])
+        print(f"[Vision] '{best['class']}' erkannt (conf={best['confidence']:.2f})")
+
+        if pixel_to_mm_func:
+            x_mm, y_mm, z_mm = pixel_to_mm_func(best['center_px'])
+            self.pick_and_place(x_mm, y_mm, z_mm, x_mm + 100, y_mm, z_mm)
+            return True
+        else:
+            print("[Vision] Keine Pixel→mm Kalibrierung – nur Erkennung.")
+            return False
+
+class VisionModule:
+    """Optional camera + YOLO integration for object detection and grasping."""
+
+    def __init__(self, camera_index: int = 0, model_path: str = "yolo11n.pt",
+                 confidence: float = 0.5):
+        self._available = False
+        self._camera = None
+        self._model = None
+        self._confidence = confidence
+        self._cv2 = None
+
+        # OpenCV check
+        try:
+            import cv2
+            self._cv2 = cv2
+            cap = cv2.VideoCapture(camera_index)
+            if cap.isOpened():
+                self._camera = cap
+                # Auflösung setzen (optional, für konsistente Kalibrierung)
+                self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                self._available = True
+                print(f"[Vision] ✓ Kamera {camera_index} erkannt "
+                      f"({int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+                      f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))})")
+            else:
+                print("[Vision] ✗ Keine Kamera gefunden – Vision deaktiviert.")
+                return
+        except ImportError:
+            print("[Vision] ✗ OpenCV nicht installiert (pip install opencv-python)")
+            return
+
+        # YOLO check
+        try:
+            from ultralytics import YOLO
+            self._model = YOLO(model_path)
+            print(f"[Vision] ✓ YOLO-Modell '{model_path}' geladen.")
+        except ImportError:
+            print("[Vision] ✗ ultralytics nicht installiert (pip install ultralytics)")
+            self._available = False
+        except Exception as e:
+            print(f"[Vision] ✗ Modell-Fehler: {e}")
+            self._available = False
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    @property
+    def resolution(self) -> tuple:
+        """Gibt die aktuelle Kamera-Auflösung zurück."""
+        if self._camera and self._cv2:
+            w = int(self._camera.get(self._cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(self._camera.get(self._cv2.CAP_PROP_FRAME_HEIGHT))
+            return (w, h)
+        return (0, 0)
+
+    def detect_objects(self, target_classes: list = None) -> list:
+        """Erkennt Objekte im aktuellen Kamerabild."""
+        if not self._available:
+            return []
+
+        ret, frame = self._camera.read()
+        if not ret:
+            return []
+
+        results = self._model(frame, conf=self._confidence, verbose=False)[0]
+        detections = []
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            cls_name = results.names[cls_id]
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            w, h = x2 - x1, y2 - y1
+
+            if target_classes and cls_name not in target_classes:
+                continue
+
+            detections.append({
+                'class': cls_name,
+                'confidence': conf,
+                'bbox': (x1, y1, x2, y2),
+                'center_px': (cx, cy),
+                'size_px': (w, h),
+            })
+
+        # Nach Confidence sortiert zurückgeben
+        detections.sort(key=lambda d: d['confidence'], reverse=True)
+        return detections
+
+    def detect_closest_to_center(self, target_classes: list = None) -> dict:
+        """Erkennt das Objekt, das am nächsten zur Bildmitte ist."""
+        detections = self.detect_objects(target_classes)
+        if not detections:
+            return None
+
+        w, h = self.resolution
+        img_cx, img_cy = w / 2, h / 2
+
+        def dist_to_center(det):
+            dx = det['center_px'][0] - img_cx
+            dy = det['center_px'][1] - img_cy
+            return (dx**2 + dy**2) ** 0.5
+
+        return min(detections, key=dist_to_center)
+
+    def get_frame(self):
+        """Gibt das aktuelle Kamerabild zurück."""
+        if not self._available:
+            return None
+        ret, frame = self._camera.read()
+        return frame if ret else None
+
+    def get_annotated_frame(self, target_classes: list = None):
+        """Gibt Frame mit eingezeichneten Bounding Boxes zurück."""
+        if not self._available:
+            return None
+
+        ret, frame = self._camera.read()
+        if not ret:
+            return None
+
+        results = self._model(frame, conf=self._confidence, verbose=False)[0]
+        annotated = results.plot()  # Ultralytics built-in Annotation
+        return annotated
+
+    def release(self):
+        """Kamera freigeben."""
+        if self._camera:
+            self._camera.release()
+            self._camera = None
+
+    def __del__(self):
+        self.release()
