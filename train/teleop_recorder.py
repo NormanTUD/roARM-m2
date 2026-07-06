@@ -3,15 +3,15 @@
 Teleop Recorder – Fernsteuerung des RoArm-M2-S mit Tastatur + Aufzeichnung.
 
 Steuerung:
-  Pfeiltasten Links/Rechts  → Base-Rotation
-  Pfeiltasten Oben/Unten    → Shoulder (vor/zurück)
-  Shift+Oben/Unten          → Elbow (hoch/runter)
-  Shift+Links/Rechts        → Hand/Wrist Rotation
+  Pfeiltasten Links/Rechts  → Base-Rotation (Links = Base dreht links, Rechts = rechts)
+  Pfeiltasten Oben/Unten    → Shoulder (Oben = Arm hebt sich / nach oben, Unten = senkt sich)
+  W/S                        → Elbow (W = hoch, S = runter)
+  A/D                        → Hand/Wrist Rotation (A = links, D = rechts)
   O                          → Gripper öffnen
   C                          → Gripper schließen
-  SPACE                      → Episode starten/stoppen (Toggle)
   R                          → Aufnahme starten (neue Episode)
-  S                          → Episode speichern & beenden
+  S (nur bei Aufnahme)       → Episode speichern & beenden
+  F                          → Episode als fehlgeschlagen markieren & speichern
   Q                          → Beenden
 
 Aufzeichnung:
@@ -57,27 +57,6 @@ class ArmState:
 
 
 @dataclass
-class Detection:
-    """Eine einzelne YOLO-Detection."""
-    cls: str = ""
-    confidence: float = 0.0
-    bbox: Tuple[float, float, float, float] = (0, 0, 0, 0)  # x1, y1, x2, y2
-    center_px: Tuple[float, float] = (0, 0)
-    size_px: Tuple[float, float] = (0, 0)
-
-
-@dataclass
-class Frame:
-    """Ein aufgezeichneter Frame."""
-    timestamp: float = 0.0
-    arm_state: ArmState = field(default_factory=ArmState)
-    detections: List[Dict] = field(default_factory=list)
-    action: str = ""  # Welche Taste gerade gedrückt ist
-    # Relative Position zu nächster BBox (für Training)
-    rel_to_target: Optional[Dict] = None
-
-
-@dataclass
 class Episode:
     """Eine komplette Aufnahme-Episode."""
     episode_id: int = 0
@@ -93,6 +72,9 @@ class Episode:
 class TeleopRecorder:
     """
     Fernsteuerung + Aufzeichnung für Behaviour Cloning.
+    
+    Flüssige Steuerung durch Key-Hold-Erkennung mit Timeout statt
+    sofortigem Clear bei fehlendem Tastendruck.
     """
 
     # Steuerungs-Parameter
@@ -109,16 +91,9 @@ class TeleopRecorder:
     ELBOW_MIN, ELBOW_MAX = 0.0, 180.0
     HAND_MIN, HAND_MAX = 0.0, 270.0
 
-    # Key codes (OpenCV)
-    KEY_UP = 82
-    KEY_DOWN = 84
-    KEY_LEFT = 81
-    KEY_RIGHT = 83
-    # Shift+Arrow (varies by system, common codes)
-    KEY_SHIFT_UP = 0  # Will detect via flags
-    KEY_SHIFT_DOWN = 1
-    KEY_SHIFT_LEFT = 2
-    KEY_SHIFT_RIGHT = 3
+    # Timing für flüssige Steuerung
+    KEY_HOLD_TIMEOUT = 0.15  # Sekunden: Taste gilt als "gehalten" für diese Dauer nach letztem Druck
+    MOVE_INTERVAL = 0.05     # 50ms = 20Hz Steuerungs-Rate
 
     def __init__(self, port: str = None, camera_index: int = 2,
                  model_path: str = "yolo11n.pt", confidence: float = 0.5,
@@ -145,10 +120,9 @@ class TeleopRecorder:
 
         # Timing
         self._last_move_time = 0.0
-        self._move_interval = 0.05  # 50ms zwischen Befehlen (20Hz Steuerung)
 
-        # Aktive Tasten (für "gehalten = bewegt sich")
-        self._active_keys = set()
+        # Key-Hold-Tracking: Jede Taste hat einen Timestamp wann sie zuletzt gedrückt wurde
+        self._key_last_pressed: Dict[str, float] = {}
 
         # Window
         self._window_name = "RoArm Teleop"
@@ -159,6 +133,18 @@ class TeleopRecorder:
         for f in self._output_dir.glob("episode_*.json"):
             count += 1
         return count
+
+    def _get_active_keys(self) -> set:
+        """Gibt alle Tasten zurück die aktuell als 'gehalten' gelten."""
+        now = time.time()
+        active = set()
+        for key, last_time in list(self._key_last_pressed.items()):
+            if now - last_time < self.KEY_HOLD_TIMEOUT:
+                active.add(key)
+            else:
+                # Abgelaufen → entfernen
+                del self._key_last_pressed[key]
+        return active
 
     # ─── Setup ────────────────────────────────────────────────────────────
 
@@ -181,7 +167,6 @@ class TeleopRecorder:
         print(f"\n[2] Kamera {self._camera_index} öffnen...")
         self._camera = cv2.VideoCapture(self._camera_index, cv2.CAP_V4L2)
         if not self._camera.isOpened():
-            # Fallback: andere Indizes probieren
             for idx in [0, 2, 1, 4]:
                 self._camera = cv2.VideoCapture(idx, cv2.CAP_V4L2)
                 if self._camera.isOpened():
@@ -206,7 +191,6 @@ class TeleopRecorder:
             try:
                 self._model = YOLO(self._model_path)
                 self._model.verbose = False
-                # Warmup
                 ret, frame = self._camera.read()
                 if ret:
                     self._model(frame, conf=self._confidence, verbose=False)
@@ -229,15 +213,20 @@ class TeleopRecorder:
 
         print("\n" + "=" * 60)
         print("  STEUERUNG:")
-        print("    ←/→         Base drehen")
-        print("    ↑/↓         Shoulder vor/zurück")
-        print("    Shift+↑/↓   Elbow hoch/runter")
-        print("    Shift+←/→   Hand/Wrist drehen")
-        print("    O            Gripper öffnen")
-        print("    C            Gripper schließen")
-        print("    R            Aufnahme starten")
-        print("    S            Aufnahme speichern")
-        print("    Q            Beenden")
+        print("    ←         Base nach links drehen")
+        print("    →         Base nach rechts drehen")
+        print("    ↑         Shoulder hoch (Arm hebt sich)")
+        print("    ↓         Shoulder runter (Arm senkt sich)")
+        print("    W         Elbow hoch")
+        print("    S         Elbow runter (ohne Aufnahme) / Save (bei Aufnahme)")
+        print("    A         Hand/Wrist nach links")
+        print("    D         Hand/Wrist nach rechts")
+        print("    O         Gripper öffnen")
+        print("    C         Gripper schließen")
+        print("    R         Aufnahme starten")
+        print("    S         Aufnahme speichern (nur während Aufnahme)")
+        print("    F         Aufnahme als fehlgeschlagen speichern")
+        print("    Q         Beenden")
         print("=" * 60)
         print(f"\n  Episoden bisher: {self._episode_count}")
         if self._target_class:
@@ -256,6 +245,7 @@ class TeleopRecorder:
         self._running = True
         fps_time = time.time()
         frame_count = 0
+        current_fps = 0.0
 
         try:
             while self._running:
@@ -270,18 +260,15 @@ class TeleopRecorder:
                 # 2. Detection
                 detections = self._detect(frame)
 
-                # 3. Tastatur verarbeiten
-                # OpenCV waitKey gibt nur 1 Taste zurück, aber wir brauchen
-                # "gehalten" Erkennung. Lösung: kurzes waitKey + State-Tracking
-                key = cv2.waitKey(1) & 0xFFFF  # 16-bit für Sondertasten
-
+                # 3. Tastatur verarbeiten (waitKey mit kurzer Wartezeit)
+                key = cv2.waitKey(1) & 0xFFFF
                 action = self._process_key(key)
 
-                # 4. Arm bewegen (wenn Taste gehalten)
+                # 4. Arm bewegen basierend auf gehaltenen Tasten
                 self._apply_movement()
 
                 # 5. Frame annotieren
-                self._annotate_frame(frame, detections, action)
+                self._annotate_frame(frame, detections, action, current_fps)
 
                 # 6. Aufzeichnen
                 if self._recording:
@@ -290,11 +277,11 @@ class TeleopRecorder:
                 # 7. Anzeigen
                 cv2.imshow(self._window_name, frame)
 
-                # FPS
+                # FPS berechnen
                 frame_count += 1
                 elapsed = time.time() - fps_time
                 if elapsed >= 1.0:
-                    fps = frame_count / elapsed
+                    current_fps = frame_count / elapsed
                     frame_count = 0
                     fps_time = time.time()
 
@@ -315,7 +302,6 @@ class TeleopRecorder:
         """Holt aktuellen Frame (Buffer-Flush)."""
         if not self._camera:
             return None
-        # Grab+Retrieve für neuesten Frame
         self._camera.grab()
         ret, frame = self._camera.retrieve()
         return frame if ret else None
@@ -343,7 +329,6 @@ class TeleopRecorder:
                 'size_px': [x2 - x1, y2 - y1],
             }
 
-            # Filter auf Target-Klasse wenn angegeben
             if self._target_class is None or cls_name == self._target_class:
                 detections.append(det)
 
@@ -354,53 +339,59 @@ class TeleopRecorder:
 
     def _process_key(self, key: int) -> str:
         """
-        Verarbeitet Tastendruck. Gibt Aktions-String zurück.
-        OpenCV Key-Codes (Linux):
-          Pfeiltasten: 65361=Left, 65362=Up, 65363=Right, 65364=Down
-          Mit Shift: Bit 16 gesetzt → key & 0xFF gleich, aber raw key anders
+        Verarbeitet Tastendruck.
+        
+        Statt active_keys sofort zu leeren wenn keine Taste kommt,
+        nutzen wir Timestamps. Eine Taste gilt als "gehalten" solange
+        sie regelmäßig (innerhalb KEY_HOLD_TIMEOUT) erneut gedrückt wird.
+        
+        OpenCV Key-Codes (Linux/X11):
+          65361 = Left, 65362 = Up, 65363 = Right, 65364 = Down
         """
         if key == -1 or key == 0xFFFF:
-            # Keine Taste → alle Bewegungen stoppen
-            self._active_keys.clear()
+            # Keine Taste → nichts tun (Timeout regelt das Stoppen)
             return ""
 
-        # Normalisieren
-        raw_key = key
+        now = time.time()
         key_low = key & 0xFF
-
-        # Shift-Detection: OpenCV gibt bei Shift+Arrow andere Codes
-        # Auf Linux/X11: Shift+Up = 65362 mit Modifier
-        # Einfacher: Wir nutzen separate Tasten
-        # w/a/s/d für Shift-Variante als Alternative
-
         action = ""
 
-        # ─── Pfeiltasten (Base + Shoulder) ───
-        if raw_key == 65361 or key_low == 81:  # Left
-            self._active_keys.add("base_left")
+        # ─── Pfeiltasten ───
+        # INTUITIVE Zuordnung:
+        #   Links  → Base dreht nach links (positiver Winkel = links von vorne gesehen)
+        #   Rechts → Base dreht nach rechts
+        #   Oben   → Shoulder hoch (Arm hebt sich)
+        #   Unten  → Shoulder runter (Arm senkt sich)
+        if key == 65361 or key_low == 81:  # Left Arrow
+            self._key_last_pressed["base_left"] = now
             action = "base_left"
-        elif raw_key == 65363 or key_low == 83:  # Right
-            self._active_keys.add("base_right")
+        elif key == 65363 or key_low == 83:  # Right Arrow
+            self._key_last_pressed["base_right"] = now
             action = "base_right"
-        elif raw_key == 65362 or key_low == 82:  # Up
-            self._active_keys.add("shoulder_up")
+        elif key == 65362 or key_low == 82:  # Up Arrow
+            self._key_last_pressed["shoulder_up"] = now
             action = "shoulder_up"
-        elif raw_key == 65364 or key_low == 84:  # Down
-            self._active_keys.add("shoulder_down")
+        elif key == 65364 or key_low == 84:  # Down Arrow
+            self._key_last_pressed["shoulder_down"] = now
             action = "shoulder_down"
 
-        # ─── W/A/S/D für Elbow + Hand (Shift-Alternative) ───
-        elif key_low == ord('w'):  # Elbow hoch
-            self._active_keys.add("elbow_up")
+        # ─── W/A/S/D für Elbow + Hand ───
+        elif key_low == ord('w'):
+            self._key_last_pressed["elbow_up"] = now
             action = "elbow_up"
-        elif key_low == ord('s') and not self._recording:  # Elbow runter (nur wenn nicht "save")
-            self._active_keys.add("elbow_down")
-            action = "elbow_down"
-        elif key_low == ord('a'):  # Hand links
-            self._active_keys.add("hand_left")
+        elif key_low == ord('s'):
+            if self._recording:
+                # S = Save während Aufnahme
+                self._stop_recording(success=True)
+                action = ""
+            else:
+                self._key_last_pressed["elbow_down"] = now
+                action = "elbow_down"
+        elif key_low == ord('a'):
+            self._key_last_pressed["hand_left"] = now
             action = "hand_left"
-        elif key_low == ord('d'):  # Hand rechts
-            self._active_keys.add("hand_right")
+        elif key_low == ord('d'):
+            self._key_last_pressed["hand_right"] = now
             action = "hand_right"
 
         # ─── Gripper ───
@@ -415,10 +406,7 @@ class TeleopRecorder:
         elif key_low == ord('r'):
             self._start_recording()
             action = ""
-        elif key_low == ord('s') and self._recording:
-            self._stop_recording(success=True)
-            action = ""
-        elif key_low == ord('f'):  # Failed episode
+        elif key_low == ord('f'):
             self._stop_recording(success=False)
             action = ""
 
@@ -430,42 +418,56 @@ class TeleopRecorder:
         return action
 
     def _apply_movement(self):
-        """Wendet aktive Bewegungen an (solange Taste gehalten)."""
+        """
+        Wendet Bewegungen an basierend auf allen aktuell gehaltenen Tasten.
+        Durch KEY_HOLD_TIMEOUT bleibt eine Taste auch zwischen waitKey-Zyklen aktiv,
+        was flüssige Bewegung ermöglicht.
+        """
         now = time.time()
-        if now - self._last_move_time < self._move_interval:
+        if now - self._last_move_time < self.MOVE_INTERVAL:
             return
 
-        if not self._active_keys:
+        active = self._get_active_keys()
+        if not active:
             return
 
         moved = False
         state = self._arm_state
 
-        for key in list(self._active_keys):
-            if key == "base_left":
-                state.base_deg = max(self.BASE_MIN, state.base_deg - self.BASE_STEP)
-                moved = True
-            elif key == "base_right":
-                state.base_deg = min(self.BASE_MAX, state.base_deg + self.BASE_STEP)
-                moved = True
-            elif key == "shoulder_up":
-                state.shoulder_deg = min(self.SHOULDER_MAX, state.shoulder_deg + self.SHOULDER_STEP)
-                moved = True
-            elif key == "shoulder_down":
-                state.shoulder_deg = max(self.SHOULDER_MIN, state.shoulder_deg - self.SHOULDER_STEP)
-                moved = True
-            elif key == "elbow_up":
-                state.elbow_deg = min(self.ELBOW_MAX, state.elbow_deg + self.ELBOW_STEP)
-                moved = True
-            elif key == "elbow_down":
-                state.elbow_deg = max(self.ELBOW_MIN, state.elbow_deg - self.ELBOW_STEP)
-                moved = True
-            elif key == "hand_left":
-                state.hand_deg = max(self.HAND_MIN, state.hand_deg - self.HAND_STEP)
-                moved = True
-            elif key == "hand_right":
-                state.hand_deg = min(self.HAND_MAX, state.hand_deg + self.HAND_STEP)
-                moved = True
+        # INTUITIVE Richtungen:
+        # base_left  → Base-Winkel ERHÖHEN (dreht nach links von vorne gesehen)
+        # base_right → Base-Winkel VERRINGERN (dreht nach rechts)
+        # shoulder_up → Shoulder-Winkel ERHÖHEN (Arm hebt sich)
+        # shoulder_down → Shoulder-Winkel VERRINGERN (Arm senkt sich)
+        # elbow_up → Elbow-Winkel VERRINGERN (Unterarm hebt sich)
+        # elbow_down → Elbow-Winkel ERHÖHEN (Unterarm senkt sich)
+        # hand_left → Hand-Winkel VERRINGERN
+        # hand_right → Hand-Winkel ERHÖHEN
+
+        if "base_left" in active:
+            state.base_deg = min(self.BASE_MAX, state.base_deg + self.BASE_STEP)
+            moved = True
+        if "base_right" in active:
+            state.base_deg = max(self.BASE_MIN, state.base_deg - self.BASE_STEP)
+            moved = True
+        if "shoulder_up" in active:
+            state.shoulder_deg = min(self.SHOULDER_MAX, state.shoulder_deg + self.SHOULDER_STEP)
+            moved = True
+        if "shoulder_down" in active:
+            state.shoulder_deg = max(self.SHOULDER_MIN, state.shoulder_deg - self.SHOULDER_STEP)
+            moved = True
+        if "elbow_up" in active:
+            state.elbow_deg = max(self.ELBOW_MIN, state.elbow_deg - self.ELBOW_STEP)
+            moved = True
+        if "elbow_down" in active:
+            state.elbow_deg = min(self.ELBOW_MAX, state.elbow_deg + self.ELBOW_STEP)
+            moved = True
+        if "hand_left" in active:
+            state.hand_deg = max(self.HAND_MIN, state.hand_deg - self.HAND_STEP)
+            moved = True
+        if "hand_right" in active:
+            state.hand_deg = min(self.HAND_MAX, state.hand_deg + self.HAND_STEP)
+            moved = True
 
         if moved:
             self._send_arm_command()
@@ -519,7 +521,6 @@ class TeleopRecorder:
         self._current_episode.success = success
         self._recording = False
 
-        # Speichern
         filename = self._output_dir / f"episode_{self._current_episode.episode_id:04d}.json"
         duration = self._current_episode.end_time - self._current_episode.start_time
         num_frames = len(self._current_episode.frames)
@@ -552,7 +553,7 @@ class TeleopRecorder:
         state = self._arm_state
         now = time.time()
 
-        # Relative Position zum nächsten Target berechnen
+        # Relative Position zum nächsten Target
         rel_to_target = None
         if detections:
             best = detections[0]
@@ -591,7 +592,7 @@ class TeleopRecorder:
 
     # ─── Annotation ──────────────────────────────────────────────────────
 
-    def _annotate_frame(self, frame, detections: List[Dict], action: str):
+    def _annotate_frame(self, frame, detections: List[Dict], action: str, fps: float = 0):
         """Zeichnet Infos auf den Frame."""
         if frame is None:
             return
@@ -613,7 +614,6 @@ class TeleopRecorder:
             cv2.putText(frame, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            # Zentrum + Linie zur Mitte
             det_cx, det_cy = int(det['center_px'][0]), int(det['center_px'][1])
             cv2.circle(frame, (det_cx, det_cy), 5, color, -1)
             if is_target:
@@ -627,18 +627,25 @@ class TeleopRecorder:
         state = self._arm_state
         status_line = (f"B:{state.base_deg:.0f} S:{state.shoulder_deg:.0f} "
                        f"E:{state.elbow_deg:.0f} H:{state.hand_deg:.0f} "
-                       f"G:{'O' if state.gripper_open else 'C'}")
+                       f"G:{'O' if state.gripper_open else 'C'} "
+                       f"FPS:{fps:.0f}")
         cv2.putText(frame, status_line, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+        # Aktive Tasten anzeigen (visuelles Feedback)
+        active = self._get_active_keys()
+        if active:
+            active_str = " + ".join(sorted(active))
+            cv2.putText(frame, f"Active: {active_str}", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
         # Aktuelle Aktion
         if action:
-            cv2.putText(frame, f"Action: {action}", (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(frame, f"Action: {action}", (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
 
         # ─── Recording-Indikator ───
         if self._recording:
-            # Roter Punkt + Text
             cv2.circle(frame, (w_f - 30, 25), 10, (0, 0, 255), -1)
             ep = self._current_episode
             if ep:
@@ -651,7 +658,7 @@ class TeleopRecorder:
                         (10, h_f - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
         # ─── Steuerungs-Overlay ───
-        help_y = h_f - 80
+        help_y = h_f - 40
         cv2.putText(frame, "Arrows=Base/Shoulder  W/S=Elbow  A/D=Hand  O/C=Gripper",
                     (10, help_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
 
