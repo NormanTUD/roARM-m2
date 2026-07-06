@@ -422,17 +422,17 @@ class EyeInHandController:
     # ─── Pixel → Arm Transform ───────────────────────────────────────────
 
     def _pixel_offset_mm(self, center_px: Tuple[float, float]) -> Tuple[float, float]:
-        """Pixel-Offset von Bildmitte → Arm-Offset in mm."""
         w, h = self.resolution
         offset_x = center_px[0] - (w / 2)
         offset_y = center_px[1] - (h / 2)
 
-        # Kamera schaut runter, am Arm montiert:
-        # Pixel-Y (unten im Bild) → Arm muss nach vorne (X+)
-        # Pixel-X (rechts im Bild) → Arm muss nach links (Y-)
-        dx_mm = offset_y * self.cal.pixel_to_mm
+        # Kamera schaut NACH VORNE (nicht nach unten!):
+        # Pixel-X rechts → Arm Y- (nach rechts)
+        # Pixel-Y unten  → Arm Z- (nach unten)
+        # Arm X (vor/zurück) ändert sich NICHT durch Pixelversatz!
         dy_mm = -offset_x * self.cal.pixel_to_mm
-        return (dx_mm, dy_mm)
+        dz_mm = -offset_y * self.cal.pixel_to_mm
+        return (0.0, dy_mm, dz_mm)  # dx=0, nur Y und Z anpassen
 
     def _pixel_dist_from_center(self, center_px: Tuple[float, float]) -> float:
         """Pixel-Distanz von Bildmitte."""
