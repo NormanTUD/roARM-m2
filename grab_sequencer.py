@@ -455,7 +455,7 @@ class GrabSequencer:
             # Bewegen
             self._arm.move_joints(
                 b=ctx.cur_base, s=ctx.cur_shoulder, e=ctx.cur_elbow, 
-                h=180, spd=20, acc=10
+                h=180, spd=20, acc=20
             )
             self._sub_state = 3
             ctx.state_enter_time = time.time()

@@ -138,13 +138,10 @@ class _VisionInterface:
         return (640, 480)
 
     def get_frame(self):
-        if not self._camera:
-            return None
         # Buffer flushen: 2x grab() verwirft alte Frames
         for _ in range(2):
             self._camera.grab()
         ret, frame = self._camera.retrieve()
-        return frame if ret else None
 
     def detect(self, target_classes: List[str] = None) -> List[Dict]:
         """Detect ohne GUI."""
