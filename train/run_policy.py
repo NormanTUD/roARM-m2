@@ -1,576 +1,630 @@
 #!/usr/bin/env python3
 """
-Run Policy – Führt die trainierte Greif-Policy autonom aus.
+LeRobot Policy Inference for RoArm-M2-S
+=========================================
 
-Lädt das trainierte Modell und steuert den Arm basierend auf
-YOLO-Detections + aktuellem Arm-Zustand.
+Loads a trained ACT/Diffusion/TDMPC model and executes the learned policy
+on the real robot arm, similar to how teleop_recorder.py controls the arm.
 
-Nutzung:
-  python run_policy.py --model policy_model.pt
-  python run_policy.py --model policy_model.pt --target bottle --episodes 5
-  python run_policy.py --model policy_model.pt --camera 2 --confidence 0.4
+Usage:
+    python3 run_policy.py trained_models/model_final.pt
+    python3 run_policy.py trained_models/model_final.pt --episodes 5
+    python3 run_policy.py trained_models/model_final.pt --port /dev/ttyUSB0
+    python3 run_policy.py trained_models/checkpoint_best.pt --speed-scale 0.5
+
+Controls during execution:
+    SPACE   → Start/Stop policy execution
+    R       → Reset arm to start position
+    Q       → Quit
+    +/-     → Adjust execution speed
 """
 
-import cv2
+import argparse
 import json
 import time
-import argparse
+import sys
+import threading
 import numpy as np
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, Tuple, List
 
-import torch
-import torch.nn as nn
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    print("ERROR: PyTorch is required! Install: pip install torch")
+    sys.exit(1)
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 from roarm_m2s import RoArmM2S
 
-try:
-    from ultralytics import YOLO
-    HAS_YOLO = True
-except ImportError:
-    HAS_YOLO = False
+# Import model classes from training script
+from train_lerobot import ACTPolicy, DiffusionPolicy, TDMPCPolicy, load_model
 
-# Import der Modell-Klassen und Feature-Extraktion aus train_policy
-from train_policy import (
-    ACTION_SPACE, NUM_ACTIONS, ACTION_TO_IDX,
-    FeatureConfig, extract_frame_features, get_feature_dim,
-    GraspPolicyMLP, GraspPolicyLSTM, GraspPolicyTransformer,
-)
-
-
-# ─── Policy Runner ───────────────────────────────────────────────────────────
 
 class PolicyRunner:
     """
-    Führt eine trainierte Policy autonom aus.
-    Liest Kamera + YOLO → Features → Modell → Aktion → Arm-Befehl.
+    Runs a trained LeRobot policy on the RoArm-M2-S.
+    
+    Handles:
+    - Model loading and inference
+    - State normalization/denormalization
+    - Action chunking with temporal ensemble
+    - Real-time arm control at consistent rate
+    - Live camera preview (optional)
+    - Safety limits and emergency stop
     """
 
-    # Gleiche Parameter wie im Teleop-Recorder
-    BASE_STEP = 2.0
-    SHOULDER_STEP = 1.5
-    ELBOW_STEP = 1.5
-    HAND_STEP = 3.0
-    MOVE_SPEED = 50
-    MOVE_ACC = 20
-
+    # Joint limits (same as teleop_recorder.py)
     BASE_MIN, BASE_MAX = -90.0, 90.0
     SHOULDER_MIN, SHOULDER_MAX = -30.0, 60.0
     ELBOW_MIN, ELBOW_MAX = 0.0, 180.0
     HAND_MIN, HAND_MAX = 0.0, 270.0
 
-    def __init__(self, model_path: str, port: str = None,
-                 camera_index: int = 2, yolo_model: str = "yolo11n.pt",
-                 confidence: float = 0.5, target_class: str = None,
-                 max_steps: int = 500, action_interval: float = 0.1,
-                 device: str = "auto"):
+    # Execution rate
+    CONTROL_HZ = 30  # Match recording FPS
+
+    def __init__(self, model_path: str, port: str = None, camera_index: int = 2,
+                 speed_scale: float = 1.0, num_episodes: int = 1,
+                 temporal_ensemble: bool = True, headless: bool = False):
         self._model_path = model_path
         self._port = port
         self._camera_index = camera_index
-        self._yolo_model_path = yolo_model
-        self._confidence = confidence
-        self._target_class = target_class
-        self._max_steps = max_steps
-        self._action_interval = action_interval
-
-        # Device
-        if device == "auto":
-            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self._device = torch.device(device)
+        self._speed_scale = speed_scale
+        self._num_episodes = num_episodes
+        self._temporal_ensemble = temporal_ensemble
+        self._headless = headless
 
         # Hardware
         self._arm: Optional[RoArmM2S] = None
-        self._camera: Optional[cv2.VideoCapture] = None
-        self._yolo_model = None
+        self._camera = None
 
-        # Policy
-        self._policy_model: Optional[nn.Module] = None
-        self._feature_config: Optional[FeatureConfig] = None
+        # Model
+        self._model = None
+        self._stats = {}
+        self._config = {}
+        self._device = "cpu"
+        self._chunk_size = 10
 
         # State
-        self._arm_state = {
-            "base_deg": 0.0,
-            "shoulder_deg": 0.0,
-            "elbow_deg": 90.0,
-            "hand_deg": 180.0,
-            "gripper_open": True,
-        }
+        self._running = False
+        self._executing = False
+        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0], dtype=np.float32)
+        self._action_queue: List[np.ndarray] = []
+        self._action_queue_lock = threading.Lock()
 
-        # Sequenz-Buffer (für LSTM/Transformer)
-        self._seq_buffer: List[np.ndarray] = []
-        self._seq_len: int = 1
-
-        # Stats
-        self._step_count = 0
-        self._action_counts = {}
+        # Temporal ensemble buffer
+        self._ensemble_buffer: List[np.ndarray] = []
+        self._ensemble_weights: Optional[np.ndarray] = None
 
     # ─── Setup ────────────────────────────────────────────────────────────
 
     def setup(self) -> bool:
-        """Initialisiert alles."""
+        """Initialize hardware and model."""
         print("=" * 60)
-        print("  RoArm-M2-S Policy Runner")
+        print("  🤖 LeRobot Policy Runner - RoArm-M2-S")
         print("=" * 60)
 
-        # 1. Modell laden
-        print(f"\n[1] Policy-Modell laden: {self._model_path}")
-        if not self._load_model():
+        # 1. Load model
+        print(f"\n  [1/3] Loading model: {self._model_path}")
+        try:
+            self._model = load_model(self._model_path, device=None)
+            self._stats = getattr(self._model, '_stats', {})
+            self._config = getattr(self._model, '_config', {})
+            self._chunk_size = self._config.get('chunk_size', 10)
+            self._device = next(self._model.parameters()).device
+
+            num_params = sum(p.numel() for p in self._model.parameters())
+            print(f"        ✓ Policy: {self._config.get('policy', 'unknown').upper()}")
+            print(f"        ✓ Parameters: {num_params:,}")
+            print(f"        ✓ Chunk size: {self._chunk_size}")
+            print(f"        ✓ Device: {self._device}")
+        except Exception as e:
+            print(f"        ✗ Model load failed: {e}")
             return False
 
-        # 2. Arm verbinden
-        print("\n[2] Arm verbinden...")
+        # 2. Connect arm
+        print(f"\n  [2/3] Connecting arm...")
         try:
             self._arm = RoArmM2S(port=self._port, enable_vision=False)
-            print("  ✓ Arm verbunden")
+            print(f"        ✓ Connected: {self._arm.port}")
         except Exception as e:
-            print(f"  ✗ Arm-Fehler: {e}")
+            print(f"        ✗ Arm connection failed: {e}")
             return False
 
-        # 3. Kamera
-        print(f"\n[3] Kamera {self._camera_index} öffnen...")
-        self._camera = cv2.VideoCapture(self._camera_index, cv2.CAP_V4L2)
-        if not self._camera.isOpened():
-            for idx in [0, 2, 1, 4]:
-                self._camera = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-                if self._camera.isOpened():
-                    self._camera_index = idx
-                    break
+        # 3. Camera (optional)
+        print(f"\n  [3/3] Camera setup...")
+        if not self._headless and HAS_CV2:
+            self._camera = cv2.VideoCapture(self._camera_index)
+            if not self._camera.isOpened():
+                # Try fallback indices
+                for idx in [0, 2, 1, 4]:
+                    self._camera = cv2.VideoCapture(idx)
+                    if self._camera.isOpened():
+                        self._camera_index = idx
+                        break
+            if self._camera.isOpened():
+                self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                self._camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                print(f"        ✓ Camera {self._camera_index} ready")
             else:
-                print("  ✗ Keine Kamera!")
-                return False
-
-        self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self._camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self._camera.set(cv2.CAP_PROP_FPS, 30)
-        print(f"  ✓ Kamera {self._camera_index}")
-
-        # 4. YOLO
-        if HAS_YOLO:
-            print(f"\n[4] YOLO '{self._yolo_model_path}' laden...")
-            try:
-                self._yolo_model = YOLO(self._yolo_model_path)
-                self._yolo_model.verbose = False
-                ret, frame = self._camera.read()
-                if ret:
-                    self._yolo_model(frame, conf=self._confidence, verbose=False)
-                print("  ✓ YOLO bereit")
-            except Exception as e:
-                print(f"  ✗ YOLO-Fehler: {e}")
-                self._yolo_model = None
+                print(f"        ⚠ No camera found (running without preview)")
+                self._camera = None
         else:
-            print("\n[4] YOLO nicht verfügbar!")
-            return False
+            print(f"        ⚠ Headless mode (no preview)")
 
-        # 5. Arm in Startposition
-        print("\n[5] Arm → Startposition...")
+        # Setup temporal ensemble weights (exponential decay)
+        if self._temporal_ensemble:
+            weights = np.exp(-0.01 * np.arange(self._chunk_size))
+            self._ensemble_weights = weights / weights.sum()
+
+        # Move arm to start position
+        print(f"\n  Moving arm to start position...")
         self._arm.move_joints_degrees(b=0, s=0, e=90, h=180, spd=20, acc=10)
-        self._arm.gripper_open()
         time.sleep(2.0)
-        print("  ✓ Bereit")
+        self._arm.gripper_open()
+        time.sleep(0.5)
+        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0], dtype=np.float32)
 
-        print("\n" + "=" * 60)
-        print("  AUTONOMER MODUS")
-        print(f"  Target: {self._target_class or '(alle)'}")
-        print(f"  Max Steps: {self._max_steps}")
-        print(f"  Action Interval: {self._action_interval}s")
-        print("  Q = Abbrechen")
-        print("=" * 60 + "\n")
-
-        return True
-
-    def _load_model(self) -> bool:
-        """Lädt das trainierte Modell."""
-        try:
-            checkpoint = torch.load(self._model_path, map_location=self._device,
-                                    weights_only=False)
-        except Exception as e:
-            print(f"  ✗ Kann Modell nicht laden: {e}")
-            return False
-
-        # Feature-Config rekonstruieren
-        fc_data = checkpoint.get("feature_config", {})
-        self._feature_config = FeatureConfig(
-            max_detections=fc_data.get("max_detections", 5),
-            normalize_bbox=fc_data.get("normalize_bbox", True),
-            include_arm_state=fc_data.get("include_arm_state", True),
-            include_gripper=fc_data.get("include_gripper", True),
-            include_rel_to_target=fc_data.get("include_rel_to_target", True),
-        )
-
-        # Modell-Klasse bestimmen
-        model_class = checkpoint.get("model_class", "GraspPolicyMLP")
-        input_dim = get_feature_dim(self._feature_config)
-
-        if model_class == "GraspPolicyMLP":
-            self._policy_model = GraspPolicyMLP(input_dim=input_dim)
-        elif model_class == "GraspPolicyLSTM":
-            self._policy_model = GraspPolicyLSTM(input_dim=input_dim)
-        elif model_class == "GraspPolicyTransformer":
-            self._policy_model = GraspPolicyTransformer(input_dim=input_dim)
-        else:
-            print(f"  ✗ Unbekannte Modell-Klasse: {model_class}")
-            return False
-
-        # Weights laden
-        self._policy_model.load_state_dict(checkpoint["model_state_dict"])
-        self._policy_model.to(self._device)
-        self._policy_model.eval()
-
-        val_acc = checkpoint.get("val_acc", 0)
-        epoch = checkpoint.get("epoch", 0)
-        print(f"  ✓ {model_class} geladen (Epoch {epoch}, Val-Acc: {val_acc:.3f})")
-        print(f"  ✓ Input-Dim: {input_dim}, Actions: {NUM_ACTIONS}")
-
-        # Target-Klasse aus Checkpoint übernehmen falls nicht angegeben
-        if not self._target_class:
-            action_space = checkpoint.get("action_space", ACTION_SPACE)
-            print(f"  ℹ Kein Target angegeben, nutze alle Detections")
+        print(f"\n  ✓ Setup complete!")
+        print(f"\n  Controls:")
+        print(f"    SPACE  → Start/Stop policy execution")
+        print(f"    R      → Reset arm to start position")
+        print(f"    +/-    → Adjust speed (current: {self._speed_scale:.1f}x)")
+        print(f"    Q      → Quit")
+        print()
 
         return True
 
-    # ─── Main Loop ────────────────────────────────────────────────────────
+    # ─── Normalization ────────────────────────────────────────────────────
 
-    def run(self, num_episodes: int = 1) -> Dict:
+    def _normalize_state(self, state: np.ndarray) -> np.ndarray:
+        """Normalize state to [-1, 1] using training stats."""
+        if "observation.state" in self._stats:
+            s = self._stats["observation.state"]
+            data_min = np.array(s["min"], dtype=np.float32)
+            data_max = np.array(s["max"], dtype=np.float32)
+
+            # Pad if needed
+            if len(data_min) < len(state):
+                data_min = np.pad(data_min, (0, len(state) - len(data_min)), constant_values=0.0)
+                data_max = np.pad(data_max, (0, len(state) - len(data_max)), constant_values=1.0)
+            elif len(data_min) > len(state):
+                data_min = data_min[:len(state)]
+                data_max = data_max[:len(state)]
+
+            range_val = np.maximum(data_max - data_min, 1e-6)
+            return 2.0 * (state - data_min) / range_val - 1.0
+        return state
+
+    def _denormalize_action(self, action: np.ndarray) -> np.ndarray:
+        """Denormalize action from [-1, 1] back to real joint values."""
+        if "action" in self._stats:
+            s = self._stats["action"]
+            data_min = np.array(s["min"], dtype=np.float32)
+            data_max = np.array(s["max"], dtype=np.float32)
+
+            # Pad if needed
+            if len(data_min) < len(action):
+                data_min = np.pad(data_min, (0, len(action) - len(data_min)), constant_values=0.0)
+                data_max = np.pad(data_max, (0, len(action) - len(data_max)), constant_values=1.0)
+            elif len(data_min) > len(action):
+                data_min = data_min[:len(action)]
+                data_max = data_max[:len(action)]
+
+            range_val = data_max - data_min
+            return (action + 1.0) / 2.0 * range_val + data_min
+        return action
+
+    # ─── Inference ────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _predict_actions(self, state: np.ndarray) -> np.ndarray:
         """
-        Führt die Policy für mehrere Episoden aus.
-
+        Run model inference to get action chunk.
+        
         Returns:
-            Dict mit Statistiken.
+            actions: [chunk_size, 5] array of denormalized actions
         """
-        if not self.setup():
-            return {"success": False, "error": "Setup fehlgeschlagen"}
+        # Normalize state
+        state_norm = self._normalize_state(state)
+        state_tensor = torch.from_numpy(state_norm).unsqueeze(0).to(self._device)
 
-        results = []
+        # Forward pass
+        policy_type = self._config.get('policy', 'act')
 
-        try:
-            for ep in range(1, num_episodes + 1):
-                print(f"\n{'─'*40}")
-                print(f"  Episode {ep}/{num_episodes}")
-                print(f"{'─'*40}")
+        if policy_type == 'act':
+            # ACT returns actions directly
+            actions_norm = self._model(state_tensor)  # [1, chunk_size, action_dim]
+        elif policy_type in ('diffusion', 'tdmpc'):
+            # These use .sample() for inference
+            actions_norm = self._model.sample(state_tensor)  # [1, chunk_size, action_dim]
+        else:
+            actions_norm = self._model(state_tensor)
 
-                result = self._run_episode()
-                results.append(result)
+        # Convert to numpy
+        actions_norm = actions_norm.squeeze(0).cpu().numpy()  # [chunk_size, action_dim]
 
-                print(f"  → {result['steps']} Steps, "
-                      f"{'ERFOLG' if result['completed'] else 'ABGEBROCHEN'}")
+        # Denormalize each action
+        actions = np.array([
+            self._denormalize_action(actions_norm[i])
+            for i in range(actions_norm.shape[0])
+        ])
 
-                # Reset für nächste Episode
-                if ep < num_episodes:
-                    print("  → Reset...")
-                    self._arm.move_joints_degrees(b=0, s=0, e=90, h=180, spd=20, acc=10)
-                    self._arm.gripper_open()
-                    self._arm_state = {
-                        "base_deg": 0.0, "shoulder_deg": 0.0,
-                        "elbow_deg": 90.0, "hand_deg": 180.0,
-                        "gripper_open": True,
-                    }
-                    time.sleep(2.0)
+        return actions
 
-        except KeyboardInterrupt:
-            print("\n[Abgebrochen]")
-        finally:
-            self._shutdown()
+    def _get_next_action(self, state: np.ndarray) -> np.ndarray:
+        """
+        Get next action using temporal ensemble (if enabled).
+        
+        Temporal ensemble: predict new chunk, blend with remaining
+        actions from previous predictions for smoother execution.
+        """
+        if not self._temporal_ensemble:
+            # Simple: predict new chunk, take first action
+            if len(self._action_queue) == 0:
+                actions = self._predict_actions(state)
+                self._action_queue = list(actions)
+            return self._action_queue.pop(0)
 
-        # Zusammenfassung
-        completed = sum(1 for r in results if r['completed'])
-        print(f"\n{'='*60}")
-        print(f"  ERGEBNIS: {completed}/{len(results)} Episoden abgeschlossen")
-        print(f"  Aktions-Verteilung gesamt:")
-        for action, count in sorted(self._action_counts.items(), key=lambda x: -x[1]):
-            name = action if action else "(idle)"
-            print(f"    {name}: {count}")
-        print(f"{'='*60}\n")
+        # Temporal ensemble: always predict, blend with buffer
+        new_actions = self._predict_actions(state)
 
-        return {
-            "episodes": results,
-            "completed": completed,
-            "total": len(results),
-            "action_counts": self._action_counts,
+        if len(self._ensemble_buffer) == 0:
+            # First prediction: use directly
+            self._ensemble_buffer = list(new_actions)
+        else:
+            # Blend new predictions with existing buffer
+            # New prediction covers next chunk_size steps
+            # Existing buffer has remaining steps from previous predictions
+            blended = []
+            for i in range(min(len(self._ensemble_buffer), self._chunk_size)):
+                # Weighted average: more weight on newer predictions for near-future
+                w_new = 0.5  # Can be tuned
+                w_old = 1.0 - w_new
+                if i < len(self._ensemble_buffer):
+                    blended_action = w_old * self._ensemble_buffer[i] + w_new * new_actions[i]
+                else:
+                    blended_action = new_actions[i]
+                blended.append(blended_action)
+
+            # Append remaining new actions
+            for i in range(len(self._ensemble_buffer), self._chunk_size):
+                blended.append(new_actions[i])
+
+            self._ensemble_buffer = blended
+
+        # Pop first action
+        if len(self._ensemble_buffer) > 0:
+            action = self._ensemble_buffer.pop(0)
+        else:
+            action = new_actions[0]
+
+        return action
+
+    # ─── Safety ───────────────────────────────────────────────────────────
+
+    def _clamp_action(self, action: np.ndarray) -> np.ndarray:
+        """Clamp action to safe joint limits."""
+        clamped = action.copy()
+        clamped[0] = np.clip(clamped[0], self.BASE_MIN, self.BASE_MAX)
+        clamped[1] = np.clip(clamped[1], self.SHOULDER_MIN, self.SHOULDER_MAX)
+        clamped[2] = np.clip(clamped[2], self.ELBOW_MIN, self.ELBOW_MAX)
+        clamped[3] = np.clip(clamped[3], self.HAND_MIN, self.HAND_MAX)
+        clamped[4] = np.clip(clamped[4], 0.0, 1.0)  # Gripper: 0=open, 1=closed
+        return clamped
+
+    def _smooth_action(self, action: np.ndarray, prev_state: np.ndarray,
+                       max_delta_deg: float = 5.0) -> np.ndarray:
+        """
+        Smooth action to prevent jerky movements.
+        Limits maximum change per step.
+        """
+        max_delta = max_delta_deg / self._speed_scale
+        smoothed = action.copy()
+
+        for i in range(4):  # Joint angles only
+            delta = action[i] - prev_state[i]
+            if abs(delta) > max_delta:
+                smoothed[i] = prev_state[i] + np.sign(delta) * max_delta
+
+        return smoothed
+
+    # ─── Execution ────────────────────────────────────────────────────────
+
+    def _execute_action(self, action: np.ndarray):
+        """Send action to the arm."""
+        base_deg = round(float(action[0]), 1)
+        shoulder_deg = round(float(action[1]), 1)
+        elbow_deg = round(float(action[2]), 1)
+        hand_deg = round(float(action[3]), 1)
+        gripper = float(action[4])
+
+        # Send joint command (non-blocking, like teleop_recorder)
+        cmd = {
+            "T": 122,
+            "b": base_deg,
+            "s": shoulder_deg,
+            "e": elbow_deg,
+            "h": hand_deg,
+            "spd": 50,
+            "acc": 100
         }
+        self._arm._send_nowait(cmd)
 
-    def _run_episode(self) -> Dict:
-        """Führt eine einzelne Episode aus."""
-        self._step_count = 0
-        self._seq_buffer = []
-        episode_start = time.time()
-        completed = False
-        aborted = False
+        # Gripper control (with hysteresis to avoid chattering)
+        gripper_threshold = 0.5
+        current_gripper = self._current_state[4]
 
-        while self._step_count < self._max_steps:
-            step_start = time.time()
+        if gripper > gripper_threshold and current_gripper <= gripper_threshold:
+            self._arm.gripper_close()
+        elif gripper <= gripper_threshold and current_gripper > gripper_threshold:
+            self._arm.gripper_open()
 
-            # 1. Frame holen
-            frame = self._get_frame()
-            if frame is None:
-                time.sleep(0.01)
-                continue
+        # Update current state
+        self._current_state = action.copy()
 
-            # 2. Detection
-            detections = self._detect(frame)
+    def _reset_arm(self):
+        """Reset arm to start position."""
+        print("  → Resetting arm to start position...")
+        self._arm.gripper_open()
+        time.sleep(0.3)
+        self._arm.move_joints_degrees(b=0, s=0, e=90, h=180, spd=20, acc=10)
+        time.sleep(2.0)
+        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0], dtype=np.float32)
+        self._action_queue = []
+        self._ensemble_buffer = []
+        print("  ✓ Reset complete")
 
-            # 3. Features extrahieren
-            frame_data = self._build_frame_data(detections)
-            features = extract_frame_features(frame_data, self._feature_config)
+    # ─── Visualization ────────────────────────────────────────────────────
 
-            # 4. Policy abfragen
-            action_idx, action_probs = self._predict_action(features)
-            action_name = ACTION_SPACE[action_idx]
-
-            # 5. Aktion ausführen
-            self._execute_action(action_name)
-
-            # 6. Stats
-            self._step_count += 1
-            self._action_counts[action_name] = self._action_counts.get(action_name, 0) + 1
-
-            # 7. Visualisierung
-            self._annotate_frame(frame, detections, action_name, action_probs)
-            cv2.imshow("Policy Runner", frame)
-
-            # 8. Tastatur (Q = Abbrechen, SPACE = Episode beenden)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                aborted = True
-                break
-            elif key == ord(' '):
-                completed = True
-                break
-
-            # 9. Timing
-            elapsed = time.time() - step_start
-            sleep_time = max(0, self._action_interval - elapsed)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        duration = time.time() - episode_start
-        return {
-            "steps": self._step_count,
-            "duration_s": duration,
-            "completed": completed,
-            "aborted": aborted,
-        }
-
-    # ─── Prediction ──────────────────────────────────────────────────────
-
-    def _predict_action(self, features: np.ndarray) -> Tuple[int, np.ndarray]:
-        """Fragt die Policy ab."""
-        with torch.no_grad():
-            x = torch.FloatTensor(features).unsqueeze(0).to(self._device)
-
-            # Für Sequenz-Modelle: Buffer nutzen
-            if isinstance(self._policy_model, (GraspPolicyLSTM, GraspPolicyTransformer)):
-                self._seq_buffer.append(features)
-                if len(self._seq_buffer) > self._seq_len:
-                    self._seq_buffer = self._seq_buffer[-self._seq_len:]
-
-                seq = np.stack(self._seq_buffer)
-                x = torch.FloatTensor(seq).unsqueeze(0).to(self._device)
-
-            logits = self._policy_model(x)
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
-            action_idx = int(logits.argmax(dim=-1).item())
-
-        return action_idx, probs
-
-    # ─── Aktion ausführen ─────────────────────────────────────────────────
-
-    def _execute_action(self, action: str):
-        """Führt eine Aktion auf dem Arm aus."""
-        state = self._arm_state
-
-        if action == "base_left":
-            state["base_deg"] = max(self.BASE_MIN, state["base_deg"] - self.BASE_STEP)
-        elif action == "base_right":
-            state["base_deg"] = min(self.BASE_MAX, state["base_deg"] + self.BASE_STEP)
-        elif action == "shoulder_up":
-            state["shoulder_deg"] = min(self.SHOULDER_MAX, state["shoulder_deg"] + self.SHOULDER_STEP)
-        elif action == "shoulder_down":
-            state["shoulder_deg"] = max(self.SHOULDER_MIN, state["shoulder_deg"] - self.SHOULDER_STEP)
-        elif action == "elbow_up":
-            state["elbow_deg"] = min(self.ELBOW_MAX, state["elbow_deg"] + self.ELBOW_STEP)
-        elif action == "elbow_down":
-            state["elbow_deg"] = max(self.ELBOW_MIN, state["elbow_deg"] - self.ELBOW_STEP)
-        elif action == "hand_left":
-            state["hand_deg"] = max(self.HAND_MIN, state["hand_deg"] - self.HAND_STEP)
-        elif action == "hand_right":
-            state["hand_deg"] = min(self.HAND_MAX, state["hand_deg"] + self.HAND_STEP)
-        elif action == "gripper_open":
-            if not state["gripper_open"]:
-                self._arm.gripper_open()
-                state["gripper_open"] = True
-            return  # Kein Joint-Move nötig
-        elif action == "gripper_close":
-            if state["gripper_open"]:
-                self._arm.gripper_close()
-                state["gripper_open"] = False
-            return  # Kein Joint-Move nötig
-        elif action == "":
-            return  # Idle
-
-        # Joint-Befehl senden
-        self._arm.move_joints_degrees(
-            b=state["base_deg"],
-            s=state["shoulder_deg"],
-            e=state["elbow_deg"],
-            h=state["hand_deg"],
-            spd=self.MOVE_SPEED,
-            acc=self.MOVE_ACC,
-        )
-
-    # ─── Hilfsfunktionen ─────────────────────────────────────────────────
-
-    def _get_frame(self):
-        if not self._camera:
-            return None
-        self._camera.grab()
-        ret, frame = self._camera.retrieve()
-        return frame if ret else None
-
-    def _detect(self, frame) -> List[Dict]:
-        if not self._yolo_model or frame is None:
-            return []
-
-        results = self._yolo_model(frame, conf=self._confidence, verbose=False)[0]
-        detections = []
-
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            cls_name = results.names[cls_id]
-            conf = float(box.conf[0])
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-
-            if self._target_class and cls_name != self._target_class:
-                continue
-
-            detections.append({
-                'class': cls_name,
-                'confidence': conf,
-                'bbox': [x1, y1, x2, y2],
-                'center_px': [cx, cy],
-                'size_px': [x2 - x1, y2 - y1],
-            })
-
-        detections.sort(key=lambda d: d['confidence'], reverse=True)
-        return detections
-
-    def _build_frame_data(self, detections: List[Dict]) -> Dict:
-        """Baut ein Frame-Dict wie es extract_frame_features erwartet."""
-        state = self._arm_state
-
-        # Relative zum Target
-        rel_to_target = None
-        if detections:
-            best = detections[0]
-            cx, cy = best['center_px']
-            rel_to_target = {
-                "offset_px_x": cx - 320,
-                "offset_px_y": cy - 240,
-                "target_size_px": best['size_px'],
-            }
-
-        return {
-            "arm_state": state,
-            "detections": detections,
-            "rel_to_target": rel_to_target,
-        }
-
-    def _annotate_frame(self, frame, detections: List[Dict],
-                        action: str, probs: np.ndarray):
-        """Zeichnet Policy-Infos auf den Frame."""
+    def _annotate_frame(self, frame, action: Optional[np.ndarray], step: int,
+                        total_steps: int, episode: int, fps: float):
+        """Draw status overlay on camera frame."""
         if frame is None:
             return
 
         h_f, w_f = frame.shape[:2]
+        state = self._current_state
 
-        # Detections
-        for det in detections:
-            x1, y1, x2, y2 = [int(v) for v in det['bbox']]
-            label = f"{det['class']} {det['confidence']:.2f}"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        # Semi-transparent header
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w_f, 70), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-        # Fadenkreuz
-        cv2.drawMarker(frame, (w_f // 2, h_f // 2), (128, 128, 128),
-                       cv2.MARKER_CROSS, 30, 1)
-
-        # Status
-        state = self._arm_state
-        status = (f"B:{state['base_deg']:.0f} S:{state['shoulder_deg']:.0f} "
-                  f"E:{state['elbow_deg']:.0f} H:{state['hand_deg']:.0f} "
-                  f"G:{'O' if state['gripper_open'] else 'C'}")
+        # Status text
+        status = "▶ EXECUTING" if self._executing else "⏸ PAUSED"
+        color = (0, 255, 0) if self._executing else (0, 200, 255)
         cv2.putText(frame, status, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Aktion + Confidence
-        if action:
-            conf = probs[ACTION_TO_IDX.get(action, 0)]
-            action_text = f"ACTION: {action} ({conf:.2f})"
-            cv2.putText(frame, action_text, (10, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # Episode/Step info
+        info = f"Episode {episode} | Step {step} | Speed: {self._speed_scale:.1f}x | FPS: {fps:.0f}"
+        cv2.putText(frame, info, (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
-        # Step-Counter
-        cv2.putText(frame, f"Step: {self._step_count}/{self._max_steps}",
-                    (w_f - 200, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # Joint state (bottom)
+        state_str = (f"B:{state[0]:.1f} S:{state[1]:.1f} "
+                     f"E:{state[2]:.1f} H:{state[3]:.1f} "
+                     f"G:{'C' if state[4] > 0.5 else 'O'}")
 
-        # Top-3 Aktionen
-        top_indices = np.argsort(probs)[::-1][:3]
-        for i, idx in enumerate(top_indices):
-            name = ACTION_SPACE[idx] if ACTION_SPACE[idx] else "(idle)"
-            text = f"{name}: {probs[idx]:.2f}"
-            cv2.putText(frame, text, (w_f - 200, 55 + i * 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+        overlay2 = frame.copy()
+        cv2.rectangle(overlay2, (0, h_f - 35), (w_f, h_f), (0, 0, 0), -1)
+        cv2.addWeighted(overlay2, 0.6, frame, 0.4, 0, frame)
+        cv2.putText(frame, state_str, (10, h_f - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # AUTONOM-Indikator
-        cv2.putText(frame, "AUTONOM", (10, h_f - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # Action visualization (if available)
+        if action is not None:
+            action_str = (f"→ B:{action[0]:.1f} S:{action[1]:.1f} "
+                          f"E:{action[2]:.1f} H:{action[3]:.1f} "
+                          f"G:{'C' if action[4] > 0.5 else 'O'}")
+            cv2.putText(frame, action_str, (10, h_f - 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 200), 1)
 
-    # ─── Shutdown ─────────────────────────────────────────────────────────
+        # Controls hint
+        cv2.putText(frame, "SPACE=Start/Stop  R=Reset  +/-=Speed  Q=Quit",
+                    (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+
+    # ─── Main Loop ────────────────────────────────────────────────────────
+
+    def run(self):
+        """Main execution loop."""
+        if not self.setup():
+            return
+
+        self._running = True
+        window_name = "RoArm Policy Runner"
+
+        control_interval = 1.0 / self.CONTROL_HZ
+        fps_time = time.time()
+        frame_count = 0
+        current_fps = 0.0
+
+        episode = 0
+        step = 0
+        last_action = None
+
+        print(f"\n  Ready! Press SPACE to start policy execution.\n")
+
+        try:
+            while self._running:
+                loop_start = time.time()
+
+                # ─── Camera frame ───
+                frame = None
+                if self._camera:
+                    self._camera.grab()
+                    ret, frame = self._camera.retrieve()
+                    if not ret:
+                        frame = None
+
+                # ─── Key handling ───
+                key = cv2.waitKey(1) & 0xFF if HAS_CV2 and not self._headless else -1
+
+                if key == ord('q'):
+                    self._running = False
+                    break
+                elif key == ord(' '):
+                    if not self._executing:
+                        # Start execution
+                        self._executing = True
+                        episode += 1
+                        step = 0
+                        self._action_queue = []
+                        self._ensemble_buffer = []
+                        print(f"\n  ▶ Episode {episode} started!")
+                    else:
+                        # Stop execution
+                        self._executing = False
+                        print(f"  ⏸ Episode {episode} paused at step {step}")
+                elif key == ord('r'):
+                    self._executing = False
+                    self._reset_arm()
+                    episode = 0
+                    step = 0
+                elif key == ord('+') or key == ord('='):
+                    self._speed_scale = min(3.0, self._speed_scale + 0.1)
+                    print(f"  ⚡ Speed: {self._speed_scale:.1f}x")
+                elif key == ord('-') or key == ord('_'):
+                    self._speed_scale = max(0.1, self._speed_scale - 0.1)
+                    print(f"  ⚡ Speed: {self._speed_scale:.1f}x")
+
+                # ─── Policy execution ───
+                if self._executing:
+                    # Get next action from model
+                    action = self._get_next_action(self._current_state)
+
+                    # Safety: clamp to limits
+                    action = self._clamp_action(action)
+
+                    # Smoothing: limit max change per step
+                    action = self._smooth_action(action, self._current_state,
+                                                  max_delta_deg=3.0 * self._speed_scale)
+
+                    # Execute on arm
+                    self._execute_action(action)
+                    last_action = action
+                    step += 1
+
+                    # Check if episode should end (e.g., after N steps)
+                    max_steps = self._chunk_size * 20  # ~200 steps max
+                    if step >= max_steps:
+                        self._executing = False
+                        print(f"  ■ Episode {episode} complete ({step} steps)")
+
+                        if episode >= self._num_episodes:
+                            print(f"\n  ✓ All {self._num_episodes} episodes complete!")
+                            self._running = False
+
+                # ─── Visualization ───
+                if frame is not None and not self._headless:
+                    self._annotate_frame(frame, last_action, step, 0, episode, current_fps)
+                    cv2.imshow(window_name, frame)
+
+                # ─── FPS tracking ───
+                frame_count += 1
+                elapsed = time.time() - fps_time
+                if elapsed >= 1.0:
+                    current_fps = frame_count / elapsed
+                    frame_count = 0
+                    fps_time = time.time()
+
+                # ─── Rate limiting ───
+                loop_elapsed = time.time() - loop_start
+                sleep_time = max(0.001, control_interval - loop_elapsed)
+                time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            print("\n  [Interrupted]")
+        finally:
+            self._shutdown()
 
     def _shutdown(self):
-        print("\n[Shutdown]...")
+        """Clean shutdown."""
+        print("\n  Shutting down...")
+        self._executing = False
+
         if self._arm:
+            self._arm.gripper_open()
+            time.sleep(0.3)
             self._arm.park()
-            time.sleep(1.0)
+            time.sleep(1.5)
+            self._arm.set_led(0)
             self._arm.disconnect()
+
         if self._camera:
             self._camera.release()
-        cv2.destroyAllWindows()
-        print("  ✓ Fertig")
+
+        if HAS_CV2:
+            cv2.destroyAllWindows()
+
+        print("  ✓ Done!")
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Run trained grasp policy")
-    parser.add_argument("--model", type=str, required=True, help="Pfad zum trainierten Modell (.pt)")
-    parser.add_argument("--port", type=str, default=None, help="Serieller Port")
-    parser.add_argument("--camera", type=int, default=2, help="Kamera-Index")
-    parser.add_argument("--yolo", type=str, default="yolo11n.pt", help="YOLO-Modell für Detection")
-    parser.add_argument("--confidence", type=float, default=0.5, help="Min. Detection Confidence")
-    parser.add_argument("--target", type=str, default=None, help="Ziel-Objekt")
-    parser.add_argument("--episodes", type=int, default=1, help="Anzahl Episoden")
-    parser.add_argument("--max-steps", type=int, default=500, help="Max. Steps pro Episode")
-    parser.add_argument("--interval", type=float, default=0.1, help="Sekunden zwischen Aktionen")
-    parser.add_argument("--device", type=str, default="auto", help="Device (auto/cpu/cuda)")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="🤖 Run trained LeRobot policy on RoArm-M2-S",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run with default settings
+  python3 run_policy.py trained_models/model_final.pt
 
-    runner = PolicyRunner(
-        model_path=args.model,
-        port=args.port,
-        camera_index=args.camera,
-        yolo_model=args.yolo,
-        confidence=args.confidence,
-        target_class=args.target,
-        max_steps=args.max_steps,
-        action_interval=args.interval,
-        device=args.device,
+  # Run 3 episodes at half speed
+  python3 run_policy.py trained_models/model_final.pt --episodes 3 --speed-scale 0.5
+
+  # Use specific port, no camera
+  python3 run_policy.py trained_models/model_final.pt --port /dev/ttyUSB0 --headless
+
+  # Use best checkpoint
+  python3 run_policy.py trained_models/checkpoint_best.pt
+        """
     )
 
-    runner.run(num_episodes=args.episodes)
+    parser.add_argument("model_path", type=str,
+                        help="Path to trained model (.pt file)")
+    parser.add_argument("--port", type=str, default=None,
+                        help="Serial port (auto-detected if not specified)")
+    parser.add_argument("--camera", type=int, default=2,
+                        help="Camera index (default: 2)")
+    parser.add_argument("--episodes", type=int, default=1,
+                        help="Number of episodes to run (default: 1)")
+    parser.add_argument("--speed-scale", type=float, default=1.0,
+                        help="Execution speed multiplier (default: 1.0)")
+    parser.add_argument("--no-ensemble", action="store_true",
+                        help="Disable temporal ensemble (use raw predictions)")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without camera preview")
+
+    args = parser.parse_args()
+
+    if not Path(args.model_path).exists():
+        print(f"ERROR: Model file not found: {args.model_path}")
+        sys.exit(1)
+
+    runner = PolicyRunner(
+        model_path=args.model_path,
+        port=args.port,
+        camera_index=args.camera,
+        speed_scale=args.speed_scale,
+        num_episodes=args.episodes,
+        temporal_ensemble=not args.no_ensemble,
+        headless=args.headless,
+    )
+    runner.run()
 
 
 if __name__ == "__main__":
