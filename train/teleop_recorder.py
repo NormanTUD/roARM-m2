@@ -561,7 +561,7 @@ class LeRobotSaver:
                     "names": ["height", "width", "channels"],
                     "video_info": {
                         "video.fps": self._fps,
-                        "video.codec": "av1",
+                        "video.codec": "h264",
                         "video.pix_fmt": "yuv420p",
                         "has_audio": False
                     }
@@ -602,25 +602,26 @@ class LeRobotSaver:
         with open(self._info_path, 'w') as f:
             json.dump(info, f, indent=2)
 
+
     def save_episode(self, episode: Episode, frames_images: List[np.ndarray] = None) -> Path:
         """
         Speichert eine Episode im LeRobot-Format.
-        
+
         Args:
             episode: Die aufgezeichnete Episode
-            frames_images: Liste von Kamera-Frames (numpy arrays) für Video
-            
+            frames_images: Liste von RAW Kamera-Frames (numpy arrays) für Video
+
         Returns:
             Pfad zur gespeicherten Parquet-Datei
         """
         ep_idx = episode.episode_id - 1  # 0-basiert
-        
+
         # ─── Parquet-Daten vorbereiten ───
         records = []
         for i, frame_data in enumerate(episode.frames):
             arm = frame_data["arm_state"]
             action_str = frame_data.get("action", "")
-            
+
             # Nächster State als Action (oder gleicher State wenn letzter Frame)
             if i < len(episode.frames) - 1:
                 next_arm = episode.frames[i + 1]["arm_state"]
@@ -639,7 +640,10 @@ class LeRobotSaver:
                     arm["hand_deg"],
                     0.0 if arm["gripper_open"] else 1.0
                 ]
-            
+
+            # Timestamp basierend auf Frame-Index und FPS (konsistent mit Video)
+            timestamp_from_index = i / self._fps
+
             record = {
                 "observation.state": [
                     arm["base_deg"],
@@ -647,38 +651,43 @@ class LeRobotSaver:
                     arm["elbow_deg"],
                     arm["hand_deg"]
                 ],
-                "observation.gripper": [0.0 if arm["gripper_open"] else 1.0],                "action": action_vec,
-                "timestamp": [frame_data["timestamp"]],
+                "observation.gripper": [0.0 if arm["gripper_open"] else 1.0],
+                "action": action_vec,
+                "timestamp": [timestamp_from_index],
                 "episode_index": [ep_idx],
                 "frame_index": [i],
                 "index": [self._total_frames + i],
                 "task_index": [0],
-                # Zusätzliche Daten für Replay
+                # Zusätzliche Daten für Replay und Training
                 "action_label": action_str,
+                # Speed/Acc für Replay-Fidelity
+                "servo_spd": frame_data.get("servo_spd", 50),
+                "servo_acc": frame_data.get("servo_acc", 100),
+                "led_brightness": frame_data.get("led_brightness", 255),
             }
-            
+
             # Detections als JSON-String speichern
             if frame_data.get("detections"):
                 record["detections_json"] = json.dumps(frame_data["detections"])
             else:
                 record["detections_json"] = "[]"
-            
+
             if frame_data.get("rel_to_target"):
                 record["rel_to_target_json"] = json.dumps(frame_data["rel_to_target"])
             else:
                 record["rel_to_target_json"] = "{}"
-            
+
             records.append(record)
-        
+
         # ─── Als Parquet speichern ───
         parquet_path = self._data_dir / f"episode_{ep_idx:06d}.parquet"
-        
+
         if HAS_PARQUET and records:
             # Konvertiere zu spaltenbasiertem Format
             columns = {}
             for key in records[0].keys():
                 columns[key] = [r[key] for r in records]
-            
+
             table = pa.table(columns)
             pq.write_table(table, parquet_path)
         else:
@@ -687,62 +696,160 @@ class LeRobotSaver:
             with open(json_path, 'w') as f:
                 json.dump(records, f, indent=2)
             parquet_path = json_path
-        
+
         # ─── Video speichern (wenn Frames vorhanden) ───
         if frames_images and len(frames_images) > 0:
             video_path = self._video_dir / f"episode_{ep_idx:06d}.mp4"
             self._save_video(frames_images, video_path)
-        
-        # ─── Episode-Index aktualisieren ───
+
+        # ─── Episode-Index aktualisieren (LeRobot v2.1 Format) ───
         num_frames = len(episode.frames)
         episode_entry = {
             "episode_index": ep_idx,
-            "task_index": 0,
-            "task": "Pick up target object with robot arm",
+            "tasks": [episode.target_class or "Pick up target object with robot arm"],
             "length": num_frames,
-            "target_class": episode.target_class,
-            "success": episode.success,
-            "duration_s": episode.end_time - episode.start_time
         }
         with open(self._episodes_path, 'a') as f:
             f.write(json.dumps(episode_entry) + "\n")
-        
+
+        # ─── Tasks aktualisieren ───
+        self._update_tasks(episode.target_class)
+
         # ─── Metadaten aktualisieren ───
         self._total_episodes += 1
         self._total_frames += num_frames
         self._save_info()
         self._update_stats(records)
-        
+
         return parquet_path
 
+
     def _save_video(self, frames: List[np.ndarray], video_path: Path):
-        """Speichert Frames als MP4-Video."""
+        """Speichert Frames als MP4-Video mit H.264 Codec (LeRobot-kompatibel)."""
         if not frames:
             return
-        
+
         h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(str(video_path), fourcc, self._fps, (w, h))
-        
+
+        # H.264 Codec – LeRobot-kompatibel
+        # Versuche verschiedene H.264 FourCC-Codes (plattformabhängig)
+        codecs_to_try = [
+            ('avc1', '.mp4'),   # H.264 (macOS/Windows)
+            ('x264', '.mp4'),   # H.264 (Linux mit x264)
+            ('H264', '.mp4'),   # H.264 (alternative)
+            ('mp4v', '.mp4'),   # MPEG-4 Fallback
+        ]
+
+        writer = None
+        for codec, ext in codecs_to_try:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            writer = cv2.VideoWriter(str(video_path), fourcc, self._fps, (w, h))
+            if writer.isOpened():
+                break
+            writer.release()
+            writer = None
+
+        if writer is None:
+            # Letzter Fallback
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(str(video_path), fourcc, self._fps, (w, h))
+
         for frame in frames:
             writer.write(frame)
-        
+
         writer.release()
+
+        # Optional: mit ffmpeg zu H.264 re-encoden falls mp4v verwendet wurde
+        self._try_reencode_h264(video_path)
+
+
+    def _try_reencode_h264(self, video_path: Path):
+        """Versucht das Video mit ffmpeg zu H.264 zu re-encoden für maximale Kompatibilität."""
+        import subprocess
+        import shutil
+
+        # Prüfe ob ffmpeg verfügbar ist
+        if not shutil.which("ffmpeg"):
+            return
+
+        temp_path = video_path.with_suffix('.tmp.mp4')
+
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", str(video_path),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-an",  # kein Audio
+                    str(temp_path)
+                ],
+                capture_output=True,
+                timeout=60
+            )
+
+            if result.returncode == 0 and temp_path.exists():
+                # Ersetze Original mit re-encodiertem Video
+                temp_path.replace(video_path)
+            else:
+                # Cleanup bei Fehler
+                if temp_path.exists():
+                    temp_path.unlink()
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            # ffmpeg nicht verfügbar oder Fehler – Original behalten
+            if temp_path.exists():
+                temp_path.unlink()
+
+
+    def _update_tasks(self, target_class: str):
+        """Aktualisiert die tasks.jsonl mit allen bekannten Tasks."""
+        # Lese bestehende Tasks
+        existing_tasks = set()
+        if self._tasks_path.exists():
+            with open(self._tasks_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            task_data = json.loads(line)
+                            existing_tasks.add(task_data.get("task", ""))
+                        except json.JSONDecodeError:
+                            pass
+
+        task_str = target_class or "Pick up target object with robot arm"
+
+        if task_str not in existing_tasks:
+            task_entry = {
+                "task_index": len(existing_tasks),
+                "task": task_str
+            }
+            with open(self._tasks_path, 'a') as f:
+                f.write(json.dumps(task_entry) + "\n")
+
 
     def _update_stats(self, records: List[Dict]):
         """Aktualisiert Statistiken über alle Episoden."""
         if not records:
             return
-        
+
         states = np.array([r["observation.state"] for r in records])
         actions = np.array([r["action"] for r in records])
-        
+        grippers = np.array([r["observation.gripper"] for r in records])
+
         stats = {
             "observation.state": {
                 "min": states.min(axis=0).tolist(),
                 "max": states.max(axis=0).tolist(),
                 "mean": states.mean(axis=0).tolist(),
                 "std": states.std(axis=0).tolist()
+            },
+            "observation.gripper": {
+                "min": grippers.min(axis=0).tolist(),
+                "max": grippers.max(axis=0).tolist(),
+                "mean": grippers.mean(axis=0).tolist(),
+                "std": grippers.std(axis=0).tolist()
             },
             "action": {
                 "min": actions.min(axis=0).tolist(),
@@ -751,9 +858,10 @@ class LeRobotSaver:
                 "std": actions.std(axis=0).tolist()
             }
         }
-        
+
         with open(self._stats_path, 'w') as f:
             json.dump(stats, f, indent=2)
+
 
 # ─── Replay Engine ────────────────────────────────────────────────────────────
 
@@ -1163,12 +1271,13 @@ class TeleopRecorder:
         self._arm.set_led(255)
         self._led_brightness = 255
 
-        # LeRobot Saver
+        # LeRobot Saver – FPS = 30.0 (Recording wird auf 30 FPS gethrttled)
+        self._recording_fps = 30.0
         self._lerobot_saver = LeRobotSaver(
             output_dir=self._output_dir / "lerobot_dataset",
-            fps=30.0
+            fps=self._recording_fps
         )
-        self._ui.print_status(f"LeRobot Saver → {self._output_dir / 'lerobot_dataset'}")
+        self._ui.print_status(f"LeRobot Saver → {self._output_dir / 'lerobot_dataset'} @ {self._recording_fps} FPS")
 
         # Replay Engine
         self._replay_engine = ReplayEngine(self._arm, self._camera)
@@ -1192,7 +1301,7 @@ class TeleopRecorder:
             time.sleep(self.COMMAND_INTERVAL)
 
     def run(self):
-        """Hauptschleife."""
+        """Hauptschleife – mit korrekter Frame-Reihenfolge für LeRobot."""
         if not self.setup():
             return
 
@@ -1208,6 +1317,11 @@ class TeleopRecorder:
         detect_every_n = 3
         loop_counter = 0
         last_detections = []
+
+        # Recording FPS Throttle
+        recording_fps = 30.0
+        recording_interval = 1.0 / recording_fps
+        last_record_time = 0.0
 
         try:
             while self._running:
@@ -1225,6 +1339,7 @@ class TeleopRecorder:
                     last_detections = self._detect(frame)
                 detections = last_detections
 
+                # 3. Key processing
                 action = ""
                 for _ in range(50):
                     key = cv2.waitKey(1) & 0xFFFF
@@ -1245,16 +1360,25 @@ class TeleopRecorder:
                 # 5. Update active keys for display
                 self._active_keys_display = self._get_active_keys()
 
-                # 6. Annotate (mit neuen Overlays)
+                # ══════════════════════════════════════════════════════════════
+                # 6. RECORD RAW FRAME (VOR Annotation!) – das ist der Fix!
+                #    LeRobot braucht rohe Kamerabilder ohne Overlays.
+                #    Die Annotations sind in den Parquet-Daten gespeichert.
+                # ══════════════════════════════════════════════════════════════
+                if self._recording:
+                    now = time.time()
+                    # Throttle Recording auf exakt 30 FPS
+                    if now - last_record_time >= recording_interval:
+                        self._record_frame(detections, action)
+                        if self._record_video:
+                            # RAW frame kopieren (ohne Overlays!)
+                            self._frame_buffer.append(frame.copy())
+                        last_record_time = now
+
+                # 7. Annotate (NUR für Display – NACH dem Recording!)
                 self._annotate_frame(frame, detections, action, current_fps)
 
-                # 7. Record
-                if self._recording:
-                    self._record_frame(detections, action)
-                    if self._record_video:
-                        self._frame_buffer.append(frame.copy())
-
-                # 8. Display
+                # 8. Display (annotierter Frame für den Benutzer)
                 cv2.imshow(self._window_name, frame)
 
                 # FPS
@@ -1265,7 +1389,7 @@ class TeleopRecorder:
                     frame_count = 0
                     fps_time = time.time()
 
-                # Target ~40 FPS
+                # Target ~40 FPS Display
                 loop_elapsed = time.time() - loop_start
                 sleep_time = max(0.001, (1.0 / 40.0) - loop_elapsed)
                 time.sleep(sleep_time)
@@ -1274,6 +1398,7 @@ class TeleopRecorder:
             print("\n[Abgebrochen]")
         finally:
             self._shutdown()
+
 
     # ─── Frame & Detection ────────────────────────────────────────────────────
 
