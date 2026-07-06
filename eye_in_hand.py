@@ -567,21 +567,24 @@ class EyeInHandController:
                 _success(f"Zentriert! (Dist={pixel_dist:.0f}px)")
                 return True
 
-            dx_mm, dy_mm = self._pixel_offset_mm(detection['center_px'])
-            _info(f"Iter {i+1}: Offset=({dx_mm:.1f}, {dy_mm:.1f})mm, Dist={pixel_dist:.0f}px")
+            # *** FIX: 3 Werte entpacken ***
+            dx_mm, dy_mm, dz_mm = self._pixel_offset_mm(detection['center_px'])
+            _info(f"Iter {i+1}: Offset=({dx_mm:.1f}, {dy_mm:.1f}, {dz_mm:.1f})mm, Dist={pixel_dist:.0f}px")
 
-            # *** HIER DER FIX: Fallback auf Tracker ***
+            # Position holen (mit Tracker-Fallback)
             cur_x, cur_y, cur_z = self._get_position()
 
-            new_x = cur_x + dx_mm * self.cal.damping
+            # Neue Position: X bleibt (Kamera schaut nach vorne), Y und Z anpassen
+            new_x = cur_x + dx_mm * self.cal.damping   # sollte 0 sein
             new_y = cur_y + dy_mm * self.cal.damping
+            new_z = cur_z + dz_mm * self.cal.damping
 
             dist = (new_x**2 + new_y**2) ** 0.5
             if dist > self.arm.MAX_REACH:
                 _error(f"Außerhalb Reichweite ({dist:.0f}mm)!")
                 return False
 
-            self._move_cartesian(new_x, new_y, cur_z, t=3.14, spd=0.15)
+            self._move_cartesian(new_x, new_y, new_z, t=3.14, spd=0.15)
             self._update_for(1.2, [target_class], "Bewege...")
 
         return False
