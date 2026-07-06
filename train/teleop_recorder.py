@@ -78,12 +78,12 @@ class TeleopRecorder:
     """
 
     # Steuerungs-Parameter
-    BASE_STEP = 2.0        # Grad pro Tick
-    SHOULDER_STEP = 1.5    # Grad pro Tick
-    ELBOW_STEP = 1.5       # Grad pro Tick
-    HAND_STEP = 3.0        # Grad pro Tick
-    MOVE_SPEED = 50        # Servo-Speed
-    MOVE_ACC = 20          # Servo-Acceleration
+    MOVE_INTERVAL = 0.03     # Send commands faster (33Hz)
+    BASE_STEP = 3.0          # Slightly larger steps
+    SHOULDER_STEP = 2.0
+    ELBOW_STEP = 2.0
+    MOVE_SPEED = 80          # Higher servo speed so it doesn't "wait" at target
+    MOVE_ACC = 30
 
     # Limits
     BASE_MIN, BASE_MAX = -90.0, 90.0
@@ -473,13 +473,15 @@ class TeleopRecorder:
     def _gripper_open(self):
         """Öffnet den Gripper und synchronisiert hand_deg."""
         self._arm_state.gripper_open = True
-        self._arm_state.hand_deg = self.GRIPPER_OPEN_DEG
+        GRIPPER_OPEN_DEG = 61.88    # 1.08 rad = open
+        self._arm_state.hand_deg = GRIPPER_OPEN_DEG
         self._arm.gripper_open()
 
     def _gripper_close(self):
         """Schließt den Gripper und synchronisiert hand_deg."""
         self._arm_state.gripper_open = False
-        self._arm_state.hand_deg = self.GRIPPER_CLOSED_DEG
+        GRIPPER_CLOSED_DEG = 180.0  # 3.14 rad = closed
+        self._arm_state.hand_deg = GRIPPER_CLOSED_DEG
         self._arm.gripper_close()
 
     # ─── Recording ────────────────────────────────────────────────────────
