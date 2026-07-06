@@ -104,7 +104,7 @@ class TeleopRecorder:
     HAND_MIN, HAND_MAX = 0.0, 270.0
 
     # Timing für flüssige Steuerung
-    KEY_HOLD_TIMEOUT = 0.15  # Sekunden: Taste gilt als "gehalten" für diese Dauer nach letztem Druck
+    KEY_HOLD_TIMEOUT = 0.35  # Sekunden: Taste gilt als "gehalten" für diese Dauer nach letztem Druck
 
     def __init__(self, port: str = None, camera_index: int = 2,
                  model_path: str = "yolo11n.pt", confidence: float = 0.5,
@@ -254,13 +254,26 @@ class TeleopRecorder:
 
     # ─── Main Loop ────────────────────────────────────────────────────────
 
+    def _command_loop(self):
+        """
+        Dedicated thread: sends arm commands at a fixed 50Hz rate,
+        completely independent of the display/detection loop.
+        """
+        while self._running:
+            self._apply_movement()
+            time.sleep(self.COMMAND_INTERVAL)  # Precise 20ms sleep
+
     def run(self):
-        """Hauptschleife – display and command sending are decoupled."""
+        """Hauptschleife – start command thread, then run display loop."""
         if not self.setup():
             return
 
         self._running = True
         self._last_cmd_time = time.time()
+
+        # START A REAL COMMAND THREAD
+        self._cmd_thread = threading.Thread(target=self._command_loop, daemon=True)
+        self._cmd_thread.start()
         fps_time = time.time()
         frame_count = 0
         current_fps = 0.0
@@ -288,11 +301,12 @@ class TeleopRecorder:
 
                 # 3. Process ALL pending key events (drain the event queue)
                 action = ""
-                for _ in range(10):  # Process up to 10 queued events
+                for _ in range(50):  # Was 10, but at 40fps we might queue more
                     key = cv2.waitKey(1) & 0xFFFF
                     if key == -1 or key == 0xFFFF:
                         break
-                    action = self._process_key(key) or action
+                    self._process_key(key)
+
 
                 # 4. Apply movement (at fixed rate, independent of display)
                 self._apply_movement()
