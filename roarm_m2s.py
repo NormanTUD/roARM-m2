@@ -342,7 +342,7 @@ class RoArmM2S:
         return self._send({"T": 100}, wait_time=wait)
 
     def move_joints_degrees(self, b=0, s=0, e=90, h=180, spd=10, acc=10) -> List[str]:
-        return self._send({"T": 122, "b": b, "s": s, "e": e, "h": h, "spd": spd, "acc": acc}, 2.0)
+        return self._send({"T": 122, "b": b, "s": s, "e": e, "h": h, "spd": spd, "acc": acc}, 0.05)
 
     def move_joints_radians(self, base=0, shoulder=0, elbow=1.57, hand=3.14, spd=0, acc=10) -> List[str]:
         return self._send({"T": 102, "base": base, "shoulder": shoulder,
