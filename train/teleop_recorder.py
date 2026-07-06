@@ -9,8 +9,8 @@ Steuerung:
   A/D                        → Hand/Wrist Rotation (A = links, D = rechts)
   O                          → Gripper öffnen
   C                          → Gripper schließen
-  R                          → Aufnahme starten (neue Episode)
-  S (nur bei Aufnahme)       → Episode speichern & beenden
+  CTRL R                          → Aufnahme starten (neue Episode)
+  CTRL S (nur bei Aufnahme)       → Episode speichern & beenden
   F                          → Episode als fehlgeschlagen markieren & speichern
   P                          → Letzte Episode 1:1 abspielen (Replay)
   Q                          → Beenden
