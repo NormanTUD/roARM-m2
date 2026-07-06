@@ -342,7 +342,7 @@ class RoArmM2S:
         return self._send({"T": 100}, wait_time=wait)
 
     def move_joints_degrees(self, b=0, s=0, e=90, h=180, spd=10, acc=10) -> List[str]:
-        return self._send({"T": 122, "b": b, "s": s, "e": e, "h": h, "spd": spd, "acc": acc}, 0.05)
+        return self._send({"T": 122, "b": b, "s": s, "e": e, "h": h, "spd": spd, "acc": acc}, 0.001)
 
     def move_joints_radians(self, base=0, shoulder=0, elbow=1.57, hand=3.14, spd=0, acc=10) -> List[str]:
         return self._send({"T": 102, "base": base, "shoulder": shoulder,
@@ -829,3 +829,26 @@ class RoArmM2S:
         time.sleep(1.0)
 
         print("\n  ✓ Demo fertig!")
+
+    def _send_nowait(self, command: dict):
+        """
+        Send command without waiting for response. For continuous streaming.
+        Uses non-blocking lock to avoid stalling the control loop.
+        Periodically drains input buffer to prevent overflow.
+        """
+        if not self.is_connected:
+            return
+        # Non-blocking: if something else holds the lock, skip this cycle
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            msg = json.dumps(command, separators=(',', ':')) + '\n'
+            self.ser.write(msg.encode('utf-8'))
+            self.ser.flush()
+            # Drain buffer every time, but don't use reset (can corrupt mid-message)
+            while self.ser.in_waiting:
+                self.ser.readline()
+        finally:
+            self._lock.release()
+
