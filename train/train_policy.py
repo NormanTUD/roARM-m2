@@ -1441,4 +1441,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Exited because you pressed CTRL-c")
+        sys.exit(0)
