@@ -142,6 +142,8 @@ class TeleopRecorder:
         # Window
         self._window_name = "RoArm Teleop"
 
+        self._arm.set_led(255)
+
     def _count_existing_episodes(self) -> int:
         """Zählt bereits vorhandene Episoden im Output-Verzeichnis."""
         count = 0
@@ -713,6 +715,7 @@ class TeleopRecorder:
         print("\n[Shutdown]...")
         if self._arm:
             self._arm.park()
+            self._arm.set_led(0)
             time.sleep(1.0)
             self._arm.disconnect()
         if self._camera:
