@@ -46,7 +46,7 @@ except ImportError:
 from roarm_m2s import RoArmM2S
 
 # Import model classes from training script
-from train_lerobot import ACTPolicy, DiffusionPolicy, TDMPCPolicy, load_model
+from train_policy import ACTPolicy, DiffusionPolicy, TDMPCPolicy, load_model
 
 
 class PolicyRunner:
