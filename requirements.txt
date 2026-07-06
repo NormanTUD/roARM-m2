@@ -9,3 +9,4 @@ urllib3==2.0.4
 opencv-contrib-python
 ultralytics
 lerobot
+rich
