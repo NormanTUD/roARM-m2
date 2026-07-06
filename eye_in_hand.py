@@ -541,11 +541,31 @@ class EyeInHandController:
 
     # ─── Zentrieren ───────────────────────────────────────────────────────
 
-    def _center_over(self, target_class: str, max_iter: int = 8) -> bool:
-        """Iterativ über dem Objekt zentrieren – mit Tracker-Fallback."""
+    def _center_over(self, target_class: str, max_iter: int = 12) -> bool:
+        """
+        Iterativ über dem Objekt zentrieren.
+        
+        Nutzt:
+        - Pixel-Offset für Y/Z-Korrektur (links/rechts, hoch/runter)
+        - Bounding-Box-Größe (gemittelt über N Frames) für X-Korrektur (näher/weiter)
+        - Größenänderung nach Bewegung → Feedback ob Richtung stimmt
+        """
+        
+        # --- Parameter ---
+        TARGET_BB_HEIGHT = 200.0  # Ziel-Höhe der BBox in Pixeln (= "nah genug zum Greifen")
+        DEPTH_STEP_MM = 15.0     # Wie viel mm pro Schritt in X (vor/zurück)
+        SMOOTHING_FRAMES = 4     # Über wie viele Frames mitteln
+        MIN_MOVE_PX = 5.0        # Minimaler Offset bevor bewegt wird
+        
+        prev_bb_height = None  # Für Richtungs-Feedback
+        
         for i in range(max_iter):
-            detection = None
-            for _ in range(5):
+            # --- Stabile Detection: über mehrere Frames mitteln ---
+            centers = []
+            bb_heights = []
+            bb_widths = []
+            
+            for _ in range(SMOOTHING_FRAMES * 2):  # Mehr Versuche als nötig
                 detections, key = self._update(
                     [target_class],
                     f"Zentriere... (Iter {i+1}/{max_iter})"
@@ -553,40 +573,110 @@ class EyeInHandController:
                 if key == ord('q'):
                     return False
                 if detections:
-                    detection = detections[0]
-                    break
-                time.sleep(0.1)
-
-            if not detection:
-                _info(f"Iter {i+1}: Objekt verloren!")
-                time.sleep(0.3)
+                    det = detections[0]
+                    centers.append(det['center_px'])
+                    bb_heights.append(det['size_px'][1])
+                    bb_widths.append(det['size_px'][0])
+                    if len(centers) >= SMOOTHING_FRAMES:
+                        break
+                time.sleep(0.05)
+            
+            if len(centers) < 2:
+                _info(f"Iter {i+1}: Objekt verloren! ({len(centers)} Frames)")
+                time.sleep(0.5)
                 continue
-
-            pixel_dist = self._pixel_dist_from_center(detection['center_px'])
-            if pixel_dist < self.cal.center_threshold_px:
-                _success(f"Zentriert! (Dist={pixel_dist:.0f}px)")
+            
+            # --- Gemittelte Werte ---
+            avg_cx = sum(c[0] for c in centers) / len(centers)
+            avg_cy = sum(c[1] for c in centers) / len(centers)
+            avg_bb_h = sum(bb_heights) / len(bb_heights)
+            avg_bb_w = sum(bb_widths) / len(bb_widths)
+            
+            # --- Pixel-Offset von Bildmitte ---
+            w, h = self.resolution
+            offset_px_x = avg_cx - (w / 2)   # positiv = rechts im Bild
+            offset_px_y = avg_cy - (h / 2)   # positiv = unten im Bild
+            pixel_dist = (offset_px_x**2 + offset_px_y**2) ** 0.5
+            
+            # --- Tiefe (X) über BBox-Größe ---
+            # Große BBox = nah, kleine BBox = weit weg
+            depth_error = TARGET_BB_HEIGHT - avg_bb_h  # positiv = zu weit weg
+            
+            _info(f"Iter {i+1}: Center=({offset_px_x:.0f},{offset_px_y:.0f})px, "
+                  f"BBox={avg_bb_w:.0f}x{avg_bb_h:.0f}px, "
+                  f"Dist={pixel_dist:.0f}px, DepthErr={depth_error:.0f}px")
+            
+            # --- Prüfe ob zentriert UND nah genug ---
+            centered = pixel_dist < self.cal.center_threshold_px
+            close_enough = abs(depth_error) < 30  # ±30px Toleranz
+            
+            if centered and close_enough:
+                _success(f"Zentriert & nah genug! (Dist={pixel_dist:.0f}px, BBox_H={avg_bb_h:.0f}px)")
                 return True
-
-            # *** FIX: 3 Werte entpacken ***
-            dx_mm, dy_mm, dz_mm = self._pixel_offset_mm(detection['center_px'])
-            _info(f"Iter {i+1}: Offset=({dx_mm:.1f}, {dy_mm:.1f}, {dz_mm:.1f})mm, Dist={pixel_dist:.0f}px")
-
-            # Position holen (mit Tracker-Fallback)
+            
+            # --- Bewegung berechnen ---
             cur_x, cur_y, cur_z = self._get_position()
+            
+            # Y-Korrektur (links/rechts): Pixel-X → Arm-Y
+            dy_mm = 0.0
+            if abs(offset_px_x) > MIN_MOVE_PX:
+                dy_mm = -offset_px_x * self.cal.pixel_to_mm * self.cal.damping
+            
+            # Z-Korrektur (hoch/runter): Pixel-Y → Arm-Z
+            dz_mm = 0.0
+            if abs(offset_px_y) > MIN_MOVE_PX:
+                dz_mm = -offset_px_y * self.cal.pixel_to_mm * self.cal.damping  # NICHT offset_py!
 
-            # Neue Position: X bleibt (Kamera schaut nach vorne), Y und Z anpassen
-            new_x = cur_x + dx_mm * self.cal.damping   # sollte 0 sein
-            new_y = cur_y + dy_mm * self.cal.damping
-            new_z = cur_z + dz_mm * self.cal.damping
-
-            dist = (new_x**2 + new_y**2) ** 0.5
-            if dist > self.arm.MAX_REACH:
-                _error(f"Außerhalb Reichweite ({dist:.0f}mm)!")
+            
+            # X-Korrektur (näher/weiter): BBox-Größe → Arm-X
+            dx_mm = 0.0
+            if not close_enough:
+                # Richtung: depth_error > 0 → zu weit weg → X erhöhen (nach vorne)
+                # Aber: Feedback nutzen! Wenn BBox kleiner wurde obwohl wir
+                # nach vorne gefahren sind → Richtung umkehren
+                direction = 1.0 if depth_error > 0 else -1.0
+                
+                # Feedback von letzter Iteration
+                if prev_bb_height is not None:
+                    bb_change = avg_bb_h - prev_bb_height
+                    # Wenn wir nach vorne gefahren sind (dx war positiv)
+                    # und BBox KLEINER wurde → falsche Richtung!
+                    if hasattr(self, '_last_dx_direction'):
+                        if self._last_dx_direction > 0 and bb_change < -5:
+                            direction = -1.0
+                            _info("  [Feedback] Richtung korrigiert! (BBox wurde kleiner)")
+                        elif self._last_dx_direction < 0 and bb_change < -5:
+                            direction = 1.0
+                            _info("  [Feedback] Richtung korrigiert! (BBox wurde kleiner)")
+                
+                # Proportional zur Abweichung, aber begrenzt
+                magnitude = min(abs(depth_error) / TARGET_BB_HEIGHT, 1.0) * DEPTH_STEP_MM
+                dx_mm = direction * magnitude
+                self._last_dx_direction = direction
+            
+            prev_bb_height = avg_bb_h
+            
+            # --- Neue Position ---
+            new_x = cur_x + dx_mm
+            new_y = cur_y + dy_mm
+            new_z = cur_z + dz_mm
+            
+            # Sicherheitscheck
+            reach = (new_x**2 + new_y**2) ** 0.5
+            if reach > self.arm.MAX_REACH:
+                _error(f"Außerhalb Reichweite ({reach:.0f}mm)!")
                 return False
-
+            if new_z < self.arm.MIN_Z or new_z > self.arm.MAX_Z:
+                _error(f"Z außerhalb Limits ({new_z:.0f}mm)!")
+                return False
+            
+            _info(f"  → Bewege: dX={dx_mm:+.1f} dY={dy_mm:+.1f} dZ={dz_mm:+.1f}mm")
+            _info(f"  → Ziel:   X={new_x:.1f} Y={new_y:.1f} Z={new_z:.1f}")
+            
             self._move_cartesian(new_x, new_y, new_z, t=3.14, spd=0.15)
-            self._update_for(1.2, [target_class], "Bewege...")
-
+            self._update_for(1.0, [target_class], "Bewege...")
+        
+        _error(f"Max Iterationen ({max_iter}) erreicht!")
         return False
 
     # ─── GRAB (Hauptlogik) ────────────────────────────────────────────────
