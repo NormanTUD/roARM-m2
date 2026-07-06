@@ -46,22 +46,21 @@ class GrabConfig:
 
     # Höhen (mm)
     scan_height: float = 200.0
-    approach_height: float = 135.0
-    grab_height: float = 75.0
+    approach_height: float = 80.0       # LOWER! Was 135 — don't go UP after centering
+    grab_height: float = 45.0           # Lower grab — was 75
     lift_height: float = 120.0
     place_height: float = 40.0
     retract_height: float = 120.0
 
-    # Geschwindigkeiten — RAMP-UP SYSTEM
-    # Initial movements are slow to prevent jerking and losing sight
-    initial_speed: int = 8            # SLOW start speed for first move
-    scan_speed: int = 12              # Slower scan (was 20)
-    search_rotate_speed: int = 15     # Rotation during search (was 25)
-    center_speed: int = 12            # Centering moves (was 20)
-    approach_speed: float = 0.12      # Approach (was 0.15)
-    grab_speed: float = 0.08         # Final grab descent (was 0.1)
-    lift_speed: float = 0.2
-    place_speed: float = 0.2
+    # Geschwindigkeiten — FASTER
+    initial_speed: int = 20             # Was 8 — no need to crawl
+    scan_speed: int = 25                # Was 12
+    search_rotate_speed: int = 25       # Was 15
+    center_speed: int = 30              # Was 12 — MUCH faster centering moves
+    approach_speed: float = 0.30        # Was 0.12 — faster descent
+    grab_speed: float = 0.20            # Was 0.08 — faster final descent
+    lift_speed: float = 0.3
+    place_speed: float = 0.3
 
     # Gripper
     gripper_torque: int = 300
@@ -69,48 +68,47 @@ class GrabConfig:
     gripper_close_timeout: float = 4.0
     gripper_step_rad: float = 0.08
 
-    # Settling — NEW: Wait for mechanical vibration to stop
-    settle_time_after_scan: float = 2.5    # Wait after reaching scan position
-    settle_time_after_search_step: float = 1.2  # Wait after each search rotation
-    settle_time_after_center_move: float = 1.0  # Wait after centering correction
-    settle_frames_to_discard: int = 5      # Discard this many frames after settling
+    # Settling — SHORTER waits
+    settle_time_after_scan: float = 1.5     # Was 2.5
+    settle_time_after_search_step: float = 0.5  # Was 1.2
+    settle_time_after_center_move: float = 0.3  # Was 1.0
+    settle_frames_to_discard: int = 3       # Was 5
 
-    # Zentrieren — REWORKED
-    center_max_iter: int = 25             # More iterations allowed (was 20)
-    center_threshold_px: float = 20.0     # Tighter threshold (was 25)
-    center_damping_initial: float = 0.3   # Start gentle (was 0.5)
-    center_damping_final: float = 0.6     # Ramp up as we get closer
-    center_deg_per_px_h: float = 0.04     # Slightly less aggressive (was 0.05)
-    center_deg_per_px_v: float = 0.03     # Slightly less aggressive (was 0.035)
-    center_smoothing_frames: int = 5      # More frames for averaging (was 3)
-    center_converge_needed: int = 3       # Need 3 consecutive converges (was 2)
-    center_max_lost: int = 12             # More tolerance (was 8)
-    center_max_step_base: float = 3.5     # Smaller max step (was 5.0)
-    center_max_step_shoulder: float = 2.0 # Smaller max step (was 3.0)
-    center_min_move_px: float = 8.0       # Dead zone bigger (was 5.0)
-    center_sample_timeout: float = 4.0    # More time to collect samples (was 3.0)
-    center_reacquire_attempts: int = 3    # NEW: Try to re-find before giving up
-    center_reacquire_pause: float = 0.5   # NEW: Pause between re-acquire attempts
+    # Zentrieren — MORE AGGRESSIVE
+    center_max_iter: int = 15              # Was 25 — should converge faster now
+    center_threshold_px: float = 30.0      # Was 20 — slightly more forgiving
+    center_damping_initial: float = 0.6    # Was 0.3 — MUCH more aggressive start
+    center_damping_final: float = 0.85     # Was 0.6 — aggressive finish
+    center_deg_per_px_h: float = 0.08      # Was 0.04 — DOUBLE the correction
+    center_deg_per_px_v: float = 0.06      # Was 0.03 — DOUBLE the correction
+    center_smoothing_frames: int = 3       # Was 5 — fewer samples needed
+    center_converge_needed: int = 2        # Was 3 — converge faster
+    center_max_lost: int = 12
+    center_max_step_base: float = 8.0      # Was 3.5 — allow bigger steps
+    center_max_step_shoulder: float = 5.0  # Was 2.0 — allow bigger steps
+    center_min_move_px: float = 5.0        # Was 8.0 — smaller dead zone
+    center_sample_timeout: float = 2.0     # Was 4.0
+    center_reacquire_attempts: int = 3
+    center_reacquire_pause: float = 0.3    # Was 0.5
 
     # Suche
     search_range: Tuple[float, float] = (-90.0, 90.0)
     search_step: float = 20.0
-    search_frames_per_step: int = 15      # More frames per step (was 10)
-    search_direct_frames: int = 20        # More direct frames (was 15)
+    search_frames_per_step: int = 8        # Was 15
+    search_direct_frames: int = 10         # Was 20
 
-    # Timeouts
-    wait_after_scan_move: float = 3.0     # Longer (was 2.0) — let arm fully stop
-    wait_after_search_step: float = 1.2   # Longer (was 0.3) — arm needs to arrive
-    wait_after_center_move: float = 1.2   # Longer (was 0.8) — critical for tracking
-    wait_after_gripper_open: float = 0.5
-    wait_after_approach: float = 2.0      # Longer (was 1.5)
+    # Timeouts — SHORTER
+    wait_after_scan_move: float = 1.5      # Was 3.0
+    wait_after_search_step: float = 0.5    # Was 1.2
+    wait_after_center_move: float = 0.4    # Was 1.2 — CRITICAL: was way too slow
+    wait_after_gripper_open: float = 0.3
+    wait_after_approach: float = 1.0       # Was 2.0
     wait_after_grip: float = 0.5
-    wait_after_lift: float = 2.0
-    wait_after_place: float = 2.0
-    wait_after_release: float = 0.5
-    wait_after_retract: float = 1.5
-    wait_after_park: float = 2.0
-
+    wait_after_lift: float = 1.5
+    wait_after_place: float = 1.5
+    wait_after_release: float = 0.3
+    wait_after_retract: float = 1.0
+    wait_after_park: float = 1.5
 
 @dataclass
 class GrabContext:
@@ -264,14 +262,14 @@ class GrabSequencer:
 
     def _get_adaptive_damping(self, pixel_dist: float) -> float:
         """
-        Returns damping factor based on how far we are from center.
-        Far away → gentle (avoid overshoot that loses object)
-        Close → more aggressive (converge faster)
+        More aggressive damping curve.
+        Far away → moderate (not too gentle, we want speed)
+        Close → very aggressive (converge fast)
         """
         cfg = self._ctx.config
-        # Normalize: 0 = at center, 1 = far away (>200px)
-        normalized = min(pixel_dist / 200.0, 1.0)
-        # Interpolate: far = initial (gentle), close = final (aggressive)
+        # Normalize: 0 = at center, 1 = far away (>100px)
+        normalized = min(pixel_dist / 100.0, 1.0)
+        # Far = initial, Close = final
         damping = cfg.center_damping_initial + (1.0 - normalized) * (
             cfg.center_damping_final - cfg.center_damping_initial
         )
@@ -308,35 +306,70 @@ class GrabSequencer:
                 self._dbg("SCAN_POSITION → SETTLING")
 
     def _handle_settling(self):
-        """
-        NEW STATE: Wait for arm to physically stop moving/vibrating.
-        Discard stale camera frames, then transition to SEARCHING.
-        """
+        """Wait for arm to stop, but don't waste time."""
         ctx = self._ctx
         cfg = ctx.config
 
         if self._sub_state == 0:
-            # Discard frames that were captured during movement
             self._flush_camera(cfg.settle_frames_to_discard)
-            self._settle_frames_discarded = cfg.settle_frames_to_discard
             self._sub_state = 1
             ctx.state_enter_time = time.time()
             self._dbg(f"SETTLING: Flushed {cfg.settle_frames_to_discard} frames")
 
         elif self._sub_state == 1:
-            # Wait a bit more and show live preview
-            dets, key = self._vision.update(
-                [cfg.target_class], "Stabilisiere..."
-            )
+            dets, key = self._vision.update([cfg.target_class], "Stabilisiere...")
             if key == ord('q'):
                 self.abort()
                 return
-
-            # Wait at least 0.5s after flush for stable image
-            if ctx.time_in_state >= 0.5:
+            # Only wait 0.3s instead of 0.5s
+            if ctx.time_in_state >= 0.3:
                 self._sub_state = 0
                 ctx.enter_state(GrabState.SEARCHING)
                 self._dbg("SETTLING → SEARCHING")
+
+
+    def _handle_approaching(self):
+        """
+        FIXED: Don't go UP after centering. Go DOWN directly to grab.
+        The arm is already centered over the object — just descend.
+        """
+        ctx = self._ctx
+        cfg = ctx.config
+
+        if self._sub_state == 0:
+            # Get current position
+            pos = self._arm.get_position()
+            if pos is None or (pos[0] == 0 and pos[1] == 0 and pos[2] == 0):
+                ctx.error_msg = "Position unbekannt"
+                ctx.enter_state(GrabState.FAILED)
+                self._dbg("APPROACHING: Position unbekannt!")
+                return
+
+            ctx.grab_x, ctx.grab_y, ctx.grab_z = pos
+            self._dbg(f"APPROACHING: Position X={ctx.grab_x:.1f} Y={ctx.grab_y:.1f} Z={ctx.grab_z:.1f}")
+
+            # Go DIRECTLY to grab height — no intermediate step up!
+            # The arm is already above the object from centering position
+            target_z = cfg.grab_height
+            self._arm.move_cartesian(
+                ctx.grab_x, ctx.grab_y, target_z,
+                t=1.08, spd=cfg.approach_speed
+            )
+            ctx.last_move_time = time.time()
+            self._sub_state = 1
+            ctx.state_enter_time = time.time()
+            self._dbg(f"APPROACHING: Descending directly to Z={target_z:.1f}mm")
+
+        elif self._sub_state == 1:
+            # Wait for descent to complete
+            dets, key = self._vision.update([cfg.target_class], "Absenken zum Greifen...")
+            if key == ord('q'):
+                self.abort()
+                return
+            if ctx.time_in_state >= cfg.wait_after_approach:
+                self._sub_state = 0
+                ctx.enter_state(GrabState.GRIPPING)
+                self._dbg("APPROACHING → GRIPPING")
 
     def _handle_searching(self):
         ctx = self._ctx
@@ -602,16 +635,14 @@ class GrabSequencer:
 
     def _handle_verify_center(self):
         """
-        NEW STATE: After centering converges, do a final verification.
-        Take multiple samples over ~1 second to confirm object is truly centered.
-        Prevents false convergence from a single lucky frame.
+        SIMPLIFIED: Quick verification — just check 3 frames, don't wait 0.8s.
+        Speed > perfection. If it's roughly centered, GO.
         """
         ctx = self._ctx
         cfg = ctx.config
 
         if self._sub_state == 0:
-            # Flush and start collecting verification samples
-            self._flush_camera(3)
+            self._flush_camera(2)
             self._verify_samples = []
             self._sub_state = 1
             ctx.state_enter_time = time.time()
@@ -620,7 +651,7 @@ class GrabSequencer:
         elif self._sub_state == 1:
             dets, key = self._vision.update(
                 [cfg.target_class],
-                f"Verifiziere Zentrierung... ({len(self._verify_samples)}/5)"
+                f"Verifiziere... ({len(self._verify_samples)}/3)"
             )
             if key == ord('q'):
                 self.abort()
@@ -629,14 +660,13 @@ class GrabSequencer:
             if dets:
                 self._verify_samples.append(dets[0]['center_px'])
 
-            # Collect 5 samples over at least 0.8 seconds
-            if len(self._verify_samples) >= 5 and ctx.time_in_state >= 0.8:
-                # Check all samples are within threshold
+            # Only need 3 samples, no minimum time
+            if len(self._verify_samples) >= 3:
                 w, h = self._vision.resolution
                 all_centered = True
                 for cx, cy in self._verify_samples:
                     dist = ((cx - w/2)**2 + (cy - h/2)**2) ** 0.5
-                    if dist > cfg.center_threshold_px * 1.5:  # Slightly relaxed for verify
+                    if dist > cfg.center_threshold_px * 2.0:
                         all_centered = False
                         break
 
@@ -645,30 +675,21 @@ class GrabSequencer:
                     self._sub_state = 0
                     ctx.enter_state(GrabState.OPEN_GRIPPER)
                 else:
-                    self._dbg("VERIFY_CENTER: ✗ Not actually centered, back to CENTERING")
+                    self._dbg("VERIFY_CENTER: ✗ Not centered, back to CENTERING")
                     ctx.center_converge_count = 0
                     self._sub_state = 0
                     ctx.enter_state(GrabState.CENTERING)
 
-            elif ctx.time_in_state > 3.0:
-                # Timeout — object might be lost
-                if len(self._verify_samples) >= 2:
-                    # Partial data, try anyway
+            elif ctx.time_in_state > 1.5:
+                # Timeout — just proceed if we have any data
+                if len(self._verify_samples) >= 1:
                     self._sub_state = 0
                     ctx.enter_state(GrabState.OPEN_GRIPPER)
-                    self._dbg("VERIFY_CENTER: Timeout but have some samples, proceeding")
+                    self._dbg("VERIFY_CENTER: Timeout, proceeding anyway")
                 else:
-                    # Lost it
-                    ctx.center_lost_count += 1
-                    self._dbg("VERIFY_CENTER: Lost object during verification")
-                    if ctx.center_lost_count >= cfg.center_max_lost:
-                        ctx.error_msg = "Objekt während Verifikation verloren"
-                        ctx.enter_state(GrabState.FAILED)
-                    else:
-                        # Go back to centering and try again
-                        ctx.center_converge_count = 0
-                        self._sub_state = 0
-                        ctx.enter_state(GrabState.CENTERING)
+                    ctx.center_converge_count = 0
+                    self._sub_state = 0
+                    ctx.enter_state(GrabState.CENTERING)
 
     def _handle_open_gripper(self):
         ctx = self._ctx
@@ -691,11 +712,15 @@ class GrabSequencer:
                 self._dbg("OPEN_GRIPPER → APPROACHING")
 
     def _handle_approaching(self):
+        """
+        FIXED: Don't go UP after centering. Go DOWN directly to grab.
+        The arm is already centered over the object — just descend.
+        """
         ctx = self._ctx
         cfg = ctx.config
 
         if self._sub_state == 0:
-            # Get current position for grab coordinates
+            # Get current position
             pos = self._arm.get_position()
             if pos is None or (pos[0] == 0 and pos[1] == 0 and pos[2] == 0):
                 ctx.error_msg = "Position unbekannt"
@@ -706,67 +731,21 @@ class GrabSequencer:
             ctx.grab_x, ctx.grab_y, ctx.grab_z = pos
             self._dbg(f"APPROACHING: Position X={ctx.grab_x:.1f} Y={ctx.grab_y:.1f} Z={ctx.grab_z:.1f}")
 
-            # Move to intermediate approach height (slower than before)
+            # Go DIRECTLY to grab height — no intermediate step up!
+            # The arm is already above the object from centering position
+            target_z = cfg.grab_height
             self._arm.move_cartesian(
-                ctx.grab_x, ctx.grab_y, cfg.approach_height,
+                ctx.grab_x, ctx.grab_y, target_z,
                 t=1.08, spd=cfg.approach_speed
             )
             ctx.last_move_time = time.time()
             self._sub_state = 1
             ctx.state_enter_time = time.time()
+            self._dbg(f"APPROACHING: Descending directly to Z={target_z:.1f}mm")
 
         elif self._sub_state == 1:
-            # Wait at intermediate height
-            dets, key = self._vision.update([cfg.target_class], "Absenken (Zwischen)...")
-            if key == ord('q'):
-                self.abort()
-                return
-            if ctx.time_in_state >= cfg.wait_after_approach:
-                # FIX: Do a final check — is the object still below us?
-                self._flush_camera(3)
-                self._sub_state = 2
-                ctx.state_enter_time = time.time()
-
-        elif self._sub_state == 2:
-            # Final object check before descending to grab height
-            dets, key = self._vision.update(
-                [cfg.target_class], "Prüfe Objekt vor Griff..."
-            )
-            if key == ord('q'):
-                self.abort()
-                return
-
-            if dets:
-                # Object still visible — check it's reasonably centered
-                w, h = self._vision.resolution
-                cx, cy = dets[0]['center_px']
-                offset_dist = ((cx - w/2)**2 + (cy - h/2)**2) ** 0.5
-
-                if offset_dist > cfg.center_threshold_px * 3:
-                    # Object drifted significantly — go back to centering
-                    self._dbg(f"APPROACHING: Object drifted! dist={offset_dist:.0f}px, "
-                             f"back to CENTERING")
-                    ctx.center_converge_count = 0
-                    ctx.center_iter = max(0, ctx.center_iter - 2)  # Give some iterations back
-                    self._sub_state = 0
-                    ctx.enter_state(GrabState.CENTERING)
-                    return
-
-                self._dbg(f"APPROACHING: Object confirmed, dist={offset_dist:.0f}px")
-
-            # Descend to grab height
-            self._arm.move_cartesian(
-                ctx.grab_x, ctx.grab_y, cfg.grab_height,
-                t=1.08, spd=cfg.grab_speed
-            )
-            ctx.last_move_time = time.time()
-            self._sub_state = 3
-            ctx.state_enter_time = time.time()
-            self._dbg(f"APPROACHING: Greifhöhe {cfg.grab_height}mm")
-
-        elif self._sub_state == 3:
-            # Wait at grab height
-            dets, key = self._vision.update([cfg.target_class], "Greifposition...")
+            # Wait for descent to complete
+            dets, key = self._vision.update([cfg.target_class], "Absenken zum Greifen...")
             if key == ord('q'):
                 self.abort()
                 return
