@@ -353,14 +353,21 @@ class TeleopRecorder:
                     last_detections = self._detect(frame)
                 detections = last_detections
 
-                # 3. Process ALL pending key events (drain the event queue)
                 action = ""
-                for _ in range(50):  # Was 10, but at 40fps we might queue more
+                for _ in range(50):
                     key = cv2.waitKey(1) & 0xFFFF
                     if key == -1 or key == 0xFFFF:
                         break
-                    self._process_key(key)
+                    key_action = self._process_key(key)
+                    if key_action:
+                        action = key_action
 
+# Also: record the action from active keys if no key event this frame:
+                if not action and self._recording:
+                    active = self._get_active_keys()
+                    if active:
+                        # Use the first active movement as the action label
+                        action = next(iter(active))
 
                 # 4. Apply movement (at fixed rate, independent of display)
                 self._apply_movement()
