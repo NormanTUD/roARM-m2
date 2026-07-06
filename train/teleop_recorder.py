@@ -12,6 +12,7 @@ Steuerung:
   R                          → Aufnahme starten (neue Episode)
   S (nur bei Aufnahme)       → Episode speichern & beenden
   F                          → Episode als fehlgeschlagen markieren & speichern
+  P                          → Letzte Episode 1:1 abspielen (Replay)
   Q                          → Beenden
 
 Aufzeichnung:
@@ -19,6 +20,7 @@ Aufzeichnung:
   - Arm-Gelenkwinkel + kartesische Position
   - Aktionen (Tasteneingaben) mit Timestamps
   - Alles relativ zu den BBoxes
+  - LeRobot-kompatibles Format (HuggingFace Dataset)
 """
 
 import cv2
@@ -40,6 +42,12 @@ try:
 except ImportError:
     HAS_YOLO = False
 
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    HAS_PARQUET = True
+except ImportError:
+    HAS_PARQUET = False
 
 # ─── Datenstrukturen ─────────────────────────────────────────────────────────
 
@@ -56,7 +64,6 @@ class ArmState:
     y: float = 0.0
     z: float = 0.0
 
-
 @dataclass
 class Episode:
     """Eine komplette Aufnahme-Episode."""
@@ -67,6 +74,480 @@ class Episode:
     target_class: str = ""
     success: bool = False
 
+# ─── LeRobot Dataset Helper ──────────────────────────────────────────────────
+
+class LeRobotSaver:
+    """
+    Speichert Episoden im LeRobot-kompatiblen Format.
+    
+    Struktur:
+      output_dir/
+        meta/
+          info.json          # Dataset-Metadaten
+          episodes.jsonl     # Episode-Index
+          stats.json         # Statistiken
+          tasks.jsonl        # Task-Beschreibungen
+        data/
+          chunk-000/
+            episode_000000.parquet   # Frames als Parquet
+            episode_000001.parquet
+            ...
+        videos/              # (optional) Kamera-Videos
+          chunk-000/
+            observation.images.top/
+              episode_000000.mp4
+    """
+
+    def __init__(self, output_dir: Path, fps: float = 30.0):
+        self._output_dir = output_dir
+        self._fps = fps
+        self._meta_dir = output_dir / "meta"
+        self._data_dir = output_dir / "data" / "chunk-000"
+        self._video_dir = output_dir / "videos" / "chunk-000" / "observation.images.top"
+        
+        # Erstelle Verzeichnisse
+        self._meta_dir.mkdir(parents=True, exist_ok=True)
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._video_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Lade oder erstelle info.json
+        self._info_path = self._meta_dir / "info.json"
+        self._episodes_path = self._meta_dir / "episodes.jsonl"
+        self._tasks_path = self._meta_dir / "tasks.jsonl"
+        self._stats_path = self._meta_dir / "stats.json"
+        
+        self._total_episodes = 0
+        self._total_frames = 0
+        self._load_or_create_meta()
+
+    def _load_or_create_meta(self):
+        """Lade bestehende Metadaten oder erstelle neue."""
+        if self._info_path.exists():
+            with open(self._info_path, 'r') as f:
+                info = json.load(f)
+                self._total_episodes = info.get("total_episodes", 0)
+                self._total_frames = info.get("total_frames", 0)
+        else:
+            self._save_info()
+        
+        # Tasks-Datei erstellen falls nicht vorhanden
+        if not self._tasks_path.exists():
+            with open(self._tasks_path, 'w') as f:
+                task = {"task_index": 0, "task": "Pick up target object with robot arm"}
+                f.write(json.dumps(task) + "\n")
+
+    def _save_info(self):
+        """Speichert Dataset-Info."""
+        info = {
+            "codebase_version": "v2.1",
+            "robot_type": "roarm_m2s",
+            "total_episodes": self._total_episodes,
+            "total_frames": self._total_frames,
+            "fps": self._fps,
+            "features": {
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": [4],
+                    "names": ["base_deg", "shoulder_deg", "elbow_deg", "hand_deg"]
+                },
+                "observation.gripper": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "names": ["gripper_position"]
+                },
+                "action": {
+                    "dtype": "float32",
+                    "shape": [5],
+                    "names": ["base_deg", "shoulder_deg", "elbow_deg", "hand_deg", "gripper"]
+                },
+                "observation.images.top": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                    "names": ["height", "width", "channels"],
+                    "video_info": {
+                        "video.fps": self._fps,
+                        "video.codec": "av1",
+                        "video.pix_fmt": "yuv420p",
+                        "has_audio": False
+                    }
+                },
+                "timestamp": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "names": ["time_s"]
+                },
+                "episode_index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": ["episode_index"]
+                },
+                "frame_index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": ["frame_index"]
+                },
+                "index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": ["global_index"]
+                },
+                "task_index": {
+                    "dtype": "int64",
+                    "shape": [1],
+                    "names": ["task_index"]
+                }
+            },
+            "splits": {
+                "train": f"0:{self._total_episodes}"
+            },
+            "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+            "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+            "chunks_size": 1000
+        }
+        with open(self._info_path, 'w') as f:
+            json.dump(info, f, indent=2)
+
+    def save_episode(self, episode: Episode, frames_images: List[np.ndarray] = None) -> Path:
+        """
+        Speichert eine Episode im LeRobot-Format.
+        
+        Args:
+            episode: Die aufgezeichnete Episode
+            frames_images: Liste von Kamera-Frames (numpy arrays) für Video
+            
+        Returns:
+            Pfad zur gespeicherten Parquet-Datei
+        """
+        ep_idx = episode.episode_id - 1  # 0-basiert
+        
+        # ─── Parquet-Daten vorbereiten ───
+        records = []
+        for i, frame_data in enumerate(episode.frames):
+            arm = frame_data["arm_state"]
+            action_str = frame_data.get("action", "")
+            
+            # Nächster State als Action (oder gleicher State wenn letzter Frame)
+            if i < len(episode.frames) - 1:
+                next_arm = episode.frames[i + 1]["arm_state"]
+                action_vec = [
+                    next_arm["base_deg"],
+                    next_arm["shoulder_deg"],
+                    next_arm["elbow_deg"],
+                    next_arm["hand_deg"],
+                    0.0 if next_arm["gripper_open"] else 1.0
+                ]
+            else:
+                action_vec = [
+                    arm["base_deg"],
+                    arm["shoulder_deg"],
+                    arm["elbow_deg"],
+                    arm["hand_deg"],
+                    0.0 if arm["gripper_open"] else 1.0
+                ]
+            
+            record = {
+                "observation.state": [
+                    arm["base_deg"],
+                    arm["shoulder_deg"],
+                    arm["elbow_deg"],
+                    arm["hand_deg"]
+                ],
+                "observation.gripper": [0.0 if arm["gripper_open"] else 1.0],
+                "action": action_vec,
+                "timestamp": [frame_data["timestamp"]],
+                "episode_index": [ep_idx],
+                "frame_index": [i],
+                "index": [self._total_frames + i],
+                "task_index": [0],
+                # Zusätzliche Daten für Replay
+                "action_label": action_str,
+            }
+            
+            # Detections als JSON-String speichern
+            if frame_data.get("detections"):
+                record["detections_json"] = json.dumps(frame_data["detections"])
+            else:
+                record["detections_json"] = "[]"
+            
+            if frame_data.get("rel_to_target"):
+                record["rel_to_target_json"] = json.dumps(frame_data["rel_to_target"])
+            else:
+                record["rel_to_target_json"] = "{}"
+            
+            records.append(record)
+        
+        # ─── Als Parquet speichern ───
+        parquet_path = self._data_dir / f"episode_{ep_idx:06d}.parquet"
+        
+        if HAS_PARQUET and records:
+            # Konvertiere zu spaltenbasiertem Format
+            columns = {}
+            for key in records[0].keys():
+                columns[key] = [r[key] for r in records]
+            
+            table = pa.table(columns)
+            pq.write_table(table, parquet_path)
+        else:
+            # Fallback: JSON speichern
+            json_path = self._data_dir / f"episode_{ep_idx:06d}.json"
+            with open(json_path, 'w') as f:
+                json.dump(records, f, indent=2)
+            parquet_path = json_path
+        
+        # ─── Video speichern (wenn Frames vorhanden) ───
+        if frames_images and len(frames_images) > 0:
+            video_path = self._video_dir / f"episode_{ep_idx:06d}.mp4"
+            self._save_video(frames_images, video_path)
+        
+        # ─── Episode-Index aktualisieren ───
+        num_frames = len(episode.frames)
+        episode_entry = {
+            "episode_index": ep_idx,
+            "task_index": 0,
+            "task": "Pick up target object with robot arm",
+            "length": num_frames,
+            "target_class": episode.target_class,
+            "success": episode.success,
+            "duration_s": episode.end_time - episode.start_time
+        }
+        with open(self._episodes_path, 'a') as f:
+            f.write(json.dumps(episode_entry) + "\n")
+        
+        # ─── Metadaten aktualisieren ───
+        self._total_episodes += 1
+        self._total_frames += num_frames
+        self._save_info()
+        self._update_stats(records)
+        
+        return parquet_path
+
+    def _save_video(self, frames: List[np.ndarray], video_path: Path):
+        """Speichert Frames als MP4-Video."""
+        if not frames:
+            return
+        
+        h, w = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(str(video_path), fourcc, self._fps, (w, h))
+        
+        for frame in frames:
+            writer.write(frame)
+        
+        writer.release()
+        print(f"    📹 Video gespeichert: {video_path} ({len(frames)} frames)")
+
+    def _update_stats(self, records: List[Dict]):
+        """Aktualisiert Statistiken über alle Episoden."""
+        if not records:
+            return
+        
+        # Berechne Min/Max/Mean für States und Actions
+        states = np.array([r["observation.state"] for r in records])
+        actions = np.array([r["action"] for r in records])
+        
+        stats = {
+            "observation.state": {
+                "min": states.min(axis=0).tolist(),
+                "max": states.max(axis=0).tolist(),
+                "mean": states.mean(axis=0).tolist(),
+                "std": states.std(axis=0).tolist()
+            },
+            "action": {
+                "min": actions.min(axis=0).tolist(),
+                "max": actions.max(axis=0).tolist(),
+                "mean": actions.mean(axis=0).tolist(),
+                "std": actions.std(axis=0).tolist()
+            }
+        }
+        
+        with open(self._stats_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+
+# ─── Replay Engine ───────────────────────────────────────────────────────────
+
+class ReplayEngine:
+    """
+    Spielt eine aufgezeichnete Episode 1:1 auf dem Arm ab.
+    Reproduziert exakt die gleichen Gelenkwinkel mit dem gleichen Timing.
+    """
+
+    def __init__(self, arm: RoArmM2S, camera: cv2.VideoCapture = None):
+        self._arm = arm
+        self._camera = camera
+        self._replaying = False
+
+    def replay_episode(self, episode_path: Path, window_name: str = "RoArm Replay") -> bool:
+        """
+        Spielt eine Episode 1:1 ab.
+        
+        Args:
+            episode_path: Pfad zur Episode-Datei (JSON oder Parquet)
+            window_name: Name des Anzeigefensters
+            
+        Returns:
+            True wenn erfolgreich abgespielt
+        """
+        # Lade Episode
+        frames_data = self._load_episode(episode_path)
+        if not frames_data:
+            print(f"  [!] Keine Frames in {episode_path}")
+            return False
+        
+        print(f"\n  ▶ REPLAY START: {episode_path.name}")
+        print(f"    {len(frames_data)} Frames")
+        
+        if frames_data and "timestamp" in frames_data[0]:
+            duration = frames_data[-1]["timestamp"]
+            if isinstance(duration, list):
+                duration = duration[0]
+            print(f"    Dauer: {duration:.1f}s")
+        
+        self._replaying = True
+        start_time = time.time()
+        
+        for i, frame_data in enumerate(frames_data):
+            if not self._replaying:
+                print("  [!] Replay abgebrochen")
+                break
+            
+            # Timing einhalten
+            target_time = self._get_timestamp(frame_data)
+            elapsed = time.time() - start_time
+            wait_time = target_time - elapsed
+            if wait_time > 0:
+                time.sleep(wait_time)
+            
+            # Gelenkwinkel setzen
+            arm_state = self._get_arm_state(frame_data)
+            if arm_state:
+                self._arm.move_joints_degrees(
+                    b=arm_state["base_deg"],
+                    s=arm_state["shoulder_deg"],
+                    e=arm_state["elbow_deg"],
+                    h=arm_state["hand_deg"],
+                    spd=50,
+                    acc=100
+                )
+                
+                # Gripper
+                if "gripper_open" in arm_state:
+                    if arm_state["gripper_open"]:
+                        self._arm.gripper_open()
+                    else:
+                        self._arm.gripper_close()
+            
+            # Live-Anzeige
+            if self._camera:
+                self._camera.grab()
+                ret, frame = self._camera.retrieve()
+                if ret:
+                    self._annotate_replay_frame(frame, frame_data, i, len(frames_data))
+                    cv2.imshow(window_name, frame)
+            
+            # Abbruch mit Q
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self._replaying = False
+                print("  [!] Replay durch Benutzer abgebrochen")
+                break
+        
+        self._replaying = False
+        actual_duration = time.time() - start_time
+        print(f"  ■ REPLAY BEENDET ({actual_duration:.1f}s)")
+        return True
+
+    def _load_episode(self, path: Path) -> List[Dict]:
+        """Lädt Episode aus JSON oder Parquet."""
+        if path.suffix == '.json':
+            with open(path, 'r') as f:
+                data = json.load(f)
+            # Unterstütze beide Formate (alt: mit "frames" key, neu: direkte Liste)
+            if isinstance(data, dict) and "frames" in data:
+                return data["frames"]
+            elif isinstance(data, list):
+                return data
+            return []
+        
+        elif path.suffix == '.parquet' and HAS_PARQUET:
+            table = pq.read_table(path)
+            df = table.to_pydict()
+            frames = []
+            num_rows = len(df.get("frame_index", []))
+            for i in range(num_rows):
+                frame = {}
+                for key, values in df.items():
+                    frame[key] = values[i]
+                frames.append(frame)
+            return frames
+        
+        return []
+
+    def _get_timestamp(self, frame_data: Dict) -> float:
+        """Extrahiert Timestamp aus Frame-Daten."""
+        ts = frame_data.get("timestamp", 0)
+        if isinstance(ts, list):
+            return ts[0]
+        return float(ts)
+
+    def _get_arm_state(self, frame_data: Dict) -> Optional[Dict]:
+        """Extrahiert Arm-State aus Frame-Daten (beide Formate)."""
+        # Altes Format (JSON mit arm_state dict)
+        if "arm_state" in frame_data:
+            return frame_data["arm_state"]
+        
+        # LeRobot-Format (observation.state als Liste)
+        if "observation.state" in frame_data:
+            state = frame_data["observation.state"]
+            gripper = frame_data.get("observation.gripper", [0.0])
+            if isinstance(gripper, list):
+                gripper_val = gripper[0]
+            else:
+                gripper_val = float(gripper)
+            
+            return {
+                "base_deg": state[0],
+                "shoulder_deg": state[1],
+                "elbow_deg": state[2],
+                "hand_deg": state[3],
+                "gripper_open": gripper_val < 0.5
+            }
+        
+        return None
+
+    def _annotate_replay_frame(self, frame, frame_data: Dict, current_idx: int, total: int):
+        """Annotiert Frame während Replay."""
+        h, w = frame.shape[:2]
+        
+        # Replay-Indikator
+        progress = current_idx / max(1, total - 1)
+        cv2.putText(frame, f"REPLAY [{current_idx+1}/{total}]", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
+        
+        # Progress-Bar
+        bar_w = w - 20
+        bar_x = 10
+        bar_y = 45
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 10), (50, 50, 50), -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + int(bar_w * progress), bar_y + 10), (0, 200, 0), -1)
+        
+        # Arm-State anzeigen
+        arm_state = self._get_arm_state(frame_data)
+        if arm_state:
+            state_str = (f"B:{arm_state['base_deg']:.0f} S:{arm_state['shoulder_deg']:.0f} "
+                        f"E:{arm_state['elbow_deg']:.0f} H:{arm_state['hand_deg']:.0f} "
+                        f"G:{'O' if arm_state.get('gripper_open', True) else 'C'}")
+            cv2.putText(frame, state_str, (10, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Action anzeigen
+        action = frame_data.get("action_label", frame_data.get("action", ""))
+        if action:
+            cv2.putText(frame, f"Action: {action}", (10, 95),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        
+        # Hinweis
+        cv2.putText(frame, "Q = Abbrechen", (10, h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
 # ─── Teleop Controller ───────────────────────────────────────────────────────
 
@@ -80,7 +561,7 @@ class TeleopRecorder:
     - Small position increments at consistent rate
     """
 
-    # ─── Steuerungs-Parameter (FIXED) ────────────────────────────────────
+    # ─── Steuerungs-Parameter (FIXED) ────────────────────────────────────────
     
     # Command streaming rate (separate from display loop)
     COMMAND_HZ = 50            # 50 commands/sec to servo
@@ -156,6 +637,16 @@ class TeleopRecorder:
         self._last_cmd_time = 0.0
         self._last_action = ""
 
+        # ─── NEW: Frame image buffer for video recording ───
+        self._frame_buffer: List[np.ndarray] = []
+        self._record_video = True  # Kamera-Frames für Video aufzeichnen
+
+        # ─── NEW: LeRobot Saver ───
+        self._lerobot_saver: Optional[LeRobotSaver] = None
+
+        # ─── NEW: Replay Engine ───
+        self._replay_engine: Optional[ReplayEngine] = None
+
         # Window
         self._window_name = "RoArm Teleop"
 
@@ -174,6 +665,13 @@ class TeleopRecorder:
         count = 0
         for f in self._output_dir.glob("episode_*.json"):
             count += 1
+        # Auch LeRobot-Format zählen
+        lerobot_data = self._output_dir / "data" / "chunk-000"
+        if lerobot_data.exists():
+            for f in lerobot_data.glob("episode_*.parquet"):
+                count += 1
+            for f in lerobot_data.glob("episode_*.json"):
+                count += 1
         return count
 
     def _get_active_keys(self) -> set:
@@ -197,6 +695,7 @@ class TeleopRecorder:
         """Returns the current speed level configuration."""
         return self.SPEED_LEVELS[self._speed_level]
 
+    
     def _change_speed(self, delta: int):
         """Change speed level by delta (+1 or -1). Clamps to valid range."""
         old_level = self._speed_level
@@ -205,7 +704,7 @@ class TeleopRecorder:
             spd = self._current_speed
             print(f"  ⚡ Speed: {spd['label']} (Level {self._speed_level}/{len(self.SPEED_LEVELS)-1})")
 
-    # ─── Setup ────────────────────────────────────────────────────────────
+    # ─── Setup ────────────────────────────────────────────────────────────────
 
     def setup(self) -> bool:
         """Initialisiert Hardware."""
@@ -217,7 +716,7 @@ class TeleopRecorder:
         print("\n[1] Arm verbinden...")
         try:
             self._arm = RoArmM2S(port=self._port, enable_vision=False)
-            print("  ✓ Arm verbunden")
+            print("  ✔ Arm verbunden")
         except Exception as e:
             print(f"  ✗ Arm-Fehler: {e}")
             return False
@@ -242,7 +741,7 @@ class TeleopRecorder:
         self._camera.set(cv2.CAP_PROP_FPS, 30)
         w = int(self._camera.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self._camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"  ✓ Kamera {self._camera_index} ({w}x{h})")
+        print(f"  ✔ Kamera {self._camera_index} ({w}x{h})")
 
         # YOLO
         if HAS_YOLO:
@@ -253,7 +752,7 @@ class TeleopRecorder:
                 ret, frame = self._camera.read()
                 if ret:
                     self._model(frame, conf=self._confidence, verbose=False)
-                print(f"  ✓ YOLO bereit")
+                print(f"  ✔ YOLO bereit")
             except Exception as e:
                 print(f"  ✗ YOLO-Fehler: {e}")
                 self._model = None
@@ -270,7 +769,18 @@ class TeleopRecorder:
         self._arm.set_led(255)
         self._led_brightness = 255
 
-        print("  ✓ Bereit")
+        # ─── LeRobot Saver initialisieren ───
+        self._lerobot_saver = LeRobotSaver(
+            output_dir=self._output_dir / "lerobot_dataset",
+            fps=30.0
+        )
+        print(f"  ✔ LeRobot Saver → {self._output_dir / 'lerobot_dataset'}")
+
+        # ─── Replay Engine initialisieren ───
+        self._replay_engine = ReplayEngine(self._arm, self._camera)
+        print("  ✔ Replay Engine bereit")
+
+        print("  ✔ Bereit")
 
         print("\n" + "=" * 60)
         print("  STEUERUNG:")
@@ -287,6 +797,7 @@ class TeleopRecorder:
         print("    R         Aufnahme starten")
         print("    S         Aufnahme speichern (nur während Aufnahme)")
         print("    F         Aufnahme als fehlgeschlagen speichern")
+        print("    P         Letzte Episode 1:1 abspielen (Replay)")
         print("    +/=       Geschwindigkeit erhöhen")
         print("    -         Geschwindigkeit verringern")
         print("    1-5       Geschwindigkeit direkt setzen (1=sehr langsam, 5=sehr schnell)")
@@ -306,7 +817,7 @@ class TeleopRecorder:
 
         return True
 
-    # ─── Main Loop ────────────────────────────────────────────────────────
+    # ─── Main Loop ────────────────────────────────────────────────────────────
 
     def _command_loop(self):
         """
@@ -362,7 +873,7 @@ class TeleopRecorder:
                     if key_action:
                         action = key_action
 
-# Also: record the action from active keys if no key event this frame:
+                # Also: record the action from active keys if no key event this frame:
                 if not action and self._recording:
                     active = self._get_active_keys()
                     if active:
@@ -375,9 +886,11 @@ class TeleopRecorder:
                 # 5. Annotate
                 self._annotate_frame(frame, detections, action, current_fps)
 
-                # 6. Record
+                # 6. Record (frame data + image for video)
                 if self._recording:
                     self._record_frame(detections, action)
+                    if self._record_video:
+                        self._frame_buffer.append(frame.copy())
 
                 # 7. Display
                 cv2.imshow(self._window_name, frame)
@@ -400,8 +913,7 @@ class TeleopRecorder:
         finally:
             self._shutdown()
 
-
-    # ─── Frame & Detection ────────────────────────────────────────────────
+    # ─── Frame & Detection ────────────────────────────────────────────────────
 
     def _get_frame(self):
         """Holt aktuellen Frame (Buffer-Flush)."""
@@ -440,7 +952,7 @@ class TeleopRecorder:
         detections.sort(key=lambda d: d['confidence'], reverse=True)
         return detections
 
-    # ─── Tastatur ─────────────────────────────────────────────────────────
+    # ─── Tastatur ─────────────────────────────────────────────────────────────
 
     def _process_key(self, key: int) -> str:
         """
@@ -502,23 +1014,22 @@ class TeleopRecorder:
             action = "gripper_close"
 
         # ─── LED Control (Shift+1 through Shift+6) ───
-        # German keyboard: Shift+1=!, Shift+2=", Shift+3=§, Shift+4=$, Shift+5=%, Shift+6=&
-        elif key_low == ord('!') or key == ord('!'):       # Shift+1 → LED OFF
+        elif key_low == ord('!') or key == ord('!'):
             self._set_led_brightness(0)
             action = "led_0"
-        elif key_low == ord('"') or key == ord('"'):       # Shift+2 → LED 51
+        elif key_low == ord('"') or key == ord('"'):
             self._set_led_brightness(1)
             action = "led_51"
-        elif key_low == 167 or key == 167:                 # Shift+3 → § (0xA7) → LED 102
+        elif key_low == 167 or key == 167:
             self._set_led_brightness(2)
             action = "led_102"
-        elif key_low == ord('$') or key == ord('$'):       # Shift+4 → LED 153
+        elif key_low == ord('$') or key == ord('$'):
             self._set_led_brightness(3)
             action = "led_153"
-        elif key_low == ord('%') or key == ord('%'):       # Shift+5 → LED 204
+        elif key_low == ord('%') or key == ord('%'):
             self._set_led_brightness(4)
             action = "led_204"
-        elif key_low == ord('&') or key == ord('&'):       # Shift+6 → LED 255
+        elif key_low == ord('&') or key == ord('&'):
             self._set_led_brightness(5)
             action = "led_255"
 
@@ -549,6 +1060,10 @@ class TeleopRecorder:
         elif key_low == ord('f'):
             self._stop_recording(success=False)
 
+        # ─── Replay ───
+        elif key_low == ord('p'):
+            self._replay_last_episode()
+
         # ─── Quit ───
         elif key_low == ord('q'):
             self._running = False
@@ -564,10 +1079,10 @@ class TeleopRecorder:
         """
         now = time.time()
         dt = now - self._last_cmd_time
-        
+
         if dt < self.COMMAND_INTERVAL:
             return
-        
+
         active = self._get_active_keys()
         if not active:
             self._last_cmd_time = now
@@ -610,7 +1125,7 @@ class TeleopRecorder:
 
         if moved:
             self._send_arm_command()
-        
+
         self._last_cmd_time = now
 
     def _send_arm_command(self):
@@ -634,18 +1149,18 @@ class TeleopRecorder:
     def _gripper_open(self):
         """Öffnet den Gripper und synchronisiert hand_deg."""
         self._arm_state.gripper_open = True
-        GRIPPER_OPEN_DEG = 61.88    # 1.08 rad = open
+        GRIPPER_OPEN_DEG = 61.88
         self._arm_state.hand_deg = GRIPPER_OPEN_DEG
         self._arm.gripper_open()
 
     def _gripper_close(self):
         """Schließt den Gripper und synchronisiert hand_deg."""
         self._arm_state.gripper_open = False
-        GRIPPER_CLOSED_DEG = 180.0  # 3.14 rad = closed
+        GRIPPER_CLOSED_DEG = 180.0
         self._arm_state.hand_deg = GRIPPER_CLOSED_DEG
         self._arm.gripper_close()
 
-    # ─── Recording ────────────────────────────────────────────────────────
+    # ─── Recording ────────────────────────────────────────────────────────────
 
     def _start_recording(self):
         """Startet eine neue Episode."""
@@ -660,6 +1175,7 @@ class TeleopRecorder:
             target_class=self._target_class or "unknown",
             frames=[]
         )
+        self._frame_buffer = []  # Reset frame buffer für Video
         self._recording = True
         print(f"\n  ● AUFNAHME GESTARTET (Episode {self._episode_count})")
 
@@ -673,9 +1189,11 @@ class TeleopRecorder:
         self._current_episode.success = success
         self._recording = False
 
-        filename = self._output_dir / f"episode_{self._current_episode.episode_id:04d}.json"
         duration = self._current_episode.end_time - self._current_episode.start_time
         num_frames = len(self._current_episode.frames)
+
+        # ─── 1. Original JSON speichern (wie bisher) ───
+        filename = self._output_dir / f"episode_{self._current_episode.episode_id:04d}.json"
 
         data = {
             "episode_id": self._current_episode.episode_id,
@@ -691,10 +1209,23 @@ class TeleopRecorder:
         with open(filename, 'w') as f:
             json.dump(data, f, indent=2)
 
-        status = "✓ ERFOLG" if success else "✗ FEHLGESCHLAGEN"
+        status = "✔ ERFOLG" if success else "✗ FEHLGESCHLAGEN"
         print(f"\n  ■ AUFNAHME GESPEICHERT: {filename}")
         print(f"    {status} | {num_frames} Frames | {duration:.1f}s")
 
+        # ─── 2. LeRobot-Format speichern ───
+        if self._lerobot_saver:
+            try:
+                lerobot_path = self._lerobot_saver.save_episode(
+                    self._current_episode,
+                    frames_images=self._frame_buffer if self._record_video else None
+                )
+                print(f"    📦 LeRobot: {lerobot_path}")
+            except Exception as e:
+                print(f"    [!] LeRobot-Speicherfehler: {e}")
+
+        # ─── 3. Frame-Buffer leeren ───
+        self._frame_buffer = []
         self._current_episode = None
 
     def _record_frame(self, detections: List[Dict], action: str):
@@ -742,7 +1273,47 @@ class TeleopRecorder:
 
         self._current_episode.frames.append(frame_data)
 
-    # ─── Annotation ──────────────────────────────────────────────────────
+    # ─── Replay ───────────────────────────────────────────────────────────────
+
+    def _replay_last_episode(self):
+        """Spielt die letzte aufgezeichnete Episode 1:1 ab."""
+        if self._recording:
+            print("  [!] Kann nicht abspielen während Aufnahme läuft!")
+            return
+
+        if not self._replay_engine:
+            print("  [!] Replay Engine nicht initialisiert!")
+            return
+
+        # Finde letzte Episode (JSON oder Parquet)
+        episode_path = self._find_last_episode()
+        if not episode_path:
+            print("  [!] Keine Episode zum Abspielen gefunden!")
+            return
+
+        print(f"\n  ▶ Starte Replay: {episode_path.name}")
+        self._replay_engine.replay_episode(episode_path, self._window_name)
+
+    def _find_last_episode(self) -> Optional[Path]:
+        """Findet die zuletzt gespeicherte Episode."""
+        # Zuerst im Hauptverzeichnis (JSON)
+        json_episodes = sorted(self._output_dir.glob("episode_*.json"))
+        if json_episodes:
+            return json_episodes[-1]
+
+        # Dann im LeRobot-Verzeichnis
+        lerobot_data = self._output_dir / "lerobot_dataset" / "data" / "chunk-000"
+        if lerobot_data.exists():
+            parquet_episodes = sorted(lerobot_data.glob("episode_*.parquet"))
+            if parquet_episodes:
+                return parquet_episodes[-1]
+            json_episodes = sorted(lerobot_data.glob("episode_*.json"))
+            if json_episodes:
+                return json_episodes[-1]
+
+        return None
+
+    # ─── Annotation ───────────────────────────────────────────────────────────
 
     def _annotate_frame(self, frame, detections: List[Dict], action: str, fps: float = 0):
         """Zeichnet Infos auf den Frame."""
@@ -810,17 +1381,321 @@ class TeleopRecorder:
                 cv2.putText(frame, rec_text, (w_f - 250, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         else:
-            cv2.putText(frame, f"Episodes: {self._episode_count} | R=Record S=Save Q=Quit",
+            cv2.putText(frame, f"Episodes: {self._episode_count} | R=Record P=Replay Q=Quit",
                         (10, h_f - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
         # ─── Steuerungs-Overlay ───
         help_y = h_f - 40
         cv2.putText(frame, "Arrows=Base/Shoulder  W/S=Elbow  A/D=Hand  O/C=Grip  +/-=Speed  1-5=Level",
                     (10, help_y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
-        cv2.putText(frame, "LED: Shift+1=OFF  Shift+2..6=Brightness Steps",
+        cv2.putText(frame, "LED: Shift+1=OFF  Shift+2..6=Brightness Steps  |  P=Replay last episode",
                     (10, help_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
 
-    # ─── Shutdown ─────────────────────────────────────────────────────────
+    # ─── Replay ───────────────────────────────────────────────────────────────
+
+    def _replay_last_episode(self):
+        """Spielt die letzte aufgezeichnete Episode 1:1 ab."""
+        if self._recording:
+            print("  [!] Kann nicht abspielen während Aufnahme läuft!")
+            return
+
+        # Finde letzte Episode
+        episode_path = self._find_last_episode()
+        if not episode_path:
+            print("  [!] Keine Episode zum Abspielen gefunden!")
+            return
+
+        print(f"\n  ▶ Starte Replay: {episode_path.name}")
+        self._do_replay(episode_path)
+
+    def _find_last_episode(self) -> Optional[Path]:
+        """Findet die zuletzt gespeicherte Episode."""
+        # Zuerst im Hauptverzeichnis (JSON)
+        json_episodes = sorted(self._output_dir.glob("episode_*.json"))
+        if json_episodes:
+            return json_episodes[-1]
+
+        # Dann im LeRobot-Verzeichnis
+        lerobot_data = self._output_dir / "lerobot_dataset" / "data" / "chunk-000"
+        if lerobot_data.exists():
+            parquet_episodes = sorted(lerobot_data.glob("episode_*.parquet"))
+            if parquet_episodes:
+                return parquet_episodes[-1]
+
+        return None
+
+    def _do_replay(self, episode_path: Path):
+        """
+        Spielt eine Episode 1:1 ab – exakt gleiche Gelenkwinkel, gleiches Timing.
+        """
+        # Lade Episode
+        with open(episode_path, 'r') as f:
+            data = json.load(f)
+
+        frames = data.get("frames", [])
+        if not frames:
+            print("  [!] Episode hat keine Frames!")
+            return
+
+        num_frames = len(frames)
+        duration = data.get("duration_s", 0)
+        print(f"    {num_frames} Frames | {duration:.1f}s Dauer")
+        print(f"    Q = Abbrechen")
+
+        start_time = time.time()
+
+        for i, frame_data in enumerate(frames):
+            # Timing einhalten
+            target_time = frame_data.get("timestamp", 0)
+            elapsed = time.time() - start_time
+            wait_time = target_time - elapsed
+            if wait_time > 0:
+                time.sleep(wait_time)
+
+            # Gelenkwinkel setzen
+            arm = frame_data.get("arm_state", {})
+            if arm:
+                self._arm_state.base_deg = arm.get("base_deg", self._arm_state.base_deg)
+                self._arm_state.shoulder_deg = arm.get("shoulder_deg", self._arm_state.shoulder_deg)
+                self._arm_state.elbow_deg = arm.get("elbow_deg", self._arm_state.elbow_deg)
+                self._arm_state.hand_deg = arm.get("hand_deg", self._arm_state.hand_deg)
+                self._arm_state.gripper_open = arm.get("gripper_open", self._arm_state.gripper_open)
+
+                self._send_arm_command()
+
+                # Gripper
+                if arm.get("gripper_open", True):
+                    self._arm.gripper_open()
+                else:
+                    self._arm.gripper_close()
+
+            # Live-Anzeige
+            frame = self._get_frame()
+            if frame is not None:
+                h_f, w_f = frame.shape[:2]
+                progress = (i + 1) / num_frames
+
+                # Replay-Indikator
+                cv2.putText(frame, f"REPLAY [{i+1}/{num_frames}]", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
+
+                # Progress-Bar
+                bar_w = w_f - 20
+                cv2.rectangle(frame, (10, 45), (10 + bar_w, 55), (50, 50, 50), -1)
+                cv2.rectangle(frame, (10, 45), (10 + int(bar_w * progress), 55), (0, 200, 0), -1)
+
+                # Arm-State
+                state_str = (f"B:{arm.get('base_deg', 0):.0f} S:{arm.get('shoulder_deg', 0):.0f} "
+                            f"E:{arm.get('elbow_deg', 0):.0f} H:{arm.get('hand_deg', 0):.0f} "
+                            f"G:{'O' if arm.get('gripper_open', True) else 'C'}")
+                cv2.putText(frame, state_str, (10, 75),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                # Action
+                action = frame_data.get("action", "")
+                if action:
+                    cv2.putText(frame, f"Action: {action}", (10, 95),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+                # Detections aus der Aufnahme anzeigen
+                dets = frame_data.get("detections", [])
+                for det in dets:
+                    x1, y1, x2, y2 = [int(v) for v in det['bbox']]
+                    label = f"{det['class']} {det['confidence']:.2f}"
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
+                    cv2.putText(frame, f"[rec] {label}", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+
+                # Hinweis
+                cv2.putText(frame, "Q = Abbrechen", (10, h_f - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+
+                cv2.imshow(self._window_name, frame)
+
+            # Abbruch mit Q
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("  [!] Replay abgebrochen")
+                return
+
+        actual_duration = time.time() - start_time
+        print(f"  ■ REPLAY BEENDET ({actual_duration:.1f}s)")
+
+    # ─── LeRobot Speicherung ─────────────────────────────────────────────────
+
+    def _save_lerobot_format(self, episode: Episode, frame_images: List[np.ndarray] = None):
+        """
+        Speichert Episode zusätzlich im LeRobot-kompatiblen Format.
+        
+        Struktur:
+          lerobot_dataset/
+            meta/
+              info.json
+              episodes.jsonl
+              stats.json
+              tasks.jsonl
+            data/
+              chunk-000/
+                episode_000000.parquet (oder .json als Fallback)
+            videos/
+              chunk-000/
+                observation.images.top/
+                  episode_000000.mp4
+        """
+        dataset_dir = self._output_dir / "lerobot_dataset"
+        meta_dir = dataset_dir / "meta"
+        data_dir = dataset_dir / "data" / "chunk-000"
+        video_dir = dataset_dir / "videos" / "chunk-000" / "observation.images.top"
+
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        video_dir.mkdir(parents=True, exist_ok=True)
+
+        ep_idx = episode.episode_id - 1  # 0-basiert
+
+        # ─── Frames in LeRobot-Spaltenformat konvertieren ───
+        records = []
+        for i, frame_data in enumerate(episode.frames):
+            arm = frame_data["arm_state"]
+
+            # Action = nächster State (oder gleicher wenn letzter Frame)
+            if i < len(episode.frames) - 1:
+                next_arm = episode.frames[i + 1]["arm_state"]
+                action_vec = [
+                    next_arm["base_deg"],
+                    next_arm["shoulder_deg"],
+                    next_arm["elbow_deg"],
+                    next_arm["hand_deg"],
+                    0.0 if next_arm["gripper_open"] else 1.0
+                ]
+            else:
+                action_vec = [
+                    arm["base_deg"],
+                    arm["shoulder_deg"],
+                    arm["elbow_deg"],
+                    arm["hand_deg"],
+                    0.0 if arm["gripper_open"] else 1.0
+                ]
+
+            record = {
+                "observation.state": [
+                    arm["base_deg"],
+                    arm["shoulder_deg"],
+                    arm["elbow_deg"],
+                    arm["hand_deg"]
+                ],
+                "observation.gripper": [0.0 if arm["gripper_open"] else 1.0],
+                "action": action_vec,
+                "timestamp": frame_data["timestamp"],
+                "episode_index": ep_idx,
+                "frame_index": i,
+                "task_index": 0,
+                "action_label": frame_data.get("action", ""),
+            }
+            records.append(record)
+
+        # ─── Als JSON speichern (Parquet als optionales Upgrade) ───
+        episode_file = data_dir / f"episode_{ep_idx:06d}.json"
+        with open(episode_file, 'w') as f:
+            json.dump(records, f, indent=2)
+
+        # ─── Video speichern (wenn Frames vorhanden) ───
+        if frame_images and len(frame_images) > 0:
+            video_path = video_dir / f"episode_{ep_idx:06d}.mp4"
+            h, w = frame_images[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(str(video_path), fourcc, 30.0, (w, h))
+            for img in frame_images:
+                writer.write(img)
+            writer.release()
+            print(f"    📹 Video: {video_path} ({len(frame_images)} frames)")
+
+        # ─── Episode-Index aktualisieren ───
+        episodes_file = meta_dir / "episodes.jsonl"
+        episode_entry = {
+            "episode_index": ep_idx,
+            "task_index": 0,
+            "task": "Pick up target object with robot arm",
+            "length": len(episode.frames),
+            "target_class": episode.target_class,
+            "success": episode.success,
+            "duration_s": episode.end_time - episode.start_time
+        }
+        with open(episodes_file, 'a') as f:
+            f.write(json.dumps(episode_entry) + "\n")
+
+        # ─── Tasks-Datei ───
+        tasks_file = meta_dir / "tasks.jsonl"
+        if not tasks_file.exists():
+            with open(tasks_file, 'w') as f:
+                f.write(json.dumps({"task_index": 0, "task": "Pick up target object with robot arm"}) + "\n")
+
+        # ─── Info.json aktualisieren ───
+        info_file = meta_dir / "info.json"
+        # Zähle alle Episoden
+        total_episodes = ep_idx + 1
+        total_frames = sum(1 for _ in open(episodes_file)) if episodes_file.exists() else 0
+
+        info = {
+            "codebase_version": "v2.1",
+            "robot_type": "roarm_m2s",
+            "total_episodes": total_episodes,
+            "total_frames": len(records),
+            "fps": 30.0,
+            "features": {
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": [4],
+                    "names": ["base_deg", "shoulder_deg", "elbow_deg", "hand_deg"]
+                },
+                "observation.gripper": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "names": ["gripper_position"]
+                },
+                "action": {
+                    "dtype": "float32",
+                    "shape": [5],
+                    "names": ["base_deg", "shoulder_deg", "elbow_deg", "hand_deg", "gripper"]
+                },
+                "observation.images.top": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                    "names": ["height", "width", "channels"]
+                }
+            },
+            "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.json",
+            "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+            "chunks_size": 1000
+        }
+        with open(info_file, 'w') as f:
+            json.dump(info, f, indent=2)
+
+        # ─── Stats aktualisieren ───
+        if records:
+            states = np.array([r["observation.state"] for r in records])
+            actions = np.array([r["action"] for r in records])
+            stats = {
+                "observation.state": {
+                    "min": states.min(axis=0).tolist(),
+                    "max": states.max(axis=0).tolist(),
+                    "mean": states.mean(axis=0).tolist(),
+                    "std": states.std(axis=0).tolist()
+                },
+                "action": {
+                    "min": actions.min(axis=0).tolist(),
+                    "max": actions.max(axis=0).tolist(),
+                    "mean": actions.mean(axis=0).tolist(),
+                    "std": actions.std(axis=0).tolist()
+                }
+            }
+            stats_file = meta_dir / "stats.json"
+            with open(stats_file, 'w') as f:
+                json.dump(stats, f, indent=2)
+
+        print(f"    📦 LeRobot: {episode_file}")
+
+    # ─── Shutdown ─────────────────────────────────────────────────────────────
 
     def _shutdown(self):
         """Aufräumen."""
@@ -836,8 +1711,7 @@ class TeleopRecorder:
         if self._camera:
             self._camera.release()
         cv2.destroyAllWindows()
-        print("  ✓ Fertig")
-
+        print("  ✔ Fertig")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -860,7 +1734,6 @@ def main():
         target_class=args.target,
     )
     recorder.run()
-
 
 if __name__ == "__main__":
     main()
