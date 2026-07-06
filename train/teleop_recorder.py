@@ -976,7 +976,7 @@ class TeleopRecorder:
         key_low = key & 0xFF
         action = ""
 
-        # ─── Pfeiltasten ───
+        # ——— Pfeiltasten ———
         if key == 65361 or key_low == 81:  # Left Arrow
             self._keys_down.add("base_left")
             self._key_last_seen["base_left"] = now
@@ -994,19 +994,28 @@ class TeleopRecorder:
             self._key_last_seen["shoulder_down"] = now
             action = "shoulder_down"
 
-        # ─── W/A/S/D ───
+        # ——— Ctrl+S → Save Recording (key code 19) ———
+        elif key_low == 19:
+            if self._recording:
+                self._stop_recording(success=True)
+            action = ""
+
+        # ——— Ctrl+F → Fail Recording (key code 6) ———
+        elif key_low == 6:
+            if self._recording:
+                self._stop_recording(success=False)
+            action = ""
+
+        # ——— W/A/S/D ———
         elif key_low == ord('w'):
             self._keys_down.add("elbow_up")
             self._key_last_seen["elbow_up"] = now
             action = "elbow_up"
         elif key_low == ord('s'):
-            if self._recording:
-                self._stop_recording(success=True)
-                action = ""
-            else:
-                self._keys_down.add("elbow_down")
-                self._key_last_seen["elbow_down"] = now
-                action = "elbow_down"
+            # Plain 's' is ALWAYS elbow_down now (no conflict with save)
+            self._keys_down.add("elbow_down")
+            self._key_last_seen["elbow_down"] = now
+            action = "elbow_down"
         elif key_low == ord('a'):
             self._keys_down.add("hand_left")
             self._key_last_seen["hand_left"] = now
@@ -1016,7 +1025,7 @@ class TeleopRecorder:
             self._key_last_seen["hand_right"] = now
             action = "hand_right"
 
-        # ─── Gripper ───
+        # ——— Gripper ———
         elif key_low == ord('o'):
             self._gripper_open()
             action = "gripper_open"
@@ -1024,7 +1033,7 @@ class TeleopRecorder:
             self._gripper_close()
             action = "gripper_close"
 
-        # ─── LED Control (Shift+1 through Shift+6) ───
+        # ——— LED Control (Shift+1 through Shift+6) ———
         elif key_low == ord('!') or key == ord('!'):
             self._set_led_brightness(0)
             action = "led_0"
@@ -1044,7 +1053,7 @@ class TeleopRecorder:
             self._set_led_brightness(5)
             action = "led_255"
 
-        # ─── Speed Control ───
+        # ——— Speed Control ———
         elif key_low == ord('+') or key_low == ord('='):
             self._change_speed(+1)
         elif key_low == ord('-') or key_low == ord('_'):
@@ -1065,17 +1074,19 @@ class TeleopRecorder:
             self._speed_level = 4
             print(f"  ⚡ Speed: {self._current_speed['label']}")
 
-        # ─── Recording ───
+        # ——— Recording ———
         elif key_low == ord('r'):
             self._start_recording()
-        elif key_low == ord('f'):
-            self._stop_recording(success=False)
 
-        # ─── Replay ───
+        # ——— Plain 'f' is now free (no action, or you could assign it to something else) ———
+        elif key_low == ord('f'):
+            pass  # No longer stops recording; Ctrl+F does that now
+
+        # ——— Replay ———
         elif key_low == ord('p'):
             self._replay_last_episode()
 
-        # ─── Quit ───
+        # ——— Quit ———
         elif key_low == ord('q'):
             self._running = False
 
