@@ -3,9 +3,6 @@ GrabSequencer – Abstrahiert die gesamte Greif-Sequenz.
 
 Zustandsmaschine für:
   IDLE → SCANNING → FOUND → CENTERING → APPROACHING → GRIPPING → LIFTING → PLACING → DONE
-
-Jeder Zustand hat klare Ein-/Ausgangsbedingungen.
-Der EyeInHandController muss nur noch update() callen.
 """
 
 import time
@@ -16,19 +13,19 @@ from typing import Optional, Tuple, List, Dict, Callable
 
 class GrabState(Enum):
     IDLE = auto()
-    SCAN_POSITION = auto()      # Fahre in Scan-Stellung
-    SEARCHING = auto()          # Suche Objekt (direkt + Rotation)
-    CENTERING = auto()          # Zentriere Objekt in Bildmitte
-    OPEN_GRIPPER = auto()       # Gripper öffnen
-    APPROACHING = auto()        # Absenken zum Objekt
-    GRIPPING = auto()           # Gripper schließen
-    LIFTING = auto()            # Anheben
-    PLACING = auto()            # Ablegen
-    RELEASING = auto()          # Gripper öffnen zum Ablegen
-    RETRACTING = auto()         # Zurückziehen
-    PARKING = auto()            # Parkposition
-    DONE = auto()               # Fertig (Erfolg)
-    FAILED = auto()             # Fehlgeschlagen
+    SCAN_POSITION = auto()
+    SEARCHING = auto()
+    CENTERING = auto()
+    OPEN_GRIPPER = auto()
+    APPROACHING = auto()
+    GRIPPING = auto()
+    LIFTING = auto()
+    PLACING = auto()
+    RELEASING = auto()
+    RETRACTING = auto()
+    PARKING = auto()
+    DONE = auto()
+    FAILED = auto()
 
 
 @dataclass
@@ -36,51 +33,52 @@ class GrabConfig:
     """Konfiguration für einen Greifvorgang."""
     target_class: str = "bottle"
     place_offset_y: float = -100.0
-    
+
     # Höhen (mm)
     scan_height: float = 200.0
-    approach_height: float = 135.0      # Zwischenhöhe beim Absenken
-    grab_height: float = 75.0           # Greifhöhe
-    lift_height: float = 120.0          # Anheben nach Griff (relativ zu grab_height)
-    place_height: float = 40.0          # Ablege-Höhe (relativ zu grab_height)
-    retract_height: float = 120.0       # Rückzug-Höhe (relativ zu grab_height)
-    
+    approach_height: float = 135.0
+    grab_height: float = 75.0
+    lift_height: float = 120.0
+    place_height: float = 40.0
+    retract_height: float = 120.0
+
     # Geschwindigkeiten
     scan_speed: int = 20
     approach_speed: float = 0.15
     grab_speed: float = 0.1
     lift_speed: float = 0.2
     place_speed: float = 0.2
-    
+
     # Gripper
     gripper_torque: int = 300
     gripper_torque_threshold: int = 60
     gripper_close_timeout: float = 4.0
     gripper_step_rad: float = 0.08
-    
+
     # Zentrieren
-    center_max_iter: int = 15
-    center_threshold_px: float = 20.0
-    center_damping: float = 0.6
+    center_max_iter: int = 20
+    center_threshold_px: float = 25.0
+    center_damping: float = 0.5
     center_deg_per_px_h: float = 0.05
     center_deg_per_px_v: float = 0.035
     center_smoothing_frames: int = 3
     center_converge_needed: int = 2
-    center_max_lost: int = 4
+    center_max_lost: int = 8          # Erhöht von 4 auf 8
     center_max_step_base: float = 5.0
     center_max_step_shoulder: float = 3.0
     center_min_move_px: float = 5.0
-    
+    center_sample_timeout: float = 3.0  # NEU: Timeout für Frame-Sammeln
+
     # Suche
     search_range: Tuple[float, float] = (-90.0, 90.0)
     search_step: float = 20.0
     search_frames_per_step: int = 10
     search_direct_frames: int = 15
-    
-    # Timeouts (Sekunden die in einem State gewartet wird)
+
+    # Timeouts
     wait_after_scan_move: float = 2.0
     wait_after_search_step: float = 0.3
-    wait_after_center_move: float = 0.6
+    wait_after_center_move: float = 0.8   # Reduziert von 0.6 – Arm braucht Zeit
     wait_after_gripper_open: float = 0.5
     wait_after_approach: float = 1.5
     wait_after_grip: float = 0.5
@@ -96,12 +94,12 @@ class GrabContext:
     """Laufzeit-Kontext eines Greifvorgangs."""
     state: GrabState = GrabState.IDLE
     config: GrabConfig = field(default_factory=GrabConfig)
-    
+
     # Positionen
     grab_x: float = 0.0
     grab_y: float = 0.0
     grab_z: float = 0.0
-    
+
     # Zentrierungs-State
     cur_base: float = 0.0
     cur_shoulder: float = 0.0
@@ -109,27 +107,27 @@ class GrabContext:
     center_iter: int = 0
     center_converge_count: int = 0
     center_lost_count: int = 0
-    
+
     # Such-State
     search_current_deg: float = -90.0
     search_frame_count: int = 0
     search_direct_count: int = 0
-    
+
     # Timing
     state_enter_time: float = 0.0
-    
+
     # Ergebnis
     gripped: bool = False
     success: bool = False
     error_msg: str = ""
-    
+
     # Letzte Detection
     last_detection: Optional[Dict] = None
-    
+
     def enter_state(self, new_state: GrabState):
         self.state = new_state
         self.state_enter_time = time.time()
-    
+
     @property
     def time_in_state(self) -> float:
         return time.time() - self.state_enter_time
@@ -140,13 +138,13 @@ class GrabSequencer:
     Zustandsmaschine für den Greifvorgang.
     
     Verwendung:
-        seq = GrabSequencer(arm_interface, vision_interface)
+        seq = GrabSequencer(arm_interface, vision_interface, debug=True)
         seq.start("bottle")
         while seq.running:
             seq.tick()  # Muss im Main-Thread laufen (wegen GUI)
     """
     
-    def __init__(self, arm, vision):
+    def __init__(self, arm, vision, debug: bool = False):
         """
         arm: Objekt mit Methoden:
             - move_joints(b, s, e, h, spd, acc)
@@ -166,6 +164,7 @@ class GrabSequencer:
         """
         self._arm = arm
         self._vision = vision
+        self._debug = debug
         self._ctx: Optional[GrabContext] = None
         self._state_handlers: Dict[GrabState, Callable] = {
             GrabState.SCAN_POSITION: self._handle_scan_position,
@@ -183,6 +182,12 @@ class GrabSequencer:
         # Sub-State für mehrstufige States
         self._sub_state: int = 0
         self._search_phase: str = "direct"  # "direct" oder "rotate"
+        self._center_samples: List[Tuple[float, float]] = []
+    
+    def _dbg(self, msg: str):
+        """Debug-Ausgabe wenn --debug aktiv."""
+        if self._debug:
+            print(f"    [DBG] {msg}")
     
     @property
     def running(self) -> bool:
@@ -207,6 +212,7 @@ class GrabSequencer:
         self._ctx.enter_state(GrabState.SCAN_POSITION)
         self._sub_state = 0
         self._search_phase = "direct"
+        self._center_samples = []
     
     def tick(self) -> GrabState:
         """
@@ -239,6 +245,7 @@ class GrabSequencer:
             # Bewegung starten
             self._arm.move_joints(b=0, s=0, e=90, h=180, spd=cfg.scan_speed, acc=10)
             self._sub_state = 1
+            self._dbg("SCAN_POSITION: Bewegung gestartet")
         
         elif self._sub_state == 1:
             # Warten + Live-Preview
@@ -252,6 +259,7 @@ class GrabSequencer:
                 ctx.cur_elbow = 90.0
                 self._sub_state = 0
                 ctx.enter_state(GrabState.SEARCHING)
+                self._dbg("SCAN_POSITION → SEARCHING")
     
     def _handle_searching(self):
         ctx = self._ctx
@@ -270,6 +278,8 @@ class GrabSequencer:
                 ctx.last_detection = dets[0]
                 self._sub_state = 0
                 ctx.enter_state(GrabState.CENTERING)
+                self._dbg(f"SEARCHING: Gefunden! conf={dets[0]['confidence']:.2f} "
+                         f"center={dets[0]['center_px']}")
                 return
             
             ctx.search_direct_count += 1
@@ -278,6 +288,7 @@ class GrabSequencer:
                 self._search_phase = "rotate"
                 self._sub_state = 0
                 ctx.search_current_deg = cfg.search_range[0]
+                self._dbg("SEARCHING: Direkt nicht gefunden → Rotation")
         
         elif self._search_phase == "rotate":
             if self._sub_state == 0:
@@ -294,6 +305,7 @@ class GrabSequencer:
                 ctx.cur_base = ctx.search_current_deg
                 self._sub_state = 1
                 ctx.state_enter_time = time.time()  # Reset timer
+                self._dbg(f"SEARCHING: Drehe zu {ctx.search_current_deg:.0f}°")
             
             elif self._sub_state == 1:
                 # Warten bis Arm da ist
@@ -325,6 +337,7 @@ class GrabSequencer:
                     ctx.last_detection = dets[0]
                     self._sub_state = 0
                     ctx.enter_state(GrabState.CENTERING)
+                    self._dbg(f"SEARCHING: Gefunden bei {ctx.search_current_deg:.0f}°!")
                     return
                 
                 ctx.search_frame_count += 1
@@ -340,19 +353,23 @@ class GrabSequencer:
         if ctx.center_iter >= cfg.center_max_iter:
             ctx.error_msg = f"Max Iterationen ({cfg.center_max_iter}) erreicht"
             ctx.enter_state(GrabState.FAILED)
+            self._dbg(f"CENTERING: Max iter erreicht!")
             return
         
         if self._sub_state == 0:
-            # Detection sammeln
+            # Detection sammeln - Reset
             self._center_samples = []
             self._sub_state = 1
+            ctx.state_enter_time = time.time()  # Timer für Timeout
+            self._dbg(f"CENTERING: Iter {ctx.center_iter+1}, sammle Frames...")
         
         elif self._sub_state == 1:
-            # Frames sammeln
+            # Frames sammeln für Smoothing
             dets, key = self._vision.update(
                 [cfg.target_class],
-                f"Zentriere (Iter {ctx.center_iter+1}/{cfg.center_max_iter}) | "
-                f"B={ctx.cur_base:.1f}°"
+                f"Zentriere ({ctx.center_iter+1}/{cfg.center_max_iter}) | "
+                f"B={ctx.cur_base:.1f}° S={ctx.cur_shoulder:.1f}° | "
+                f"lost={ctx.center_lost_count}/{cfg.center_max_lost}"
             )
             if key == ord('q'):
                 self.abort()
@@ -360,22 +377,27 @@ class GrabSequencer:
             
             if dets:
                 self._center_samples.append(dets[0]['center_px'])
+                self._dbg(f"CENTERING: Sample {len(self._center_samples)}/{cfg.center_smoothing_frames} "
+                         f"@ {dets[0]['center_px']}")
             
             if len(self._center_samples) >= cfg.center_smoothing_frames:
+                # Genug Samples → weiter zur Berechnung
                 self._sub_state = 2
-            elif ctx.time_in_state > 2.0:
-                # Timeout beim Sammeln
+            elif ctx.time_in_state > cfg.center_sample_timeout:
+                # Timeout beim Sammeln → Objekt verloren
                 ctx.center_lost_count += 1
+                self._dbg(f"CENTERING: Timeout! lost={ctx.center_lost_count}/{cfg.center_max_lost} "
+                         f"(hatte {len(self._center_samples)} samples)")
                 if ctx.center_lost_count >= cfg.center_max_lost:
                     ctx.error_msg = "Objekt zu oft verloren"
                     ctx.enter_state(GrabState.FAILED)
                     return
-                ctx.center_iter += 1
+                # Retry: nochmal versuchen ohne iter zu erhöhen
                 self._sub_state = 0
-                ctx.enter_state(GrabState.CENTERING)  # Reset timer
+                ctx.state_enter_time = time.time()
         
         elif self._sub_state == 2:
-            # Offset berechnen
+            # Offset berechnen aus gesammelten Samples
             centers = self._center_samples
             avg_cx = sum(c[0] for c in centers) / len(centers)
             avg_cy = sum(c[1] for c in centers) / len(centers)
@@ -385,18 +407,24 @@ class GrabSequencer:
             offset_px_y = avg_cy - (h / 2)
             pixel_dist = (offset_px_x**2 + offset_px_y**2) ** 0.5
             
+            self._dbg(f"CENTERING: offset=({offset_px_x:.1f}, {offset_px_y:.1f})px "
+                     f"dist={pixel_dist:.1f}px threshold={cfg.center_threshold_px}")
+            
             # Zentriert?
             if pixel_dist < cfg.center_threshold_px:
                 ctx.center_converge_count += 1
+                self._dbg(f"CENTERING: Konvergiert! count={ctx.center_converge_count}/"
+                         f"{cfg.center_converge_needed}")
                 if ctx.center_converge_count >= cfg.center_converge_needed:
                     # ERFOLG → Gripper öffnen
                     self._sub_state = 0
                     ctx.enter_state(GrabState.OPEN_GRIPPER)
+                    self._dbg("CENTERING → OPEN_GRIPPER (Erfolg!)")
                     return
                 # Nochmal verifizieren
                 ctx.center_iter += 1
                 self._sub_state = 0
-                ctx.enter_state(GrabState.CENTERING)
+                ctx.state_enter_time = time.time()
                 return
             else:
                 ctx.center_converge_count = 0
@@ -415,8 +443,14 @@ class GrabSequencer:
                                min(cfg.center_max_step_shoulder, d_shoulder))
             
             # Neue Winkel
-            ctx.cur_base = max(-90, min(90, ctx.cur_base + d_base))
-            ctx.cur_shoulder = max(-30, min(60, ctx.cur_shoulder + d_shoulder))
+            new_base = max(-90, min(90, ctx.cur_base + d_base))
+            new_shoulder = max(-30, min(60, ctx.cur_shoulder + d_shoulder))
+            
+            self._dbg(f"CENTERING: Korrektur d_base={d_base:.2f}° d_shoulder={d_shoulder:.2f}° "
+                     f"→ B={new_base:.1f}° S={new_shoulder:.1f}°")
+            
+            ctx.cur_base = new_base
+            ctx.cur_shoulder = new_shoulder
             
             # Bewegen
             self._arm.move_joints(
@@ -427,18 +461,21 @@ class GrabSequencer:
             ctx.state_enter_time = time.time()
         
         elif self._sub_state == 3:
-            # Warten nach Bewegung
+            # Warten nach Bewegung (mit Live-Preview)
             dets, key = self._vision.update(
-                [cfg.target_class], "Bewege..."
+                [cfg.target_class], 
+                f"Bewege... B={ctx.cur_base:.1f}° S={ctx.cur_shoulder:.1f}°"
             )
             if key == ord('q'):
                 self.abort()
                 return
             if ctx.time_in_state >= cfg.wait_after_center_move:
                 ctx.center_iter += 1
-                ctx.center_lost_count = 0
+                # WICHTIG: lost_count NICHT resetten nach erfolgreicher Bewegung
+                # Nur resetten wenn wir tatsächlich was sehen
                 self._sub_state = 0
-                ctx.enter_state(GrabState.CENTERING)
+                ctx.state_enter_time = time.time()
+                self._dbg(f"CENTERING: Bewegung fertig, nächste Iteration")
     
     def _handle_open_gripper(self):
         ctx = self._ctx
@@ -448,6 +485,7 @@ class GrabSequencer:
             self._arm.gripper_open()
             self._sub_state = 1
             ctx.state_enter_time = time.time()
+            self._dbg("OPEN_GRIPPER: Öffne...")
         
         elif self._sub_state == 1:
             dets, key = self._vision.update([cfg.target_class], "Gripper öffnen...")
@@ -468,9 +506,11 @@ class GrabSequencer:
             if pos is None or (pos[0] == 0 and pos[1] == 0 and pos[2] == 0):
                 ctx.error_msg = "Position unbekannt"
                 ctx.enter_state(GrabState.FAILED)
+                self._dbg("APPROACHING: Position unbekannt!")
                 return
             
             ctx.grab_x, ctx.grab_y, ctx.grab_z = pos
+            self._dbg(f"APPROACHING: Position X={ctx.grab_x:.1f} Y={ctx.grab_y:.1f} Z={ctx.grab_z:.1f}")
             
             # Zwischenhöhe anfahren
             self._arm.move_cartesian(
@@ -494,6 +534,7 @@ class GrabSequencer:
                 )
                 self._sub_state = 2
                 ctx.state_enter_time = time.time()
+                self._dbg(f"APPROACHING: Greifhöhe {cfg.grab_height}mm")
         
         elif self._sub_state == 2:
             # Warten (Greifhöhe)
@@ -510,6 +551,7 @@ class GrabSequencer:
         cfg = ctx.config
         
         if self._sub_state == 0:
+            self._dbg("GRIPPING: Schließe Gripper...")
             # Torque setzen + Greifen
             self._arm.gripper_set_max_torque(cfg.gripper_torque)
             time.sleep(0.3)
@@ -522,6 +564,7 @@ class GrabSequencer:
             ctx.gripped = gripped
             self._sub_state = 1
             ctx.state_enter_time = time.time()
+            self._dbg(f"GRIPPING: Ergebnis gripped={gripped}")
         
         elif self._sub_state == 1:
             dets, key = self._vision.update(status_text="Gegriffen!")
@@ -534,12 +577,14 @@ class GrabSequencer:
         cfg = ctx.config
         
         if self._sub_state == 0:
+            lift_z = cfg.grab_height + cfg.lift_height
             self._arm.move_cartesian(
-                ctx.grab_x, ctx.grab_y, cfg.grab_height + cfg.lift_height,
+                ctx.grab_x, ctx.grab_y, lift_z,
                 t=3.14, spd=cfg.lift_speed
             )
             self._sub_state = 1
             ctx.state_enter_time = time.time()
+            self._dbg(f"LIFTING: Z={lift_z:.1f}mm")
         
         elif self._sub_state == 1:
             dets, key = self._vision.update(status_text="Anheben...")
@@ -556,12 +601,14 @@ class GrabSequencer:
         
         if self._sub_state == 0:
             place_y = ctx.grab_y + cfg.place_offset_y
+            place_z = cfg.grab_height + cfg.place_height
             self._arm.move_cartesian(
-                ctx.grab_x, place_y, cfg.grab_height + cfg.place_height,
+                ctx.grab_x, place_y, place_z,
                 t=3.14, spd=cfg.place_speed
             )
             self._sub_state = 1
             ctx.state_enter_time = time.time()
+            self._dbg(f"PLACING: Y={place_y:.1f} Z={place_z:.1f}")
         
         elif self._sub_state == 1:
             dets, key = self._vision.update(status_text="Ablegen...")
@@ -593,8 +640,9 @@ class GrabSequencer:
         
         if self._sub_state == 0:
             place_y = ctx.grab_y + cfg.place_offset_y
+            retract_z = cfg.grab_height + cfg.retract_height
             self._arm.move_cartesian(
-                ctx.grab_x, place_y, cfg.grab_height + cfg.retract_height,
+                ctx.grab_x, place_y, retract_z,
                 t=3.14, spd=0.25
             )
             self._sub_state = 1
@@ -620,3 +668,4 @@ class GrabSequencer:
             if ctx.time_in_state >= cfg.wait_after_park:
                 ctx.success = True
                 ctx.enter_state(GrabState.DONE)
+                self._dbg("PARKING → DONE (Erfolg!)")

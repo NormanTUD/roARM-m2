@@ -34,6 +34,8 @@ from roarm_m2s import RoArmM2S, ArmStatus
 
 console = Console() if HAS_RICH else None
 
+DEBUG = False
+
 def _print(msg: str, style: str = ""):
     if HAS_RICH:
         console.print(msg, style=style)
@@ -55,6 +57,10 @@ def _error(msg: str):
 def _info(msg: str):
     _print(f"  {msg}")
 
+def _debug(msg: str):
+    if DEBUG:
+        _print(f"  [DBG] {msg}")
+
 
 # ─── Arm Interface (für GrabSequencer) ───────────────────────────────────────
 
@@ -67,17 +73,21 @@ class _ArmInterface:
         self._tracker.update_from_joints_degrees(b=0, s=0, e=90, h=180)
 
     def move_joints(self, b=0, s=0, e=90, h=180, spd=20, acc=10):
+        _debug(f"move_joints(b={b:.1f}, s={s:.1f}, e={e:.1f}, h={h:.1f})")
         self._arm.move_joints_degrees(b=b, s=s, e=e, h=h, spd=spd, acc=acc)
         self._tracker.update_from_joints_degrees(b, s, e, h)
 
     def move_cartesian(self, x: float, y: float, z: float, t: float = 3.14, spd: float = 0.25):
+        _debug(f"move_cartesian(x={x:.1f}, y={y:.1f}, z={z:.1f})")
         self._arm.move_cartesian(x, y, z, t=t, spd=spd)
         self._tracker.update_from_cartesian(x, y, z)
 
     def gripper_open(self):
+        _debug("gripper_open()")
         self._arm.gripper_open()
 
     def gripper_close_until_resistance(self, torque_threshold=60, timeout=4.0, step_rad=0.08) -> bool:
+        _debug(f"gripper_close_until_resistance(threshold={torque_threshold})")
         return self._arm.gripper_close_until_resistance(
             torque_threshold=torque_threshold,
             timeout=timeout,
@@ -91,10 +101,11 @@ class _ArmInterface:
         status = self._arm.get_status()
         if status:
             self._tracker.update_from_cartesian(status.x, status.y, status.z)
+            _debug(f"get_position() → ({status.x:.1f}, {status.y:.1f}, {status.z:.1f})")
             return (status.x, status.y, status.z)
         # Fallback
         pos = self._tracker.cartesian
-        _info(f"[Tracker-Fallback] X={pos[0]:.1f} Y={pos[1]:.1f} Z={pos[2]:.1f}")
+        _debug(f"get_position() → FALLBACK ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})")
         return pos
 
     def park(self):
@@ -113,6 +124,9 @@ class _VisionInterface:
         self._confidence = confidence
         self._headless = headless
         self._window_name = window_name
+        self._frame_count = 0
+        self._fps_time = time.time()
+        self._last_fps = 0.0
 
     @property
     def resolution(self) -> Tuple[int, int]:
@@ -126,7 +140,9 @@ class _VisionInterface:
     def get_frame(self):
         if not self._camera:
             return None
-        self._camera.grab()
+        # Buffer flushen: 2x grab() verwirft alte Frames
+        for _ in range(2):
+            self._camera.grab()
         ret, frame = self._camera.retrieve()
         return frame if ret else None
 
@@ -144,7 +160,32 @@ class _VisionInterface:
             return [], -1
 
         detections = self._run_detection(frame, target_classes)
-        self._annotate(frame, detections, target_classes, status_text)
+
+        # FPS berechnen
+        self._frame_count += 1
+        elapsed = time.time() - self._fps_time
+        if elapsed >= 1.0:
+            self._last_fps = self._frame_count / elapsed
+            self._frame_count = 0
+            self._fps_time = time.time()
+
+        # Debug-Info in Status einbauen
+        fps_text = f"FPS:{self._last_fps:.1f}"
+        if status_text:
+            full_status = f"{fps_text} | {status_text}"
+        else:
+            full_status = fps_text
+
+        # Debug: Detection-Info
+        if DEBUG and target_classes and detections:
+            det = detections[0]
+            cx, cy = det['center_px']
+            w, h = self.resolution
+            off_x = cx - w/2
+            off_y = cy - h/2
+            full_status += f" | off=({off_x:.0f},{off_y:.0f})px conf={det['confidence']:.2f}"
+
+        self._annotate(frame, detections, target_classes, full_status)
         key = self._show(frame)
         return detections, key
 
@@ -183,6 +224,16 @@ class _VisionInterface:
             })
 
         detections.sort(key=lambda d: d['confidence'], reverse=True)
+
+        if DEBUG:
+            if target_classes:
+                all_classes = set()
+                for box in results.boxes:
+                    cls_id = int(box.cls[0])
+                    all_classes.add(results.names[cls_id])
+                if not detections and all_classes:
+                    _debug(f"Kein '{target_classes}' aber sehe: {all_classes}")
+
         return detections
 
     def _annotate(self, frame, detections: List[Dict], target_classes: List[str] = None,
@@ -237,7 +288,10 @@ class EyeInHandController:
 
     def __init__(self, arm: RoArmM2S, camera_index: Optional[int] = None,
                  model_path: str = "yolo11n.pt", confidence: float = 0.5,
-                 headless: bool = False):
+                 headless: bool = False, debug: bool = False):
+        global DEBUG
+        DEBUG = debug
+
         self.arm = arm
         self._headless = headless
         self._camera = None
@@ -245,11 +299,12 @@ class EyeInHandController:
         self._confidence = confidence
         self._window_name = "RoArm Eye-in-Hand"
         self._active = False
+        self._debug = debug
 
-        # Interfaces (werden nach Kamera/YOLO-Init erstellt)
+        # Interfaces
         self._arm_iface: Optional[_ArmInterface] = None
         self._vision_iface: Optional[_VisionInterface] = None
-        self._sequencer: Optional[GrabSequencer] = None
+        self._sequencer = GrabSequencer(self._arm_iface, self._vision_iface, debug=debug)
 
         if not HAS_CV2:
             _error("OpenCV nicht installiert: pip install opencv-python")
@@ -286,7 +341,7 @@ class EyeInHandController:
             self._camera, self._model, self._confidence,
             self._headless, self._window_name
         )
-        self._sequencer = GrabSequencer(self._arm_iface, self._vision_iface)
+        self._sequencer = GrabSequencer(self._arm_iface, self._vision_iface, debug=debug)
 
     @property
     def active(self) -> bool:
@@ -362,7 +417,9 @@ class EyeInHandController:
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimaler Buffer gegen Ruckeln
+        # Optional: FPS limitieren um CPU zu sparen
+        cap.set(cv2.CAP_PROP_FPS, 30)
 
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -374,7 +431,6 @@ class EyeInHandController:
     def grab(self, target_class: str, place_offset_y: float = -100) -> bool:
         """
         Findet und greift ein Objekt. Komplett automatisch mit Live-Preview.
-        Delegiert die gesamte Logik an den GrabSequencer.
         """
         if not self._active or not self._sequencer:
             _error("Controller nicht aktiv!")
@@ -382,13 +438,11 @@ class EyeInHandController:
 
         _header(f"GRAB: '{target_class}'")
 
-        # Config anpassen
         config = GrabConfig(
             target_class=target_class,
             place_offset_y=place_offset_y,
         )
 
-        # Sequencer starten
         self._sequencer.start(target_class, config)
 
         # Tick-Loop (Main-Thread!)

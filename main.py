@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RoArm-M2-S Controller – Minimal Entry Point"""
+"""RoArm-M2-S Controller — Minimal Entry Point"""
 
 import argparse
 import sys
@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--confidence", type=float, default=0.5, help="Min. Confidence")
     parser.add_argument("--headless", action="store_true", help="Kein GUI-Fenster")
     parser.add_argument("--no-vision", action="store_true", help="Vision deaktivieren")
+    parser.add_argument("--debug", action="store_true", help="Verbose Debug-Ausgaben")
     args = parser.parse_args()
 
     from roarm_m2s import RoArmM2S
@@ -32,6 +33,7 @@ def main():
             model_path=args.model,
             confidence=args.confidence,
             headless=args.headless,
+            debug=args.debug,
         )
 
         try:
@@ -43,7 +45,6 @@ def main():
             controller.shutdown()
             arm.disconnect()
     else:
-        # Test-Demo ohne Vision
         with RoArmM2S(port=args.port, enable_vision=False) as arm:
             from eye_in_hand import run_test_demo
             run_test_demo(arm)
