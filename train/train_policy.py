@@ -1080,7 +1080,7 @@ class Trainer:
         return avg_loss, best_batch
 
     def _train_with_rich_progress(self, best_loss, loss_history, start_time):
-        """Training loop with rich progress bars."""
+        """Training loop with rich progress bars and time estimates."""
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -1093,51 +1093,81 @@ class Trainer:
         )
 
         with progress:
-            # Epoch progress
+            # Epoch-level progress
             epoch_task = progress.add_task(
-                "Training", total=self.args.epochs
+                "Epochs", total=self.args.epochs
+            )
+
+            # Batch-level progress (will be reset each epoch)
+            batch_task = progress.add_task(
+                "   Batches", total=len(self.dataloader), visible=True
             )
 
             for epoch in range(self.args.epochs):
-                avg_loss, best_batch = self._train_epoch(epoch)
+                # Reset batch progress for this epoch
+                progress.reset(batch_task, total=len(self.dataloader))
+                progress.update(batch_task, description=f"   Epoch {epoch+1} batches")
+
+                # --- Train one epoch with per-batch updates ---
+                self.model.train()
+                epoch_loss = 0.0
+                num_batches = 0
+
+                for batch in self.dataloader:
+                    state = batch["observation.state"].to(self.device)
+                    action = batch["action"].to(self.device)
+                    image = batch.get("observation.image")
+                    if image is not None:
+                        image = image.to(self.device)
+
+                    self.optimizer.zero_grad()
+
+                    if self.args.policy == "diffusion":
+                        loss = self.model(state, action, image)
+                    elif self.args.policy == "tdmpc":
+                        loss = self.model(state, action, image)
+                    else:  # ACT
+                        pred_actions = self.model(state, image)
+                        loss = nn.functional.mse_loss(pred_actions, action)
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.scheduler.step()
+
+                    epoch_loss += loss.item()
+                    num_batches += 1
+
+                    # Update batch progress bar
+                    progress.update(batch_task, advance=1)
+
+                avg_loss = epoch_loss / max(num_batches, 1)
                 loss_history.append(avg_loss)
 
                 # Track best
                 improved = ""
                 if avg_loss < best_loss:
                     best_loss = avg_loss
-                    improved = " ⭐"
-                    # Save best model
+                    improved = " â­�"
                     self._save_checkpoint("best")
 
-                # Update progress
+                # Update epoch progress
                 lr = self.optimizer.param_groups[0]["lr"]
                 progress.update(
                     epoch_task,
                     advance=1,
                     description=(
-                        f"Epoch {epoch+1}/{self.args.epochs} │ "
-                        f"Loss: {avg_loss:.6f}{improved} │ "
+                        f"Epoch {epoch+1}/{self.args.epochs}"
+                        f"Loss: {avg_loss:.6f}{improved}"
+                        f"Best: {best_loss:.6f}"
                         f"LR: {lr:.2e}"
                     )
                 )
 
-                # Periodic logging
-                if (epoch + 1) % max(1, self.args.epochs // 20) == 0:
-                    elapsed = time.time() - start_time
-                    console.print(
-                        f"  [dim]Epoch {epoch+1:4d} │ "
-                        f"Loss: {avg_loss:.6f} │ "
-                        f"Best: {best_loss:.6f} │ "
-                        f"LR: {lr:.2e} │ "
-                        f"Time: {elapsed:.0f}s[/dim]"
-                    )
-
-                # Save periodic checkpoint
+                # Periodic checkpoint
                 if (epoch + 1) % self.args.save_every == 0:
                     self._save_checkpoint(f"epoch_{epoch+1}")
 
-        # Final save
         self._save_final(best_loss, loss_history, start_time)
 
     def _train_simple(self, best_loss, loss_history, start_time):
