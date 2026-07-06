@@ -204,8 +204,6 @@ class TeleopRecorder:
         # Arm in Startposition
         print("\n[4] Arm → Startposition...")
         self._arm.move_joints_degrees(b=0, s=0, e=90, h=180, spd=20, acc=10)
-        self._arm.gripper_open()
-        time.sleep(2.0)
         self._arm_state = ArmState(
             base_deg=0, shoulder_deg=0, elbow_deg=90, hand_deg=180, gripper_open=True
         )
