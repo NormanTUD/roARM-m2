@@ -418,8 +418,7 @@ class TeleopRecorder:
     def _apply_movement(self):
         """
         Wendet Bewegungen an basierend auf allen aktuell gehaltenen Tasten.
-        Durch KEY_HOLD_TIMEOUT bleibt eine Taste auch zwischen waitKey-Zyklen aktiv,
-        was flüssige Bewegung ermöglicht.
+        Hand/wrist keys are REMOVED — gripper is only controlled via O/C.
         """
         now = time.time()
         if now - self._last_move_time < self.MOVE_INTERVAL:
@@ -431,16 +430,6 @@ class TeleopRecorder:
 
         moved = False
         state = self._arm_state
-
-        # INTUITIVE Richtungen:
-        # base_left  → Base-Winkel ERHÖHEN (dreht nach links von vorne gesehen)
-        # base_right → Base-Winkel VERRINGERN (dreht nach rechts)
-        # shoulder_up → Shoulder-Winkel ERHÖHEN (Arm hebt sich)
-        # shoulder_down → Shoulder-Winkel VERRINGERN (Arm senkt sich)
-        # elbow_up → Elbow-Winkel VERRINGERN (Unterarm hebt sich)
-        # elbow_down → Elbow-Winkel ERHÖHEN (Unterarm senkt sich)
-        # hand_left → Hand-Winkel VERRINGERN
-        # hand_right → Hand-Winkel ERHÖHEN
 
         if "base_left" in active:
             state.base_deg = min(self.BASE_MAX, state.base_deg + self.BASE_STEP)
@@ -460,19 +449,17 @@ class TeleopRecorder:
         if "elbow_down" in active:
             state.elbow_deg = min(self.ELBOW_MAX, state.elbow_deg + self.ELBOW_STEP)
             moved = True
-        if "hand_left" in active:
-            state.hand_deg = max(self.HAND_MIN, state.hand_deg - self.HAND_STEP)
-            moved = True
-        if "hand_right" in active:
-            state.hand_deg = min(self.HAND_MAX, state.hand_deg + self.HAND_STEP)
-            moved = True
+
+        # hand_left / hand_right are intentionally NOT changing hand_deg anymore
+        # because hand_deg IS the gripper. If you have a separate wrist joint,
+        # you'd need a different command (not T:122's h parameter).
 
         if moved:
             self._send_arm_command()
             self._last_move_time = now
 
     def _send_arm_command(self):
-        """Sendet aktuelle Gelenkwinkel an den Arm."""
+        """Sendet aktuelle Gelenkwinkel an den Arm (inkl. Gripper-Sync)."""
         state = self._arm_state
         self._arm.move_joints_degrees(
             b=state.base_deg,
@@ -484,12 +471,16 @@ class TeleopRecorder:
         )
 
     def _gripper_open(self):
-        self._arm.gripper_open()
+        """Öffnet den Gripper und synchronisiert hand_deg."""
         self._arm_state.gripper_open = True
+        self._arm_state.hand_deg = self.GRIPPER_OPEN_DEG
+        self._arm.gripper_open()
 
     def _gripper_close(self):
-        self._arm.gripper_close()
+        """Schließt den Gripper und synchronisiert hand_deg."""
         self._arm_state.gripper_open = False
+        self._arm_state.hand_deg = self.GRIPPER_CLOSED_DEG
+        self._arm.gripper_close()
 
     # ─── Recording ────────────────────────────────────────────────────────
 
