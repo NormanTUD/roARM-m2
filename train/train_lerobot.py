@@ -261,20 +261,7 @@ class LeRobotArmDataset(Dataset):
         return samples
 
     def _load_or_compute_stats(self) -> dict:
-        """Load or compute normalization statistics."""
-        stats_path = self.meta_dir / "stats.json"
-        if stats_path.exists():
-            with open(stats_path) as f:
-                stats = json.load(f)
-            # Clamp all std values to prevent division by zero
-            for key in stats:
-                if "std" in stats[key]:
-                    stats[key]["std"] = np.maximum(
-                        np.array(stats[key]["std"]), 1e-6
-                    ).tolist()
-            return stats
-
-        # Compute from data
+        """Compute normalization statistics from actual data (ignore stale stats.json)."""
         all_states = []
         all_actions = []
         for ep in self.episodes:
@@ -286,28 +273,38 @@ class LeRobotArmDataset(Dataset):
                 if action is not None:
                     all_actions.append(action)
 
-        if all_states:
-            states_arr = np.array(all_states)
-            actions_arr = np.array(all_actions)
-            stats = {
-                "observation.state": {
-                    "mean": states_arr.mean(axis=0).tolist(),
-                    "std": np.maximum(states_arr.std(axis=0), 1e-6).tolist(),
-                    "min": states_arr.min(axis=0).tolist(),
-                    "max": states_arr.max(axis=0).tolist(),
-                },
-                "action": {
-                    "mean": actions_arr.mean(axis=0).tolist(),
-                    "std": np.maximum(actions_arr.std(axis=0), 1e-6).tolist(),
-                    "min": actions_arr.min(axis=0).tolist(),
-                    "max": actions_arr.max(axis=0).tolist(),
-                }
+        if not all_states or not all_actions:
+            # Try loading from file as fallback
+            stats_path = self.meta_dir / "stats.json"
+            if stats_path.exists():
+                with open(stats_path) as f:
+                    return json.load(f)
+            return {}
+
+        states_arr = np.array(all_states)
+        actions_arr = np.array(all_actions)
+        
+        stats = {
+            "observation.state": {
+                "mean": states_arr.mean(axis=0).tolist(),
+                "std": np.maximum(states_arr.std(axis=0), 1e-6).tolist(),
+                "min": states_arr.min(axis=0).tolist(),
+                "max": states_arr.max(axis=0).tolist(),
+            },
+            "action": {
+                "mean": actions_arr.mean(axis=0).tolist(),
+                "std": np.maximum(actions_arr.std(axis=0), 1e-6).tolist(),
+                "min": actions_arr.min(axis=0).tolist(),
+                "max": actions_arr.max(axis=0).tolist(),
             }
-        else:
-            stats = {}
-
+        }
+        
+        # Print for debugging
+        print(f"\n  📊 Computed Stats:")
+        print(f"    State range: {states_arr.min(axis=0)} → {states_arr.max(axis=0)}")
+        print(f"    Action range: {actions_arr.min(axis=0)} → {actions_arr.max(axis=0)}")
+        
         return stats
-
 
     def _extract_state(self, frame: dict) -> Optional[np.ndarray]:
         """Extract state vector from frame data."""
@@ -366,20 +363,26 @@ class LeRobotArmDataset(Dataset):
         return None
 
     def _normalize(self, data: np.ndarray, key: str) -> np.ndarray:
-        """Normalize data using stored statistics. Clamps std to avoid div-by-zero."""
+        """Normalize data to [-1, 1] using min-max scaling."""
         if key in self.stats:
-            mean = np.array(self.stats[key]["mean"], dtype=np.float32)
-            std = np.array(self.stats[key]["std"], dtype=np.float32)
-            # Pad if needed
-            if len(mean) < len(data):
-                mean = np.pad(mean, (0, len(data) - len(mean)))
-                std = np.pad(std, (0, len(data) - len(std)), constant_values=1.0)
-            elif len(mean) > len(data):
-                mean = mean[:len(data)]
-                std = std[:len(data)]
-            # *** FIX: Clamp std to prevent division by zero ***
-            std = np.maximum(std, 1e-6)
-            return (data - mean) / std
+            data_min = np.array(self.stats[key]["min"], dtype=np.float32)
+            data_max = np.array(self.stats[key]["max"], dtype=np.float32)
+
+            # Pad/trim if needed
+            if len(data_min) < len(data):
+                # Pad with reasonable defaults for gripper (0-1 range)
+                data_min = np.pad(data_min, (0, len(data) - len(data_min)), constant_values=0.0)
+                data_max = np.pad(data_max, (0, len(data) - len(data_max)), constant_values=1.0)
+            elif len(data_min) > len(data):
+                data_min = data_min[:len(data)]
+                data_max = data_max[:len(data)]
+
+            # Prevent division by zero
+            range_val = data_max - data_min
+            range_val = np.maximum(range_val, 1e-6)
+
+            # Scale to [-1, 1]
+            return 2.0 * (data - data_min) / range_val - 1.0
         return data
 
     def __len__(self):
