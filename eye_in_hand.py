@@ -142,6 +142,7 @@ class _VisionInterface:
         for _ in range(2):
             self._camera.grab()
         ret, frame = self._camera.retrieve()
+        return frame if ret else None  # ← DAS FEHLTE!
 
     def detect(self, target_classes: List[str] = None) -> List[Dict]:
         """Detect ohne GUI."""
