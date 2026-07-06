@@ -307,28 +307,35 @@ class LeRobotArmDataset(Dataset):
         return stats
 
     def _extract_state(self, frame: dict) -> Optional[np.ndarray]:
-        """Extract state vector from frame data."""
+        """Extract state vector from frame data (including LED)."""
         if "observation.state" in frame:
             s = frame["observation.state"]
             g = frame.get("observation.gripper", [0.0])
             if isinstance(g, list):
                 g = g[0]
-            return np.array(s + [float(g)], dtype=np.float32)
+            led = frame.get("led_brightness", 255) / 255.0
+            return np.array(s + [float(g), led], dtype=np.float32)
         elif "arm_state" in frame:
             arm = frame["arm_state"]
+            led = frame.get("led_brightness", 255) / 255.0
             return np.array([
                 arm["base_deg"], arm["shoulder_deg"],
                 arm["elbow_deg"], arm["hand_deg"],
-                0.0 if arm.get("gripper_open", True) else 1.0
+                0.0 if arm.get("gripper_open", True) else 1.0,
+                led
             ], dtype=np.float32)
         return None
 
     def _extract_action(self, frame: dict) -> Optional[np.ndarray]:
-        """Extract action vector from frame data."""
+        """Extract action vector from frame data (including LED)."""
         if "action" in frame:
             a = frame["action"]
-            if isinstance(a, list) and len(a) >= 5:
-                return np.array(a[:5], dtype=np.float32)
+            if isinstance(a, list) and len(a) >= 6:
+                return np.array(a[:6], dtype=np.float32)
+            elif isinstance(a, list) and len(a) >= 5:
+                # Legacy 5-dim: append LED from frame metadata
+                led = frame.get("led_brightness", 255) / 255.0
+                return np.array(a[:5] + [led], dtype=np.float32)
         return None
 
     def _get_image(self, ep_idx: int, frame_idx: int) -> Optional[np.ndarray]:
@@ -901,27 +908,22 @@ class Trainer:
         """Build the selected policy model."""
         policy_cls = self.POLICY_REGISTRY[self.args.policy]
 
-        # Check if images are available
         use_images = self.args.use_images
         if use_images:
             has_video = self.dataset.video_dir.exists() and any(self.dataset.video_dir.glob("*.mp4"))
             if not has_video:
-                if HAS_RICH:
-                    console.print("  [yellow]⚠ No video files found, disabling image input[/yellow]")
-                else:
-                    print("  ⚠ No video files found, disabling image input")
+                print("  ⚠ No video files found, disabling image input")
                 use_images = False
 
         kwargs = {
-            "state_dim": 5,
-            "action_dim": 5,
+            "state_dim": 6,   # base, shoulder, elbow, hand, gripper, led
+            "action_dim": 6,  # base, shoulder, elbow, hand, gripper, led
             "chunk_size": self.args.chunk_size,
             "hidden_dim": self.args.hidden_dim,
             "use_images": use_images,
             "image_size": (128, 128),
         }
 
-        # Policy-specific args
         if self.args.policy == "act":
             kwargs["num_heads"] = self.args.num_heads
             kwargs["num_layers"] = self.args.num_layers

@@ -96,7 +96,7 @@ class PolicyRunner:
         # State
         self._running = False
         self._executing = False
-        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0], dtype=np.float32)
+        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0, 1.0], dtype=np.float32)
         self._action_queue: List[np.ndarray] = []
         self._action_queue_lock = threading.Lock()
 
@@ -172,7 +172,7 @@ class PolicyRunner:
         time.sleep(2.0)
         self._arm.gripper_open()
         time.sleep(0.5)
-        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0], dtype=np.float32)
+        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0, 1.0], dtype=np.float32)
 
         print(f"\n  ✓ Setup complete!")
         print(f"\n  Controls:")
@@ -183,6 +183,24 @@ class PolicyRunner:
         print()
 
         return True
+
+    def _execute_led(self, brightness: int):
+        """Send LED command if brightness changed."""
+        if not hasattr(self, '_last_led_brightness'):
+            self._last_led_brightness = -1
+
+        if brightness != self._last_led_brightness:
+            self._arm.set_led(brightness)
+            self._last_led_brightness = brightness
+
+
+    def _extract_led_from_action(self, action: np.ndarray) -> int:
+        """Extract LED brightness (0-255) from action vector."""
+        if len(action) >= 6:
+            led_norm = float(np.clip(action[5], 0.0, 1.0))
+            return int(round(led_norm * 255))
+        return 255  # Default: full brightness
+
 
     # ─── Normalization ────────────────────────────────────────────────────
 
@@ -313,14 +331,17 @@ class PolicyRunner:
     # ─── Safety ───────────────────────────────────────────────────────────
 
     def _clamp_action(self, action: np.ndarray) -> np.ndarray:
-        """Clamp action to safe joint limits."""
+        """Clamp action to safe limits (6-dim)."""
         clamped = action.copy()
         clamped[0] = np.clip(clamped[0], self.BASE_MIN, self.BASE_MAX)
         clamped[1] = np.clip(clamped[1], self.SHOULDER_MIN, self.SHOULDER_MAX)
         clamped[2] = np.clip(clamped[2], self.ELBOW_MIN, self.ELBOW_MAX)
         clamped[3] = np.clip(clamped[3], self.HAND_MIN, self.HAND_MAX)
-        clamped[4] = np.clip(clamped[4], 0.0, 1.0)  # Gripper: 0=open, 1=closed
+        clamped[4] = np.clip(clamped[4], 0.0, 1.0)   # Gripper
+        if len(clamped) >= 6:
+            clamped[5] = np.clip(clamped[5], 0.0, 1.0)  # LED normalized
         return clamped
+
 
     def _smooth_action(self, action: np.ndarray, prev_state: np.ndarray,
                        max_delta_deg: float = 5.0) -> np.ndarray:
@@ -340,15 +361,26 @@ class PolicyRunner:
 
     # ─── Execution ────────────────────────────────────────────────────────
 
+    def _execute_gripper(self, gripper: float):
+        """Handle gripper with hysteresis."""
+        gripper_threshold = 0.5
+        current_gripper = self._current_state[4]
+
+        if gripper > gripper_threshold and current_gripper <= gripper_threshold:
+            self._arm.gripper_close()
+        elif gripper <= gripper_threshold and current_gripper > gripper_threshold:
+            self._arm.gripper_open()
+
+
     def _execute_action(self, action: np.ndarray):
-        """Send action to the arm."""
+        """Send action to the arm (joints + gripper + LED)."""
         base_deg = round(float(action[0]), 1)
         shoulder_deg = round(float(action[1]), 1)
         elbow_deg = round(float(action[2]), 1)
         hand_deg = round(float(action[3]), 1)
         gripper = float(action[4])
 
-        # Send joint command (non-blocking, like teleop_recorder)
+        # Joint command
         cmd = {
             "T": 122,
             "b": base_deg,
@@ -360,14 +392,12 @@ class PolicyRunner:
         }
         self._arm._send_nowait(cmd)
 
-        # Gripper control (with hysteresis to avoid chattering)
-        gripper_threshold = 0.5
-        current_gripper = self._current_state[4]
+        # Gripper control
+        self._execute_gripper(gripper)
 
-        if gripper > gripper_threshold and current_gripper <= gripper_threshold:
-            self._arm.gripper_close()
-        elif gripper <= gripper_threshold and current_gripper > gripper_threshold:
-            self._arm.gripper_open()
+        # LED control
+        led_brightness = self._extract_led_from_action(action)
+        self._execute_led(led_brightness)
 
         # Update current state
         self._current_state = action.copy()
@@ -379,7 +409,7 @@ class PolicyRunner:
         time.sleep(0.3)
         self._arm.move_joints_degrees(b=0, s=0, e=90, h=180, spd=20, acc=10)
         time.sleep(2.0)
-        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0], dtype=np.float32)
+        self._current_state = np.array([0.0, 0.0, 90.0, 180.0, 0.0, 1.0], dtype=np.float32)
         self._action_queue = []
         self._ensemble_buffer = []
         print("  ✓ Reset complete")

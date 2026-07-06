@@ -515,6 +515,70 @@ class LeRobotSaver:
         self._total_frames = 0
         self._load_or_create_meta()
 
+    def _build_action_vector(self, arm_state: dict, led_brightness: int) -> list:
+        """Build 6-dim action vector including LED."""
+        return [
+            arm_state["base_deg"],
+            arm_state["shoulder_deg"],
+            arm_state["elbow_deg"],
+            arm_state["hand_deg"],
+            0.0 if arm_state["gripper_open"] else 1.0,
+            led_brightness / 255.0
+        ]
+
+    def _build_all_records(self, episode: Episode) -> list:
+        """Build all records for an episode."""
+        ep_idx = episode.episode_id - 1
+        records = []
+
+        for i, frame_data in enumerate(episode.frames):
+            next_frame = episode.frames[i + 1] if i < len(episode.frames) - 1 else None
+            record = self._build_record(
+                frame_data, next_frame, ep_idx, i, self._total_frames
+            )
+            records.append(record)
+
+        return records
+
+    def _build_record(self, frame_data: dict, next_frame_data: Optional[dict],
+                      ep_idx: int, frame_idx: int, global_offset: int) -> dict:
+        """Build a single LeRobot record from frame data."""
+        arm = frame_data["arm_state"]
+        led = frame_data.get("led_brightness", 255)
+
+        if next_frame_data:
+            next_arm = next_frame_data["arm_state"]
+            next_led = next_frame_data.get("led_brightness", 255)
+            action_vec = self._build_action_vector(next_arm, next_led)
+        else:
+            action_vec = self._build_action_vector(arm, led)
+
+        timestamp_from_index = frame_idx / self._fps
+
+        return {
+            "observation.state": [
+                arm["base_deg"],
+                arm["shoulder_deg"],
+                arm["elbow_deg"],
+                arm["hand_deg"]
+            ],
+            "observation.gripper": [0.0 if arm["gripper_open"] else 1.0],
+            "observation.led": [led / 255.0],
+            "action": action_vec,
+            "timestamp": [timestamp_from_index],
+            "episode_index": [ep_idx],
+            "frame_index": [frame_idx],
+            "index": [global_offset + frame_idx],
+            "task_index": [0],
+            "action_label": frame_data.get("action", ""),
+            "servo_spd": frame_data.get("servo_spd", 50),
+            "servo_acc": frame_data.get("servo_acc", 100),
+            "led_brightness": led,
+            "detections_json": json.dumps(frame_data.get("detections", [])),
+            "rel_to_target_json": json.dumps(frame_data.get("rel_to_target", {})),
+        }
+
+
     def _load_or_create_meta(self):
         """Lade bestehende Metadaten oder erstelle neue."""
         if self._info_path.exists():
@@ -552,9 +616,9 @@ class LeRobotSaver:
                 },
                 "action": {
                     "dtype": "float32",
-                    "shape": [5],
-                    "names": ["base_deg", "shoulder_deg", "elbow_deg", "hand_deg", "gripper"]
-                },
+                    "shape": [6],
+                    "names": ["base_deg", "shoulder_deg", "elbow_deg", "hand_deg", "gripper", "led"]
+                    },
                 "observation.images.top": {
                     "dtype": "video",
                     "shape": [480, 640, 3],
@@ -565,6 +629,11 @@ class LeRobotSaver:
                         "video.pix_fmt": "yuv420p",
                         "has_audio": False
                     }
+                },
+                "observation.led": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "names": ["led_brightness_normalized"]
                 },
                 "timestamp": {
                     "dtype": "float32",
@@ -616,70 +685,10 @@ class LeRobotSaver:
         """
         ep_idx = episode.episode_id - 1  # 0-basiert
 
-        # ─── Parquet-Daten vorbereiten ───
-        records = []
-        for i, frame_data in enumerate(episode.frames):
-            arm = frame_data["arm_state"]
-            action_str = frame_data.get("action", "")
+        # ——— Build records using the new helper functions ———
+        records = self._build_all_records(episode)
 
-            # Nächster State als Action (oder gleicher State wenn letzter Frame)
-            if i < len(episode.frames) - 1:
-                next_arm = episode.frames[i + 1]["arm_state"]
-                action_vec = [
-                    next_arm["base_deg"],
-                    next_arm["shoulder_deg"],
-                    next_arm["elbow_deg"],
-                    next_arm["hand_deg"],
-                    0.0 if next_arm["gripper_open"] else 1.0
-                ]
-            else:
-                action_vec = [
-                    arm["base_deg"],
-                    arm["shoulder_deg"],
-                    arm["elbow_deg"],
-                    arm["hand_deg"],
-                    0.0 if arm["gripper_open"] else 1.0
-                ]
-
-            # Timestamp basierend auf Frame-Index und FPS (konsistent mit Video)
-            timestamp_from_index = i / self._fps
-
-            record = {
-                "observation.state": [
-                    arm["base_deg"],
-                    arm["shoulder_deg"],
-                    arm["elbow_deg"],
-                    arm["hand_deg"]
-                ],
-                "observation.gripper": [0.0 if arm["gripper_open"] else 1.0],
-                "action": action_vec,
-                "timestamp": [timestamp_from_index],
-                "episode_index": [ep_idx],
-                "frame_index": [i],
-                "index": [self._total_frames + i],
-                "task_index": [0],
-                # Zusätzliche Daten für Replay und Training
-                "action_label": action_str,
-                # Speed/Acc für Replay-Fidelity
-                "servo_spd": frame_data.get("servo_spd", 50),
-                "servo_acc": frame_data.get("servo_acc", 100),
-                "led_brightness": frame_data.get("led_brightness", 255),
-            }
-
-            # Detections als JSON-String speichern
-            if frame_data.get("detections"):
-                record["detections_json"] = json.dumps(frame_data["detections"])
-            else:
-                record["detections_json"] = "[]"
-
-            if frame_data.get("rel_to_target"):
-                record["rel_to_target_json"] = json.dumps(frame_data["rel_to_target"])
-            else:
-                record["rel_to_target_json"] = "{}"
-
-            records.append(record)
-
-        # ─── Als Parquet speichern ───
+        # ——— Als Parquet speichern ———
         parquet_path = self._data_dir / f"episode_{ep_idx:06d}.parquet"
 
         if HAS_PARQUET and records:
@@ -697,12 +706,12 @@ class LeRobotSaver:
                 json.dump(records, f, indent=2)
             parquet_path = json_path
 
-        # ─── Video speichern (wenn Frames vorhanden) ───
+        # ——— Video speichern (wenn Frames vorhanden) ———
         if frames_images and len(frames_images) > 0:
             video_path = self._video_dir / f"episode_{ep_idx:06d}.mp4"
             self._save_video(frames_images, video_path)
 
-        # ─── Episode-Index aktualisieren (LeRobot v2.1 Format) ───
+        # ——— Episode-Index aktualisieren (LeRobot v2.1 Format) ———
         num_frames = len(episode.frames)
         episode_entry = {
             "episode_index": ep_idx,
@@ -712,17 +721,16 @@ class LeRobotSaver:
         with open(self._episodes_path, 'a') as f:
             f.write(json.dumps(episode_entry) + "\n")
 
-        # ─── Tasks aktualisieren ───
+        # ——— Tasks aktualisieren ———
         self._update_tasks(episode.target_class)
 
-        # ─── Metadaten aktualisieren ───
+        # ——— Metadaten aktualisieren ———
         self._total_episodes += 1
         self._total_frames += num_frames
         self._save_info()
         self._update_stats(records)
 
         return parquet_path
-
 
     def _save_video(self, frames: List[np.ndarray], video_path: Path):
         """Speichert Frames als MP4-Video mit H.264 Codec (LeRobot-kompatibel)."""
