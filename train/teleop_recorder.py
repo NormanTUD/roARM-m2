@@ -86,16 +86,21 @@ class TeleopRecorder:
     COMMAND_HZ = 50            # 50 commands/sec to servo
     COMMAND_INTERVAL = 1.0 / 50  # 20ms between commands
     
-    # Step sizes PER COMMAND (at 50Hz, 0.6°/cmd = 30°/sec movement)
-    BASE_STEP = 0.6
-    SHOULDER_STEP = 0.5
-    ELBOW_STEP = 0.5
+    # Speed levels: (base_step, shoulder_step, elbow_step, hand_step, servo_spd, servo_acc)
+    SPEED_LEVELS = [
+        # Level 0: Very Slow (precision)
+        {"base": 0.15, "shoulder": 0.12, "elbow": 0.12, "hand": 0.2, "spd": 15, "acc": 30, "label": "VERY SLOW"},
+        # Level 1: Slow
+        {"base": 0.3, "shoulder": 0.25, "elbow": 0.25, "hand": 0.4, "spd": 30, "acc": 50, "label": "SLOW"},
+        # Level 2: Medium (default)
+        {"base": 0.6, "shoulder": 0.5, "elbow": 0.5, "hand": 0.7, "spd": 50, "acc": 100, "label": "MEDIUM"},
+        # Level 3: Fast
+        {"base": 1.0, "shoulder": 0.8, "elbow": 0.8, "hand": 1.2, "spd": 80, "acc": 150, "label": "FAST"},
+        # Level 4: Very Fast
+        {"base": 1.5, "shoulder": 1.2, "elbow": 1.2, "hand": 1.8, "spd": 100, "acc": 200, "label": "VERY FAST"},
+    ]
     
-    # Servo parameters
-    # spd for T:122 in degrees mode: higher = faster. 0 might not mean max!
-    # Try 50-100 for fast continuous motion
-    MOVE_SPEED = 50
-    MOVE_ACC = 100
+    DEFAULT_SPEED_LEVEL = 2  # Medium
     
     # Limits
     BASE_MIN, BASE_MAX = -90.0, 90.0
@@ -105,6 +110,11 @@ class TeleopRecorder:
 
     # Timing für flüssige Steuerung
     KEY_HOLD_TIMEOUT = 0.35  # Sekunden: Taste gilt als "gehalten" für diese Dauer nach letztem Druck
+    
+    # Speed change keys
+    SPEED_UP_KEY = ord('+')      # '+' or '=' key to increase speed
+    SPEED_UP_KEY_ALT = ord('=')  # For keyboards without numpad
+    SPEED_DOWN_KEY = ord('-')    # '-' key to decrease speed
 
     def __init__(self, port: str = None, camera_index: int = 2,
                  model_path: str = "yolo11n.pt", confidence: float = 0.5,
@@ -128,6 +138,9 @@ class TeleopRecorder:
         self._current_episode: Optional[Episode] = None
         self._episode_count = self._count_existing_episodes()
         self._running = False
+
+        # ─── Speed control ───
+        self._speed_level = self.DEFAULT_SPEED_LEVEL
 
         # ─── NEW: Persistent key state (press/release tracking) ───
         self._keys_down: set = set()           # Currently held keys
@@ -164,6 +177,19 @@ class TeleopRecorder:
             del self._key_last_seen[key]
             self._keys_down.discard(key)
         return set(self._keys_down)  # Return a copy
+
+    @property
+    def _current_speed(self) -> dict:
+        """Returns the current speed level configuration."""
+        return self.SPEED_LEVELS[self._speed_level]
+
+    def _change_speed(self, delta: int):
+        """Change speed level by delta (+1 or -1). Clamps to valid range."""
+        old_level = self._speed_level
+        self._speed_level = max(0, min(len(self.SPEED_LEVELS) - 1, self._speed_level + delta))
+        if self._speed_level != old_level:
+            spd = self._current_speed
+            print(f"  ⚡ Speed: {spd['label']} (Level {self._speed_level}/{len(self.SPEED_LEVELS)-1})")
 
     # ─── Setup ────────────────────────────────────────────────────────────
 
@@ -246,6 +272,9 @@ class TeleopRecorder:
         print("    R         Aufnahme starten")
         print("    S         Aufnahme speichern (nur während Aufnahme)")
         print("    F         Aufnahme als fehlgeschlagen speichern")
+        print("    +/=       Geschwindigkeit erhöhen")
+        print("    -         Geschwindigkeit verringern")
+        print("    1-5       Geschwindigkeit direkt setzen (1=sehr langsam, 5=sehr schnell)")
         print("    Q         Beenden")
         print("=" * 60)
         print(f"\n  Episoden bisher: {self._episode_count}")
@@ -443,6 +472,27 @@ class TeleopRecorder:
             self._gripper_close()
             action = "gripper_close"
 
+        # ─── Speed Control ───
+        elif key_low == ord('+') or key_low == ord('='):
+            self._change_speed(+1)
+        elif key_low == ord('-') or key_low == ord('_'):
+            self._change_speed(-1)
+        elif key_low == ord('1'):
+            self._speed_level = 0
+            print(f"  ⚡ Speed: {self._current_speed['label']}")
+        elif key_low == ord('2'):
+            self._speed_level = 1
+            print(f"  ⚡ Speed: {self._current_speed['label']}")
+        elif key_low == ord('3'):
+            self._speed_level = 2
+            print(f"  ⚡ Speed: {self._current_speed['label']}")
+        elif key_low == ord('4'):
+            self._speed_level = 3
+            print(f"  ⚡ Speed: {self._current_speed['label']}")
+        elif key_low == ord('5'):
+            self._speed_level = 4
+            print(f"  ⚡ Speed: {self._current_speed['label']}")
+
         # ─── Recording ───
         elif key_low == ord('r'):
             self._start_recording()
@@ -460,7 +510,7 @@ class TeleopRecorder:
     def _apply_movement(self):
         """
         Apply movement at a FIXED RATE regardless of display loop timing.
-        This is the key fix: decouple command rate from frame rate.
+        Uses dynamic speed levels for all joint movements.
         """
         now = time.time()
         dt = now - self._last_cmd_time
@@ -470,33 +520,42 @@ class TeleopRecorder:
         
         active = self._get_active_keys()
         if not active:
+            self._last_cmd_time = now
             return
 
         # Calculate steps proportional to actual elapsed time (velocity-based)
-        # This ensures consistent speed regardless of timing jitter
         time_factor = dt / self.COMMAND_INTERVAL  # Normally ~1.0
         time_factor = min(time_factor, 3.0)  # Cap to prevent jumps after stalls
+
+        # Get current speed settings
+        spd_cfg = self._current_speed
 
         moved = False
         state = self._arm_state
 
         if "base_left" in active:
-            state.base_deg = min(self.BASE_MAX, state.base_deg + self.BASE_STEP * time_factor)
+            state.base_deg = min(self.BASE_MAX, state.base_deg + spd_cfg["base"] * time_factor)
             moved = True
         if "base_right" in active:
-            state.base_deg = max(self.BASE_MIN, state.base_deg - self.BASE_STEP * time_factor)
+            state.base_deg = max(self.BASE_MIN, state.base_deg - spd_cfg["base"] * time_factor)
             moved = True
         if "shoulder_up" in active:
-            state.shoulder_deg = min(self.SHOULDER_MAX, state.shoulder_deg + self.SHOULDER_STEP * time_factor)
+            state.shoulder_deg = min(self.SHOULDER_MAX, state.shoulder_deg + spd_cfg["shoulder"] * time_factor)
             moved = True
         if "shoulder_down" in active:
-            state.shoulder_deg = max(self.SHOULDER_MIN, state.shoulder_deg - self.SHOULDER_STEP * time_factor)
+            state.shoulder_deg = max(self.SHOULDER_MIN, state.shoulder_deg - spd_cfg["shoulder"] * time_factor)
             moved = True
         if "elbow_up" in active:
-            state.elbow_deg = max(self.ELBOW_MIN, state.elbow_deg - self.ELBOW_STEP * time_factor)
+            state.elbow_deg = max(self.ELBOW_MIN, state.elbow_deg - spd_cfg["elbow"] * time_factor)
             moved = True
         if "elbow_down" in active:
-            state.elbow_deg = min(self.ELBOW_MAX, state.elbow_deg + self.ELBOW_STEP * time_factor)
+            state.elbow_deg = min(self.ELBOW_MAX, state.elbow_deg + spd_cfg["elbow"] * time_factor)
+            moved = True
+        if "hand_left" in active:
+            state.hand_deg = max(self.HAND_MIN, state.hand_deg - spd_cfg["hand"] * time_factor)
+            moved = True
+        if "hand_right" in active:
+            state.hand_deg = min(self.HAND_MAX, state.hand_deg + spd_cfg["hand"] * time_factor)
             moved = True
 
         if moved:
@@ -507,21 +566,20 @@ class TeleopRecorder:
     def _send_arm_command(self):
         """
         Send current joint angles to the arm.
-        Uses _send_nowait for non-blocking streaming.
-        Rounds values to reduce unique command strings (helps firmware parser).
+        Uses dynamic speed/acceleration from current speed level.
         """
         state = self._arm_state
+        spd_cfg = self._current_speed
         cmd = {
             "T": 122,
             "b": round(state.base_deg, 1),
             "s": round(state.shoulder_deg, 1),
             "e": round(state.elbow_deg, 1),
             "h": round(state.hand_deg, 1),
-            "spd": self.MOVE_SPEED,
-            "acc": self.MOVE_ACC
+            "spd": spd_cfg["spd"],
+            "acc": spd_cfg["acc"]
         }
         self._arm._send_nowait(cmd)
-
 
     def _gripper_open(self):
         """Öffnet den Gripper und synchronisiert hand_deg."""
@@ -669,10 +727,12 @@ class TeleopRecorder:
 
         # ─── Status-Leiste oben ───
         state = self._arm_state
+        spd_label = self._current_speed["label"]
         status_line = (f"B:{state.base_deg:.0f} S:{state.shoulder_deg:.0f} "
                        f"E:{state.elbow_deg:.0f} H:{state.hand_deg:.0f} "
                        f"G:{'O' if state.gripper_open else 'C'} "
-                       f"FPS:{fps:.0f}")
+                       f"FPS:{fps:.0f} | SPD:{spd_label}")
+
         cv2.putText(frame, status_line, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
@@ -703,8 +763,8 @@ class TeleopRecorder:
 
         # ─── Steuerungs-Overlay ───
         help_y = h_f - 40
-        cv2.putText(frame, "Arrows=Base/Shoulder  W/S=Elbow  A/D=Hand  O/C=Gripper",
-                    (10, help_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+        cv2.putText(frame, "Arrows=Base/Shoulder  W/S=Elbow  A/D=Hand  O/C=Grip  +/-=Speed  1-5=Level",
+                    (10, help_y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
 
     # ─── Shutdown ─────────────────────────────────────────────────────────
 
