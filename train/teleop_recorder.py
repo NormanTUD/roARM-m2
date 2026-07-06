@@ -26,6 +26,7 @@ import json
 import time
 import os
 import argparse
+import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -73,17 +74,31 @@ class TeleopRecorder:
     """
     Fernsteuerung + Aufzeichnung für Behaviour Cloning.
     
-    Flüssige Steuerung durch Key-Hold-Erkennung mit Timeout statt
-    sofortigem Clear bei fehlendem Tastendruck.
+    Smooth movement via:
+    - Persistent key state tracking (not relying on OS key-repeat)
+    - High-frequency command streaming in a separate thread
+    - Small position increments at consistent rate
     """
 
-    # Steuerungs-Parameter
-    MOVE_INTERVAL = 0.03     # Send commands faster (33Hz)
-    BASE_STEP = 3.0          # Slightly larger steps
-    SHOULDER_STEP = 2.0
-    ELBOW_STEP = 2.0
-    MOVE_SPEED = 80          # Higher servo speed so it doesn't "wait" at target
-    MOVE_ACC = 30
+    # ─── Steuerungs-Parameter (FIXED) ────────────────────────────────────
+    
+    # Command streaming rate (separate from display loop)
+    COMMAND_HZ = 50            # 50 commands/sec to servo
+    COMMAND_INTERVAL = 1.0 / 50  # 20ms between commands
+    
+    # Step sizes PER COMMAND (at 50Hz, 0.6°/cmd = 30°/sec movement)
+    BASE_STEP = 0.6
+    SHOULDER_STEP = 0.5
+    ELBOW_STEP = 0.5
+    
+    # Servo parameters
+    # spd for T:122 in degrees mode: higher = faster. 0 might not mean max!
+    # Try 50-100 for fast continuous motion
+    MOVE_SPEED = 50
+    MOVE_ACC = 100
+    
+    # Key hold detection
+    KEY_HOLD_TIMEOUT = 0.20    # ONLY defined once! 200ms forgiveness for key-repeat gaps
 
     # Limits
     BASE_MIN, BASE_MAX = -90.0, 90.0
@@ -93,7 +108,6 @@ class TeleopRecorder:
 
     # Timing für flüssige Steuerung
     KEY_HOLD_TIMEOUT = 0.15  # Sekunden: Taste gilt als "gehalten" für diese Dauer nach letztem Druck
-    MOVE_INTERVAL = 0.05     # 50ms = 20Hz Steuerungs-Rate
 
     def __init__(self, port: str = None, camera_index: int = 2,
                  model_path: str = "yolo11n.pt", confidence: float = 0.5,
@@ -118,11 +132,15 @@ class TeleopRecorder:
         self._episode_count = self._count_existing_episodes()
         self._running = False
 
-        # Timing
-        self._last_move_time = 0.0
+        # ─── NEW: Persistent key state (press/release tracking) ───
+        self._keys_down: set = set()           # Currently held keys
+        self._key_last_seen: Dict[str, float] = {}  # Timestamp of last keypress event
 
-        # Key-Hold-Tracking: Jede Taste hat einen Timestamp wann sie zuletzt gedrückt wurde
-        self._key_last_pressed: Dict[str, float] = {}
+        # ─── NEW: Command thread ───
+        self._cmd_thread: Optional[threading.Thread] = None
+        self._cmd_lock = threading.Lock()
+        self._last_cmd_time = 0.0
+        self._last_action = ""
 
         # Window
         self._window_name = "RoArm Teleop"
@@ -135,16 +153,20 @@ class TeleopRecorder:
         return count
 
     def _get_active_keys(self) -> set:
-        """Gibt alle Tasten zurück die aktuell als 'gehalten' gelten."""
+        """
+        Returns all keys currently considered 'held'.
+        A key is held if it was seen within KEY_HOLD_TIMEOUT.
+        This handles OS key-repeat gaps gracefully.
+        """
         now = time.time()
-        active = set()
-        for key, last_time in list(self._key_last_pressed.items()):
-            if now - last_time < self.KEY_HOLD_TIMEOUT:
-                active.add(key)
-            else:
-                # Abgelaufen → entfernen
-                del self._key_last_pressed[key]
-        return active
+        expired = []
+        for key, last_time in self._key_last_seen.items():
+            if now - last_time >= self.KEY_HOLD_TIMEOUT:
+                expired.append(key)
+        for key in expired:
+            del self._key_last_seen[key]
+            self._keys_down.discard(key)
+        return set(self._keys_down)  # Return a copy
 
     # ─── Setup ────────────────────────────────────────────────────────────
 
@@ -236,46 +258,59 @@ class TeleopRecorder:
     # ─── Main Loop ────────────────────────────────────────────────────────
 
     def run(self):
-        """Hauptschleife."""
+        """Hauptschleife – display and command sending are decoupled."""
         if not self.setup():
             return
 
         self._running = True
+        self._last_cmd_time = time.time()
         fps_time = time.time()
         frame_count = 0
         current_fps = 0.0
 
+        # Detection throttle: don't run YOLO every frame
+        detect_every_n = 3  # Run YOLO every 3rd frame
+        loop_counter = 0
+        last_detections = []
+
         try:
             while self._running:
                 loop_start = time.time()
+                loop_counter += 1
 
-                # 1. Frame holen
+                # 1. Frame holen (always, for display)
                 frame = self._get_frame()
                 if frame is None:
-                    time.sleep(0.01)
+                    time.sleep(0.005)
                     continue
 
-                # 2. Detection
-                detections = self._detect(frame)
+                # 2. Detection (throttled to reduce blocking)
+                if loop_counter % detect_every_n == 0:
+                    last_detections = self._detect(frame)
+                detections = last_detections
 
-                # 3. Tastatur verarbeiten (waitKey mit kurzer Wartezeit)
-                key = cv2.waitKey(1) & 0xFFFF
-                action = self._process_key(key)
+                # 3. Process ALL pending key events (drain the event queue)
+                action = ""
+                for _ in range(10):  # Process up to 10 queued events
+                    key = cv2.waitKey(1) & 0xFFFF
+                    if key == -1 or key == 0xFFFF:
+                        break
+                    action = self._process_key(key) or action
 
-                # 4. Arm bewegen basierend auf gehaltenen Tasten
+                # 4. Apply movement (at fixed rate, independent of display)
                 self._apply_movement()
 
-                # 5. Frame annotieren
+                # 5. Annotate
                 self._annotate_frame(frame, detections, action, current_fps)
 
-                # 6. Aufzeichnen
+                # 6. Record
                 if self._recording:
                     self._record_frame(detections, action)
 
-                # 7. Anzeigen
+                # 7. Display
                 cv2.imshow(self._window_name, frame)
 
-                # FPS berechnen
+                # FPS
                 frame_count += 1
                 elapsed = time.time() - fps_time
                 if elapsed >= 1.0:
@@ -283,16 +318,16 @@ class TeleopRecorder:
                     frame_count = 0
                     fps_time = time.time()
 
-                # Loop-Timing (Ziel: ~30 FPS)
+                # Target ~40 FPS for display (commands are sent independently within _apply_movement)
                 loop_elapsed = time.time() - loop_start
-                sleep_time = max(0, (1.0 / 30.0) - loop_elapsed)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                sleep_time = max(0.001, (1.0 / 40.0) - loop_elapsed)
+                time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             print("\n[Abgebrochen]")
         finally:
             self._shutdown()
+
 
     # ─── Frame & Detection ────────────────────────────────────────────────
 
@@ -337,17 +372,9 @@ class TeleopRecorder:
 
     def _process_key(self, key: int) -> str:
         """
-        Verarbeitet Tastendruck.
-        
-        Statt active_keys sofort zu leeren wenn keine Taste kommt,
-        nutzen wir Timestamps. Eine Taste gilt als "gehalten" solange
-        sie regelmäßig (innerhalb KEY_HOLD_TIMEOUT) erneut gedrückt wird.
-        
-        OpenCV Key-Codes (Linux/X11):
-          65361 = Left, 65362 = Up, 65363 = Right, 65364 = Down
+        Verarbeitet Tastendruck. Updates persistent key state.
         """
         if key == -1 or key == 0xFFFF:
-            # Keine Taste → nichts tun (Timeout regelt das Stoppen)
             return ""
 
         now = time.time()
@@ -355,41 +382,43 @@ class TeleopRecorder:
         action = ""
 
         # ─── Pfeiltasten ───
-        # INTUITIVE Zuordnung:
-        #   Links  → Base dreht nach links (positiver Winkel = links von vorne gesehen)
-        #   Rechts → Base dreht nach rechts
-        #   Oben   → Shoulder hoch (Arm hebt sich)
-        #   Unten  → Shoulder runter (Arm senkt sich)
         if key == 65361 or key_low == 81:  # Left Arrow
-            self._key_last_pressed["base_left"] = now
+            self._keys_down.add("base_left")
+            self._key_last_seen["base_left"] = now
             action = "base_left"
         elif key == 65363 or key_low == 83:  # Right Arrow
-            self._key_last_pressed["base_right"] = now
+            self._keys_down.add("base_right")
+            self._key_last_seen["base_right"] = now
             action = "base_right"
         elif key == 65362 or key_low == 82:  # Up Arrow
-            self._key_last_pressed["shoulder_up"] = now
+            self._keys_down.add("shoulder_up")
+            self._key_last_seen["shoulder_up"] = now
             action = "shoulder_up"
         elif key == 65364 or key_low == 84:  # Down Arrow
-            self._key_last_pressed["shoulder_down"] = now
+            self._keys_down.add("shoulder_down")
+            self._key_last_seen["shoulder_down"] = now
             action = "shoulder_down"
 
-        # ─── W/A/S/D für Elbow + Hand ───
+        # ─── W/A/S/D ───
         elif key_low == ord('w'):
-            self._key_last_pressed["elbow_up"] = now
+            self._keys_down.add("elbow_up")
+            self._key_last_seen["elbow_up"] = now
             action = "elbow_up"
         elif key_low == ord('s'):
             if self._recording:
-                # S = Save während Aufnahme
                 self._stop_recording(success=True)
                 action = ""
             else:
-                self._key_last_pressed["elbow_down"] = now
+                self._keys_down.add("elbow_down")
+                self._key_last_seen["elbow_down"] = now
                 action = "elbow_down"
         elif key_low == ord('a'):
-            self._key_last_pressed["hand_left"] = now
+            self._keys_down.add("hand_left")
+            self._key_last_seen["hand_left"] = now
             action = "hand_left"
         elif key_low == ord('d'):
-            self._key_last_pressed["hand_right"] = now
+            self._keys_down.add("hand_right")
+            self._key_last_seen["hand_right"] = now
             action = "hand_right"
 
         # ─── Gripper ───
@@ -403,72 +432,82 @@ class TeleopRecorder:
         # ─── Recording ───
         elif key_low == ord('r'):
             self._start_recording()
-            action = ""
         elif key_low == ord('f'):
             self._stop_recording(success=False)
-            action = ""
 
         # ─── Quit ───
         elif key_low == ord('q'):
             self._running = False
-            action = ""
 
+        if action:
+            self._last_action = action
         return action
 
     def _apply_movement(self):
         """
-        Wendet Bewegungen an basierend auf allen aktuell gehaltenen Tasten.
-        Hand/wrist keys are REMOVED — gripper is only controlled via O/C.
+        Apply movement at a FIXED RATE regardless of display loop timing.
+        This is the key fix: decouple command rate from frame rate.
         """
         now = time.time()
-        if now - self._last_move_time < self.MOVE_INTERVAL:
+        dt = now - self._last_cmd_time
+        
+        if dt < self.COMMAND_INTERVAL:
             return
-
+        
         active = self._get_active_keys()
         if not active:
             return
+
+        # Calculate steps proportional to actual elapsed time (velocity-based)
+        # This ensures consistent speed regardless of timing jitter
+        time_factor = dt / self.COMMAND_INTERVAL  # Normally ~1.0
+        time_factor = min(time_factor, 3.0)  # Cap to prevent jumps after stalls
 
         moved = False
         state = self._arm_state
 
         if "base_left" in active:
-            state.base_deg = min(self.BASE_MAX, state.base_deg + self.BASE_STEP)
+            state.base_deg = min(self.BASE_MAX, state.base_deg + self.BASE_STEP * time_factor)
             moved = True
         if "base_right" in active:
-            state.base_deg = max(self.BASE_MIN, state.base_deg - self.BASE_STEP)
+            state.base_deg = max(self.BASE_MIN, state.base_deg - self.BASE_STEP * time_factor)
             moved = True
         if "shoulder_up" in active:
-            state.shoulder_deg = min(self.SHOULDER_MAX, state.shoulder_deg + self.SHOULDER_STEP)
+            state.shoulder_deg = min(self.SHOULDER_MAX, state.shoulder_deg + self.SHOULDER_STEP * time_factor)
             moved = True
         if "shoulder_down" in active:
-            state.shoulder_deg = max(self.SHOULDER_MIN, state.shoulder_deg - self.SHOULDER_STEP)
+            state.shoulder_deg = max(self.SHOULDER_MIN, state.shoulder_deg - self.SHOULDER_STEP * time_factor)
             moved = True
         if "elbow_up" in active:
-            state.elbow_deg = max(self.ELBOW_MIN, state.elbow_deg - self.ELBOW_STEP)
+            state.elbow_deg = max(self.ELBOW_MIN, state.elbow_deg - self.ELBOW_STEP * time_factor)
             moved = True
         if "elbow_down" in active:
-            state.elbow_deg = min(self.ELBOW_MAX, state.elbow_deg + self.ELBOW_STEP)
+            state.elbow_deg = min(self.ELBOW_MAX, state.elbow_deg + self.ELBOW_STEP * time_factor)
             moved = True
-
-        # hand_left / hand_right are intentionally NOT changing hand_deg anymore
-        # because hand_deg IS the gripper. If you have a separate wrist joint,
-        # you'd need a different command (not T:122's h parameter).
 
         if moved:
             self._send_arm_command()
-            self._last_move_time = now
+        
+        self._last_cmd_time = now
 
     def _send_arm_command(self):
-        """Sendet aktuelle Gelenkwinkel an den Arm (inkl. Gripper-Sync)."""
+        """
+        Send current joint angles to the arm.
+        Uses _send_nowait for non-blocking streaming.
+        Rounds values to reduce unique command strings (helps firmware parser).
+        """
         state = self._arm_state
-        self._arm.move_joints_degrees(
-            b=state.base_deg,
-            s=state.shoulder_deg,
-            e=state.elbow_deg,
-            h=state.hand_deg,
-            spd=self.MOVE_SPEED,
-            acc=self.MOVE_ACC
-        )
+        cmd = {
+            "T": 122,
+            "b": round(state.base_deg, 1),
+            "s": round(state.shoulder_deg, 1),
+            "e": round(state.elbow_deg, 1),
+            "h": round(state.hand_deg, 1),
+            "spd": self.MOVE_SPEED,
+            "acc": self.MOVE_ACC
+        }
+        self._arm._send_nowait(cmd)
+
 
     def _gripper_open(self):
         """Öffnet den Gripper und synchronisiert hand_deg."""

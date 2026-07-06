@@ -829,3 +829,26 @@ class RoArmM2S:
         time.sleep(1.0)
 
         print("\n  ✓ Demo fertig!")
+
+    def _send_nowait(self, command: dict):
+        """
+        Send command without waiting for response. For continuous streaming.
+        Uses non-blocking lock to avoid stalling the control loop.
+        Periodically drains input buffer to prevent overflow.
+        """
+        if not self.is_connected:
+            return
+        # Non-blocking: if something else holds the lock, skip this cycle
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            msg = json.dumps(command, separators=(',', ':')) + '\n'
+            self.ser.write(msg.encode('utf-8'))
+            self.ser.flush()
+            # Drain buffer every time, but don't use reset (can corrupt mid-message)
+            while self.ser.in_waiting:
+                self.ser.readline()
+        finally:
+            self._lock.release()
+
