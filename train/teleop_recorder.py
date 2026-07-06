@@ -142,6 +142,10 @@ class TeleopRecorder:
         # ─── Speed control ───
         self._speed_level = self.DEFAULT_SPEED_LEVEL
 
+        # ─── LED control ───
+        self._led_brightness = 255  # Current LED brightness (0-255)
+        self.LED_STEPS = [0, 51, 102, 153, 204, 255]  # 6 steps from off to full
+
         # ─── NEW: Persistent key state (press/release tracking) ───
         self._keys_down: set = set()           # Currently held keys
         self._key_last_seen: Dict[str, float] = {}  # Timestamp of last keypress event
@@ -154,6 +158,16 @@ class TeleopRecorder:
 
         # Window
         self._window_name = "RoArm Teleop"
+
+    def _set_led_brightness(self, level_index: int):
+        """Set LED brightness by step index (0-5)."""
+        level_index = max(0, min(len(self.LED_STEPS) - 1, level_index))
+        self._led_brightness = self.LED_STEPS[level_index]
+        self._arm.set_led(self._led_brightness)
+        if self._led_brightness == 0:
+            print(f"  💡 LED: OFF")
+        else:
+            print(f"  💡 LED: {self._led_brightness}/255 (Step {level_index}/{len(self.LED_STEPS)-1})")
 
     def _count_existing_episodes(self) -> int:
         """Zählt bereits vorhandene Episoden im Output-Verzeichnis."""
@@ -254,6 +268,7 @@ class TeleopRecorder:
         )
 
         self._arm.set_led(255)
+        self._led_brightness = 255
 
         print("  ✓ Bereit")
 
@@ -275,6 +290,13 @@ class TeleopRecorder:
         print("    +/=       Geschwindigkeit erhöhen")
         print("    -         Geschwindigkeit verringern")
         print("    1-5       Geschwindigkeit direkt setzen (1=sehr langsam, 5=sehr schnell)")
+        print("  LED-STEUERUNG (Shift + Zahl):")
+        print("    !  (Shift+1)  LED AUS (0)")
+        print('    "  (Shift+2)  LED  51/255 (20%)')
+        print("    §  (Shift+3)  LED 102/255 (40%)")
+        print("    $  (Shift+4)  LED 153/255 (60%)")
+        print("    %  (Shift+5)  LED 204/255 (80%)")
+        print("    &  (Shift+6)  LED 255/255 (100%)")
         print("    Q         Beenden")
         print("=" * 60)
         print(f"\n  Episoden bisher: {self._episode_count}")
@@ -471,6 +493,27 @@ class TeleopRecorder:
         elif key_low == ord('c'):
             self._gripper_close()
             action = "gripper_close"
+
+        # ─── LED Control (Shift+1 through Shift+6) ───
+        # German keyboard: Shift+1=!, Shift+2=", Shift+3=§, Shift+4=$, Shift+5=%, Shift+6=&
+        elif key_low == ord('!') or key == ord('!'):       # Shift+1 → LED OFF
+            self._set_led_brightness(0)
+            action = "led_0"
+        elif key_low == ord('"') or key == ord('"'):       # Shift+2 → LED 51
+            self._set_led_brightness(1)
+            action = "led_51"
+        elif key_low == 167 or key == 167:                 # Shift+3 → § (0xA7) → LED 102
+            self._set_led_brightness(2)
+            action = "led_102"
+        elif key_low == ord('$') or key == ord('$'):       # Shift+4 → LED 153
+            self._set_led_brightness(3)
+            action = "led_153"
+        elif key_low == ord('%') or key == ord('%'):       # Shift+5 → LED 204
+            self._set_led_brightness(4)
+            action = "led_204"
+        elif key_low == ord('&') or key == ord('&'):       # Shift+6 → LED 255
+            self._set_led_brightness(5)
+            action = "led_255"
 
         # ─── Speed Control ───
         elif key_low == ord('+') or key_low == ord('='):
@@ -728,13 +771,15 @@ class TeleopRecorder:
         # ─── Status-Leiste oben ───
         state = self._arm_state
         spd_label = self._current_speed["label"]
+        led_pct = int(self._led_brightness / 255 * 100)
         status_line = (f"B:{state.base_deg:.0f} S:{state.shoulder_deg:.0f} "
                        f"E:{state.elbow_deg:.0f} H:{state.hand_deg:.0f} "
                        f"G:{'O' if state.gripper_open else 'C'} "
+                       f"LED:{self._led_brightness}({led_pct}%) "
                        f"FPS:{fps:.0f} | SPD:{spd_label}")
 
         cv2.putText(frame, status_line, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
 
         # Aktive Tasten anzeigen (visuelles Feedback)
         active = self._get_active_keys()
@@ -765,6 +810,8 @@ class TeleopRecorder:
         help_y = h_f - 40
         cv2.putText(frame, "Arrows=Base/Shoulder  W/S=Elbow  A/D=Hand  O/C=Grip  +/-=Speed  1-5=Level",
                     (10, help_y), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
+        cv2.putText(frame, "LED: Shift+1=OFF  Shift+2..6=Brightness Steps",
+                    (10, help_y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 180, 180), 1)
 
     # ─── Shutdown ─────────────────────────────────────────────────────────
 
