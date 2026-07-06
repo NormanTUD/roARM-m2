@@ -15,6 +15,7 @@ import time
 import math
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass, field
+from position_tracker import PositionTracker
 
 try:
     import cv2
@@ -144,6 +145,8 @@ class EyeInHandController:
             _error(f"YOLO Fehler: {e}")
             self._camera.release()
             self._camera = None
+
+        self._init_tracker()
 
     @property
     def active(self) -> bool:
@@ -469,9 +472,7 @@ class EyeInHandController:
         while current <= end_deg:
             # Drehen – NORMALE Position (s=0, e=90, h=180 = geradeaus schauen)
             # Nicht e=45 (das neigt den Arm nach oben/unten)
-            self.arm.move_joints_degrees(
-                b=current, s=0, e=90, h=180, spd=25, acc=10
-            )
+            self._move_joints(b=current, s=0, e=90, h=180, spd=25, acc=10)
 
             # WICHTIG: Warte bis Arm WIRKLICH still steht
             # move_joints_degrees hat intern 2s wait, aber der Arm braucht
@@ -501,12 +502,48 @@ class EyeInHandController:
         _error(f"'{target_class}' nicht gefunden ({start_deg:.0f}° bis {end_deg:.0f}°)")
         return None
 
+    # ─── Position Tracker Integration ─────────────────────────────────────
+    # Diese Methoden NACH __init__ einfügen (oder __init__ erweitern)
+
+    def _init_tracker(self):
+        """Initialisiert den Position-Tracker. Aufrufen am Ende von __init__."""
+        self._tracker = PositionTracker()
+        # Sync mit initialer Scan-Position (b=0, s=0, e=90, h=180)
+        self._tracker.update_from_joints_degrees(b=0, s=0, e=90, h=180)
+
+    def _move_joints(self, b=0, s=0, e=90, h=180, spd=20, acc=10):
+        """Bewegt Joints UND trackt Position."""
+        self.arm.move_joints_degrees(b=b, s=s, e=e, h=h, spd=spd, acc=acc)
+        self._tracker.update_from_joints_degrees(b, s, e, h)
+
+    def _move_cartesian(self, x: float, y: float, z: float, t: float = 3.14, spd: float = 0.25):
+        """Bewegt kartesisch UND trackt Position."""
+        self.arm.move_cartesian(x, y, z, t=t, spd=spd)
+        self._tracker.update_from_cartesian(x, y, z)
+
+    def _get_position(self) -> Tuple[float, float, float]:
+        """
+        Holt aktuelle Position.
+        Versucht zuerst echten Status vom Arm.
+        Fallback: Position aus dem Tracker (Forward Kinematics).
+        """
+        status = self._get_status(retries=2, delay=0.3)
+        if status:
+            # Sync Tracker mit echtem Feedback
+            self._tracker.update_from_cartesian(status.x, status.y, status.z)
+            return (status.x, status.y, status.z)
+        else:
+            _info(f"[Tracker-Fallback] Position: "
+                  f"X={self._tracker.pos.x:.1f} "
+                  f"Y={self._tracker.pos.y:.1f} "
+                  f"Z={self._tracker.pos.z:.1f}")
+            return self._tracker.cartesian
+
     # ─── Zentrieren ───────────────────────────────────────────────────────
 
     def _center_over(self, target_class: str, max_iter: int = 8) -> bool:
-        """Iterativ über dem Objekt zentrieren."""
+        """Iterativ über dem Objekt zentrieren – mit Tracker-Fallback."""
         for i in range(max_iter):
-            # Mehrere Frames für Stabilität
             detection = None
             for _ in range(5):
                 detections, key = self._update(
@@ -525,34 +562,26 @@ class EyeInHandController:
                 time.sleep(0.3)
                 continue
 
-            # Distanz prüfen
             pixel_dist = self._pixel_dist_from_center(detection['center_px'])
             if pixel_dist < self.cal.center_threshold_px:
                 _success(f"Zentriert! (Dist={pixel_dist:.0f}px)")
                 return True
 
-            # Offset berechnen
             dx_mm, dy_mm = self._pixel_offset_mm(detection['center_px'])
             _info(f"Iter {i+1}: Offset=({dx_mm:.1f}, {dy_mm:.1f})mm, Dist={pixel_dist:.0f}px")
 
-            # Status holen
-            status = self._get_status()
-            if not status:
-                _error("Status nicht lesbar!")
-                return False
+            # *** HIER DER FIX: Fallback auf Tracker ***
+            cur_x, cur_y, cur_z = self._get_position()
 
-            # Neue Position (gedämpft)
-            new_x = status.x + dx_mm * self.cal.damping
-            new_y = status.y + dy_mm * self.cal.damping
+            new_x = cur_x + dx_mm * self.cal.damping
+            new_y = cur_y + dy_mm * self.cal.damping
 
-            # Sicherheitscheck
             dist = (new_x**2 + new_y**2) ** 0.5
             if dist > self.arm.MAX_REACH:
                 _error(f"Außerhalb Reichweite ({dist:.0f}mm)!")
                 return False
 
-            # Bewegen + Preview während Bewegung
-            self.arm.move_cartesian(new_x, new_y, status.z, t=3.14, spd=0.15)
+            self._move_cartesian(new_x, new_y, cur_z, t=3.14, spd=0.15)
             self._update_for(1.2, [target_class], "Bewege...")
 
         return False
@@ -577,7 +606,7 @@ class EyeInHandController:
 
         # 1. Normale Scan-Position (geradeaus schauen, NICHT nach oben)
         _step(1, "Scan-Position...")
-        self.arm.move_joints_degrees(b=0, s=0, e=90, h=180, spd=20, acc=10)
+        self._move_joints(b=0, s=0, e=90, h=180, spd=20, acc=10)
         self._update_for(2.5, [target_class], "Fahre Scan-Position...")
 
         # 2. Suche
@@ -625,16 +654,13 @@ class EyeInHandController:
             self._cleanup()
             return False
 
-        # 4. Status für Greifposition
-        status = self._get_status()
-        if not status:
-            _error("Status nicht lesbar!")
+        # 4. Position für Greifposition (mit Tracker-Fallback)
+        grab_x, grab_y, grab_z = self._get_position()
+        if grab_x == 0 and grab_y == 0 and grab_z == 0:
+            _error("Position unbekannt (Tracker nicht initialisiert)!")
             self.arm.park()
             self._cleanup()
             return False
-
-        grab_x = status.x
-        grab_y = status.y
 
         _step(4, f"Greife bei X={grab_x:.0f} Y={grab_y:.0f} Z={self.cal.grab_height:.0f}...")
 
@@ -644,10 +670,10 @@ class EyeInHandController:
 
         # Absenken
         _info("Absenken...")
-        self.arm.move_cartesian(grab_x, grab_y, self.cal.grab_height + 50, t=3.14, spd=0.15)
+        self._move_cartesian(grab_x, grab_y, self.cal.grab_height + 50, t=3.14, spd=0.15)
         self._update_for(1.5, [target_class], "Absenken...")
 
-        self.arm.move_cartesian(grab_x, grab_y, self.cal.grab_height, t=3.14, spd=0.1)
+        self._move_cartesian(grab_x, grab_y, self.cal.grab_height, t=3.14, spd=0.1)
         self._update_for(1.5, [target_class], "Greifen...")
 
         # Greifen
@@ -657,25 +683,25 @@ class EyeInHandController:
 
         # 5. Anheben
         _step(5, "Anheben...")
-        self.arm.move_cartesian(grab_x, grab_y, self.cal.grab_height + 120, t=3.14, spd=0.2)
+        self._move_cartesian(grab_x, grab_y, self.cal.grab_height + 120, t=3.14, spd=0.2)
         self._update_for(2.0, status_text="Anheben...")
 
         # 6. Ablegen
         place_y = grab_y + place_offset_y
         _step(6, f"Ablegen bei Y={place_y:.0f}...")
-        self.arm.move_cartesian(grab_x, place_y, self.cal.grab_height + 40, t=3.14, spd=0.2)
+        self._move_cartesian(grab_x, place_y, self.cal.grab_height + 40, t=3.14, spd=0.2)
         self._update_for(2.0, status_text="Ablegen...")
 
         self.arm.gripper_open()
         self._update_for(0.5, status_text="Abgelegt!")
 
         # Zurückziehen
-        self.arm.move_cartesian(grab_x, place_y, self.cal.grab_height + 120, t=3.14, spd=0.25)
+        self._move_cartesian(grab_x, place_y, self.cal.grab_height + 120, t=3.14, spd=0.25)
         self._update_for(1.5, status_text="Zurückziehen...")
 
         # 7. Parken
         _step(7, "Parken...")
-        self.arm.park()
+        self._move_joints(b=0, s=0, e=90, h=180, spd=15, acc=10)
         self._update_for(2.0, status_text="Fertig!")
 
         self._cleanup()
