@@ -1393,7 +1393,7 @@ Examples:
     )
 
     # Training hyperparameters
-    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs (default: 200)")
+    parser.add_argument("--epochs", type=int, default=500, help="Number of training epochs (default: 500)")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size (default: 16)")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay (default: 1e-5)")
