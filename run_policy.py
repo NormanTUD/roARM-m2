@@ -555,7 +555,7 @@ class PolicyRunner:
                     step += 1
 
                     # Check if episode should end (e.g., after N steps)
-                    max_steps = self._chunk_size * 20  # ~200 steps max
+                    max_steps = self._chunk_size * 50  # ~500 steps max
                     if step >= max_steps:
                         self._executing = False
                         print(f"  ■ Episode {episode} complete ({step} steps)")
