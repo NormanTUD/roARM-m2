@@ -72,57 +72,130 @@ warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["XMODIFIERS"] = ""
 
 class LiveTrainingPlot:
-    """Live matplotlib plot showing training loss curve."""
+    """Live matplotlib plot showing training loss curves: per-batch and per-epoch."""
 
-    def __init__(self, total_epochs: int):
+    def __init__(self, total_epochs: int, total_batches_per_epoch: int):
         if not HAS_MATPLOTLIB:
             self._enabled = False
             return
         self._enabled = True
         self._total_epochs = total_epochs
-        self._losses = []
-        self._best_losses = []
+        self._total_batches_per_epoch = total_batches_per_epoch
+        self._total_batches = total_epochs * total_batches_per_epoch
 
-        plt.ion()  # Interactive mode
-        self._fig, self._ax = plt.subplots(1, 1, figsize=(10, 5))
+        # Batch-level data
+        self._batch_losses = []
+        self._batch_indices = []
+        self._batch_counter = 0
+
+        # Epoch-level data
+        self._epoch_losses = []
+        self._epoch_best_losses = []
+
+        plt.ion()
+        self._fig, (self._ax_batch, self._ax_epoch) = plt.subplots(
+            1, 2, figsize=(14, 5)
+        )
         self._fig.suptitle('🤖 LeRobot ACT Training', fontsize=14, fontweight='bold')
-        self._ax.set_xlabel('Epoch')
-        self._ax.set_ylabel('Loss')
-        self._ax.set_xlim(0, total_epochs)
-        self._ax.grid(True, alpha=0.3)
-        self._line_loss, = self._ax.plot([], [], 'b-', linewidth=1.5, label='Train Loss')
-        self._line_best, = self._ax.plot([], [], 'r--', linewidth=1, alpha=0.7, label='Best Loss')
-        self._ax.legend(loc='upper right')
-        self._fig.tight_layout()
+
+        # --- Left subplot: Batch loss ---
+        self._ax_batch.set_xlabel('Batch (global)')
+        self._ax_batch.set_ylabel('Loss')
+        self._ax_batch.set_title('Batch Loss (live)')
+        self._ax_batch.set_xlim(0, self._total_batches)
+        self._ax_batch.grid(True, alpha=0.3)
+        self._line_batch, = self._ax_batch.plot(
+            [], [], 'b-', linewidth=0.8, alpha=0.7, label='Batch Loss'
+        )
+        self._line_batch_smooth, = self._ax_batch.plot(
+            [], [], 'r-', linewidth=1.5, label='Smoothed (EMA)'
+        )
+        self._ax_batch.legend(loc='upper right')
+
+        # --- Right subplot: Epoch loss ---
+        self._ax_epoch.set_xlabel('Epoch')
+        self._ax_epoch.set_ylabel('Loss')
+        self._ax_epoch.set_title('Epoch Loss')
+        self._ax_epoch.set_xlim(0, total_epochs)
+        self._ax_epoch.grid(True, alpha=0.3)
+        self._line_epoch, = self._ax_epoch.plot(
+            [], [], 'b-o', linewidth=1.5, markersize=3, label='Avg Epoch Loss'
+        )
+        self._line_best, = self._ax_epoch.plot(
+            [], [], 'r--', linewidth=1, alpha=0.7, label='Best Loss'
+        )
+        self._ax_epoch.legend(loc='upper right')
+
+        self._fig.tight_layout(rect=[0, 0, 1, 0.93])
         plt.show(block=False)
         plt.pause(0.01)
 
-    def update(self, epoch: int, loss: float, best_loss: float):
-        """Update the plot with new data."""
+        # EMA smoothing state
+        self._ema_loss = None
+        self._ema_alpha = 0.1
+        self._smoothed_losses = []
+
+    def update_batch(self, batch_loss: float):
+        """Call after each batch to update the left (batch) subplot."""
         if not self._enabled:
             return
-        self._losses.append(loss)
-        self._best_losses.append(best_loss)
+        self._batch_counter += 1
+        self._batch_losses.append(batch_loss)
+        self._batch_indices.append(self._batch_counter)
 
-        epochs = list(range(1, len(self._losses) + 1))
-        self._line_loss.set_data(epochs, self._losses)
-        self._line_best.set_data(epochs, self._best_losses)
+        # EMA smoothing
+        if self._ema_loss is None:
+            self._ema_loss = batch_loss
+        else:
+            self._ema_loss = self._ema_alpha * batch_loss + (1 - self._ema_alpha) * self._ema_loss
+        self._smoothed_losses.append(self._ema_loss)
+
+        # Update batch plot lines
+        self._line_batch.set_data(self._batch_indices, self._batch_losses)
+        self._line_batch_smooth.set_data(self._batch_indices, self._smoothed_losses)
 
         # Auto-scale Y axis
-        if self._losses:
-            valid_losses = [l for l in self._losses if np.isfinite(l)]
-            if valid_losses:
-                ymin = min(valid_losses) * 0.9
-                ymax = max(valid_losses) * 1.1
-                self._ax.set_ylim(max(0, ymin), ymax)
+        if self._batch_losses:
+            recent = self._batch_losses[-max(200, self._total_batches_per_epoch):]
+            valid = [l for l in recent if np.isfinite(l)]
+            if valid:
+                ymin = min(valid) * 0.9
+                ymax = max(valid) * 1.1
+                self._ax_batch.set_ylim(max(0, ymin), ymax)
 
-        self._ax.set_xlim(0, max(self._total_epochs, epoch + 1))
+        self._ax_batch.set_xlim(0, max(self._total_batches, self._batch_counter + 1))
+        self._ax_batch.set_title(
+            f'Batch Loss (batch {self._batch_counter}/{self._total_batches}) | '
+            f'Current: {batch_loss:.6f}'
+        )
 
-        # Add text annotation for current values
-        self._ax.set_title(
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+        plt.pause(0.001)
+
+    def update_epoch(self, epoch: int, avg_loss: float, best_loss: float):
+        """Call after each epoch to update the right (epoch) subplot."""
+        if not self._enabled:
+            return
+        self._epoch_losses.append(avg_loss)
+        self._epoch_best_losses.append(best_loss)
+
+        epochs = list(range(1, len(self._epoch_losses) + 1))
+        self._line_epoch.set_data(epochs, self._epoch_losses)
+        self._line_best.set_data(epochs, self._epoch_best_losses)
+
+        # Auto-scale Y axis
+        if self._epoch_losses:
+            valid = [l for l in self._epoch_losses if np.isfinite(l)]
+            if valid:
+                ymin = min(valid) * 0.9
+                ymax = max(valid) * 1.1
+                self._ax_epoch.set_ylim(max(0, ymin), ymax)
+
+        self._ax_epoch.set_xlim(0, max(self._total_epochs, epoch + 1))
+        self._ax_epoch.set_title(
             f'Epoch {epoch}/{self._total_epochs} | '
-            f'Loss: {loss:.6f} | Best: {best_loss:.6f}',
-            fontsize=11
+            f'Loss: {avg_loss:.6f} | Best: {best_loss:.6f}'
         )
 
         self._fig.canvas.draw_idle()
@@ -1408,8 +1481,8 @@ class Trainer:
 
     def _train_with_rich_progress(self, best_loss, loss_history, start_time):
         """Training loop with rich progress bars, time estimates, and live matplotlib plot."""
-        # Initialize live plot (shows matplotlib window)
-        plot = LiveTrainingPlot(self.args.epochs) if HAS_MATPLOTLIB else None
+        # Initialize live plot (ONE window, 2 subplots)
+        plot = LiveTrainingPlot(self.args.epochs, len(self.dataloader)) if HAS_MATPLOTLIB else None
 
         progress = Progress(
             SpinnerColumn(),
@@ -1423,22 +1496,17 @@ class Trainer:
         )
 
         with progress:
-            # Epoch-level progress
             epoch_task = progress.add_task(
                 "Epochs", total=self.args.epochs
             )
-
-            # Batch-level progress (will be reset each epoch)
             batch_task = progress.add_task(
                 "   Batches", total=len(self.dataloader), visible=True
             )
 
             for epoch in range(self.args.epochs):
-                # Reset batch progress for this epoch
                 progress.reset(batch_task, total=len(self.dataloader))
                 progress.update(batch_task, description=f"   Epoch {epoch+1} batches")
 
-                # --- Train one epoch with per-batch updates ---
                 self.model.train()
                 epoch_loss = 0.0
                 num_batches = 0
@@ -1465,36 +1533,29 @@ class Trainer:
                     self.optimizer.step()
                     self.scheduler.step()
 
-                    epoch_loss += loss.item()
+                    batch_loss = loss.item()
+                    epoch_loss += batch_loss
                     num_batches += 1
 
-                    # Update batch progress bar
                     progress.update(batch_task, advance=1)
 
-                    # Update plot every batch (shows live loss curve)
+                    # Update BATCH subplot
                     if plot:
-                        batch_avg = epoch_loss / num_batches
-                        plot.update(
-                            epoch + (num_batches / len(self.dataloader)),
-                            batch_avg,
-                            best_loss,
-                        )
+                        plot.update_batch(batch_loss)
 
                 avg_loss = epoch_loss / max(num_batches, 1)
                 loss_history.append(avg_loss)
 
-                # Track best
                 improved = ""
                 if avg_loss < best_loss:
                     best_loss = avg_loss
                     improved = " ⭐"
                     self._save_checkpoint("best")
 
-                # Update plot at epoch boundary (clean epoch-level point)
+                # Update EPOCH subplot
                 if plot:
-                    plot.update(epoch + 1, avg_loss, best_loss)
+                    plot.update_epoch(epoch + 1, avg_loss, best_loss)
 
-                # Update epoch progress
                 lr = self.optimizer.param_groups[0]["lr"]
                 progress.update(
                     epoch_task,
@@ -1507,11 +1568,9 @@ class Trainer:
                     ),
                 )
 
-                # Periodic checkpoint
                 if (epoch + 1) % self.args.save_every == 0:
                     self._save_checkpoint(f"epoch_{epoch+1}")
 
-        # Save and close plot
         if plot:
             output_dir = Path(self.args.output)
             output_dir.mkdir(parents=True, exist_ok=True)
