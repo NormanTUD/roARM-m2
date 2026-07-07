@@ -1,3 +1,35 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "opencv-python",
+#     "numpy",
+#     "pyserial",
+#     "ultralytics",
+#     "pyarrow",
+#     "rich",
+# ]
+# ///
+
+import os
+import sys
+
+def _ensure_uv():
+    if os.environ.get("_UV_SAFE_ENV") == "1":
+        return
+    os.environ["_UV_SAFE_ENV"] = "1"
+    from datetime import datetime, timedelta, timezone
+    if not os.environ.get("UV_EXCLUDE_NEWER"):
+        past = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        os.environ["UV_EXCLUDE_NEWER"] = past
+    try:
+        os.execvpe("uv", ["uv", "run", "--quiet", sys.argv[0]] + sys.argv[1:], os.environ)
+    except FileNotFoundError:
+        print("uv is not installed. Install: curl -LsSf https://astral.sh/uv/install.sh | sh")
+        sys.exit(1)
+
+_ensure_uv()
+
 """
 Teleop Recorder — Fernsteuerung des RoArm-M2-S mit Tastatur + Aufzeichnung.
 

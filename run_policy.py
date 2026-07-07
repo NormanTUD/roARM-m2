@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""
-LeRobot Policy Inference for RoArm-M2-S
-=========================================
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "torch",
+#     "numpy",
+#     "opencv-python",
+#     "pyserial",
+# ]
+# ///
 
-Loads a trained ACT/Diffusion/TDMPC model and executes the learned policy
-on the real robot arm, similar to how teleop_recorder.py controls the arm.
+import os
+import sys
 
-Usage:
-    python3 run_policy.py trained_models/model_final.pt
-    python3 run_policy.py trained_models/model_final.pt --episodes 5
-    python3 run_policy.py trained_models/model_final.pt --port /dev/ttyUSB0
-    python3 run_policy.py trained_models/checkpoint_best.pt --speed-scale 0.5
+def _ensure_uv():
+    if os.environ.get("_UV_SAFE_ENV") == "1":
+        return
+    os.environ["_UV_SAFE_ENV"] = "1"
+    from datetime import datetime, timedelta, timezone
+    if not os.environ.get("UV_EXCLUDE_NEWER"):
+        past = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        os.environ["UV_EXCLUDE_NEWER"] = past
+    try:
+        os.execvpe("uv", ["uv", "run", "--quiet", sys.argv[0]] + sys.argv[1:], os.environ)
+    except FileNotFoundError:
+        print("uv is not installed. Install: curl -LsSf https://astral.sh/uv/install.sh | sh")
+        sys.exit(1)
 
-Controls during execution:
-    SPACE   → Start/Stop policy execution
-    R       → Reset arm to start position
-    Q       → Quit
-    +/-     → Adjust execution speed
-"""
+_ensure_uv()
 
 import argparse
 import json
