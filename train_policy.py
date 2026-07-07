@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
 #     "torch",
+#     "torchvision",
 #     "numpy",
 #     "pyarrow",
 #     "opencv-python",
@@ -171,6 +171,13 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
+
+try:
+    import torchvision.models as tv_models
+    from torchvision.models import ResNet18_Weights
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
 
 # ─── Optional: Parquet ────────────────────────────────────────────────────────
 try:
@@ -478,20 +485,22 @@ class ACTPolicy(nn.Module):
     """
     Action Chunking with Transformers (ACT).
     
-    Lightweight version optimized for small hardware.
+    Supports optional pretrained ResNet18 vision backbone.
     Predicts a chunk of future actions given current state (+ optional image).
     """
 
     def __init__(self, state_dim: int = 5, action_dim: int = 5,
                  chunk_size: int = 10, hidden_dim: int = 256,
                  num_heads: int = 4, num_layers: int = 4,
-                 use_images: bool = False, image_size: Tuple[int, int] = (128, 128)):
+                 use_images: bool = False, image_size: Tuple[int, int] = (128, 128),
+                 use_pretrained_vision: bool = False):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.chunk_size = chunk_size
         self.hidden_dim = hidden_dim
         self.use_images = use_images
+        self.use_pretrained_vision = use_pretrained_vision
 
         # State encoder
         self.state_encoder = nn.Sequential(
@@ -501,23 +510,28 @@ class ACTPolicy(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
-        # Image encoder (lightweight CNN)
+        # Image encoder (pretrained or lightweight CNN)
         if use_images:
-            self.image_encoder = nn.Sequential(
-                nn.Conv2d(3, 32, 5, stride=2, padding=2),
-                nn.ReLU(),
-                nn.Conv2d(32, 64, 3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool2d((4, 4)),
-                nn.Flatten(),
-                nn.Linear(128 * 4 * 4, hidden_dim),
-                nn.ReLU(),
-                nn.LayerNorm(hidden_dim),
-            )
+            if use_pretrained_vision and HAS_TORCHVISION:
+                self.image_encoder = build_pretrained_image_encoder(
+                    hidden_dim=hidden_dim, freeze_backbone=True
+                )
+            else:
+                self.image_encoder = nn.Sequential(
+                    nn.Conv2d(3, 32, 5, stride=2, padding=2),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, 3, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(64, 128, 3, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((4, 4)),
+                    nn.Flatten(),
+                    nn.Linear(128 * 4 * 4, hidden_dim),
+                    nn.ReLU(),
+                    nn.LayerNorm(hidden_dim),
+                )
             self.fusion = nn.Linear(hidden_dim * 2, hidden_dim)
-        
+
         # Positional encoding for action chunk
         self.pos_embed = nn.Parameter(torch.randn(1, chunk_size, hidden_dim) * 0.02)
 
@@ -569,7 +583,6 @@ class ACTPolicy(nn.Module):
         # Predict actions
         actions = self.action_head(decoded)  # [B, chunk_size, action_dim]
         return actions
-
 
 class DiffusionPolicy(nn.Module):
     """
@@ -836,6 +849,217 @@ class TDMPCPolicy(nn.Module):
 # TRAINER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def print_model_summary(model: nn.Module, model_name: str = "Model"):
+    """
+    Print a detailed model summary similar to Keras model.summary().
+    Shows layer names, output shapes, parameter counts, and which layers are frozen.
+    """
+    if HAS_RICH:
+        table = Table(
+            title=f"📐 {model_name} Architecture Summary",
+            box=box.ROUNDED,
+            border_style="bright_magenta",
+            show_lines=True,
+        )
+        table.add_column("Layer (type)", style="cyan", min_width=40)
+        table.add_column("Output Shape", style="green", min_width=20)
+        table.add_column("Param #", style="yellow", justify="right", min_width=12)
+        table.add_column("Trainable", style="white", justify="center", min_width=10)
+    else:
+        print(f"\n{'='*90}")
+        print(f"  📐 {model_name} Architecture Summary")
+        print(f"{'='*90}")
+        print(f"  {'Layer (type)':<45} {'Output Shape':<20} {'Param #':>12} {'Trainable':>10}")
+        print(f"  {'-'*87}")
+
+    total_params = 0
+    trainable_params = 0
+    frozen_params = 0
+
+    for name, module in model.named_modules():
+        # Skip the top-level module itself and container modules
+        if name == "":
+            continue
+        # Only show leaf modules (no children that are also nn.Module with params)
+        direct_params = sum(p.numel() for p in module.parameters(recurse=False))
+        if direct_params == 0:
+            # Check if it's a meaningful container (Sequential, etc.) - skip those
+            if isinstance(module, (nn.Sequential, nn.ModuleList, nn.TransformerDecoder,
+                                   nn.TransformerDecoderLayer)):
+                continue
+
+        # Count parameters for this layer
+        layer_params = sum(p.numel() for p in module.parameters(recurse=False))
+        layer_trainable = sum(p.numel() for p in module.parameters(recurse=False) if p.requires_grad)
+        layer_frozen = layer_params - layer_trainable
+
+        total_params += layer_params
+        trainable_params += layer_trainable
+        frozen_params += layer_frozen
+
+        # Get output shape estimate (based on layer type)
+        shape_str = _estimate_output_shape(module)
+        trainable_str = "✓" if layer_trainable > 0 else "✗ (frozen)"
+
+        layer_type = module.__class__.__name__
+        display_name = f"{name} ({layer_type})"
+
+        if layer_params > 0:
+            if HAS_RICH:
+                style = "dim" if layer_trainable == 0 else ""
+                table.add_row(
+                    display_name,
+                    shape_str,
+                    f"{layer_params:,}",
+                    trainable_str,
+                    style=style,
+                )
+            else:
+                print(f"  {display_name:<45} {shape_str:<20} {layer_params:>12,} {trainable_str:>10}")
+
+    # Summary footer
+    size_mb = total_params * 4 / (1024 * 1024)
+    trainable_mb = trainable_params * 4 / (1024 * 1024)
+
+    if HAS_RICH:
+        console.print(table)
+        console.print(f"\n  [bold]Total params:[/bold]      {total_params:,} ({size_mb:.2f} MB)")
+        console.print(f"  [bold green]Trainable params:[/bold green]  {trainable_params:,} ({trainable_mb:.2f} MB)")
+        if frozen_params > 0:
+            console.print(f"  [bold red]Frozen params:[/bold red]     {frozen_params:,} ({frozen_params*4/1024/1024:.2f} MB)")
+        console.print()
+    else:
+        print(f"  {'='*87}")
+        print(f"  Total params:      {total_params:,} ({size_mb:.2f} MB)")
+        print(f"  Trainable params:  {trainable_params:,} ({trainable_mb:.2f} MB)")
+        if frozen_params > 0:
+            print(f"  Frozen params:     {frozen_params:,} ({frozen_params*4/1024/1024:.2f} MB)")
+        print(f"  {'='*87}\n")
+
+
+def _estimate_output_shape(module: nn.Module) -> str:
+    """Estimate output shape string for a layer."""
+    if isinstance(module, nn.Linear):
+        return f"[*, {module.out_features}]"
+    elif isinstance(module, nn.Conv2d):
+        return f"[*, {module.out_channels}, H, W]"
+    elif isinstance(module, nn.LayerNorm):
+        shape = list(module.normalized_shape)
+        return f"[*, {', '.join(str(s) for s in shape)}]"
+    elif isinstance(module, nn.AdaptiveAvgPool2d):
+        return f"[*, C, {module.output_size[0]}, {module.output_size[1]}]"
+    elif isinstance(module, nn.Flatten):
+        return "[*, flattened]"
+    elif isinstance(module, (nn.ReLU, nn.SiLU, nn.GELU)):
+        return "[same]"
+    elif isinstance(module, nn.Parameter):
+        return str(list(module.shape))
+    elif isinstance(module, nn.MultiheadAttention):
+        return f"[*, *, {module.embed_dim}]"
+    return "—"
+
+def download_pretrained_backbone(hidden_dim: int = 256, device: str = "cpu") -> Optional[Dict]:
+    """
+    Download a pretrained ResNet18 backbone from torchvision and adapt it
+    for use as a vision encoder or as initialization for MLP layers.
+
+    Returns a dict with pretrained weight tensors that can be partially loaded.
+    """
+    if not HAS_TORCHVISION:
+        print("  ⚠ torchvision not available, skipping pretrained backbone download")
+        return None
+
+    print("  📥 Downloading pretrained ResNet18 backbone from PyTorch Hub...")
+    try:
+        resnet = tv_models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        print("  ✓ ResNet18 (ImageNet pretrained) downloaded successfully")
+        return {"resnet18": resnet}
+    except Exception as e:
+        print(f"  ⚠ Failed to download pretrained model: {e}")
+        return None
+
+
+def build_pretrained_image_encoder(hidden_dim: int = 256, freeze_backbone: bool = True) -> nn.Module:
+    """
+    Build an image encoder using pretrained ResNet18 features.
+
+    The backbone is frozen by default (only the projection head trains),
+    which dramatically speeds up training and reduces overfitting.
+    """
+    if not HAS_TORCHVISION:
+        return None
+
+    print("  🔧 Building pretrained image encoder (ResNet18 → projection)...")
+
+    # Load pretrained ResNet18
+    resnet = tv_models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+
+    # Remove the final FC layer and avgpool - we'll use our own
+    # ResNet18 feature extractor outputs 512-dim features
+    backbone = nn.Sequential(
+        resnet.conv1,      # [B, 64, H/2, W/2]
+        resnet.bn1,
+        resnet.relu,
+        resnet.maxpool,    # [B, 64, H/4, W/4]
+        resnet.layer1,     # [B, 64, H/4, W/4]
+        resnet.layer2,     # [B, 128, H/8, W/8]
+        resnet.layer3,     # [B, 256, H/16, W/16]
+        resnet.layer4,     # [B, 512, H/32, W/32]
+        nn.AdaptiveAvgPool2d((1, 1)),  # [B, 512, 1, 1]
+        nn.Flatten(),      # [B, 512]
+    )
+
+    # Freeze backbone if requested
+    if freeze_backbone:
+        for param in backbone.parameters():
+            param.requires_grad = False
+        print("  ❄️  Backbone frozen (only projection head will train)")
+
+    # Projection head (trainable)
+    projection = nn.Sequential(
+        nn.Linear(512, hidden_dim),
+        nn.ReLU(),
+        nn.LayerNorm(hidden_dim),
+    )
+
+    encoder = nn.Sequential(backbone, projection)
+
+    total = sum(p.numel() for p in encoder.parameters())
+    trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+    print(f"  ✓ Image encoder: {total:,} params ({trainable:,} trainable, {total-trainable:,} frozen)")
+
+    return encoder
+
+
+def initialize_transformer_from_pretrained(model: nn.Module, hidden_dim: int = 256):
+    """
+    Initialize transformer layers with better weight initialization
+    inspired by pretrained language model patterns.
+
+    This uses scaled initialization (GPT-2 style) which helps training
+    converge faster even without loading actual pretrained weights.
+    """
+    print("  🎯 Applying pretrained-style initialization to transformer layers...")
+
+    initialized_count = 0
+    for name, param in model.named_parameters():
+        if "transformer" in name or "decoder" in name:
+            if "weight" in name:
+                if param.dim() >= 2:
+                    # Xavier uniform for attention/FFN weights (like BERT/GPT init)
+                    nn.init.xavier_uniform_(param, gain=0.5)
+                    initialized_count += 1
+            elif "bias" in name:
+                nn.init.zeros_(param)
+                initialized_count += 1
+        elif "action_head" in name and "weight" in name:
+            # Smaller init for output head (reduces initial loss)
+            if param.dim() >= 2:
+                nn.init.xavier_uniform_(param, gain=0.1)
+                initialized_count += 1
+
+    print(f"  ✓ Initialized {initialized_count} parameter tensors with improved init")
+
 class Trainer:
     """
     Training loop with rich progress bars and model saving.
@@ -897,6 +1121,10 @@ class Trainer:
             table.add_row("Use Images", str(self.args.use_images))
             table.add_row("Output", str(self.args.output))
 
+            table.add_row("Pretrained", str(self.args.pretrained or "None (from scratch)"))
+            table.add_row("Pretrained Vision", "✓ ResNet18" if self.args.use_pretrained_vision else "✗")
+            table.add_row("Smart Init", "✓" if self.args.smart_init else "✗")
+
             console.print(table)
         else:
             print(f"\n  Config:")
@@ -908,6 +1136,9 @@ class Trainer:
             print(f"  LR:         {self.args.lr:.1e}")
             print(f"  Chunk Size: {self.args.chunk_size}")
             print(f"  Output:     {self.args.output}")
+            print(f"  Pretrained: {self.args.pretrained or 'None (from scratch)'}")
+            print(f"  Pretrained Vision: {'ResNet18' if self.args.use_pretrained_vision else 'No'}")
+            print(f"  Smart Init: {'Yes' if self.args.smart_init else 'No'}")
 
     def _print_dataset_info(self):
         if HAS_RICH:
@@ -936,7 +1167,7 @@ class Trainer:
             print(f"    Chunk Size:    {self.dataset.chunk_size}")
 
     def _build_model(self) -> nn.Module:
-        """Build the selected policy model."""
+        """Build the selected policy model with optional pretrained components."""
         policy_cls = self.POLICY_REGISTRY[self.args.policy]
 
         use_images = self.args.use_images
@@ -958,11 +1189,73 @@ class Trainer:
         if self.args.policy == "act":
             kwargs["num_heads"] = self.args.num_heads
             kwargs["num_layers"] = self.args.num_layers
+            kwargs["use_pretrained_vision"] = self.args.use_pretrained_vision and use_images
         elif self.args.policy == "diffusion":
             kwargs["num_diffusion_steps"] = self.args.diffusion_steps
 
         model = policy_cls(**kwargs)
+
+        # --- Apply smart initialization ---
+        if self.args.smart_init:
+            initialize_transformer_from_pretrained(model, self.args.hidden_dim)
+
+        # --- Load pretrained checkpoint (transfer learning) ---
+        if self.args.pretrained:
+            self._load_pretrained_weights(model)
+
         return model.to(self.device)
+
+    def _load_pretrained_weights(self, model: nn.Module):
+        """Load weights from a pretrained checkpoint, matching what we can."""
+        pretrained_path = self.args.pretrained
+        if not os.path.exists(pretrained_path):
+            print(f"  ⚠ Pretrained checkpoint not found: {pretrained_path}")
+            return
+
+        print(f"  📥 Loading pretrained weights from: {pretrained_path}")
+        checkpoint = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+
+        if "model_state_dict" in checkpoint:
+            pretrained_dict = checkpoint["model_state_dict"]
+        else:
+            pretrained_dict = checkpoint
+
+        model_dict = model.state_dict()
+
+        # Match layers by name and shape
+        matched = {}
+        mismatched_shape = []
+        missing = []
+
+        for key, value in pretrained_dict.items():
+            if key in model_dict:
+                if value.shape == model_dict[key].shape:
+                    matched[key] = value
+                else:
+                    mismatched_shape.append(
+                        f"    {key}: pretrained {list(value.shape)} vs model {list(model_dict[key].shape)}"
+                    )
+            else:
+                missing.append(key)
+
+        # Apply matched weights
+        model_dict.update(matched)
+        model.load_state_dict(model_dict)
+
+        # Report
+        total_layers = len(model_dict)
+        loaded_layers = len(matched)
+        print(f"  ✓ Loaded {loaded_layers}/{total_layers} layers from pretrained checkpoint")
+
+        if mismatched_shape:
+            print(f"  ⚠ {len(mismatched_shape)} layers skipped (shape mismatch):")
+            for msg in mismatched_shape[:5]:  # Show first 5
+                print(msg)
+            if len(mismatched_shape) > 5:
+                print(f"    ... and {len(mismatched_shape) - 5} more")
+
+        if missing:
+            print(f"  ℹ️  {len(missing)} pretrained layers not in current model (ignored)")
 
     def _count_parameters(self, model: nn.Module) -> int:
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1023,7 +1316,7 @@ class Trainer:
         self._print_config()
         self._print_dataset_info()
 
-        # ─── Build Model ──────────────────────────────────────────────────
+        # ─── Build Model ─────────────────────────────────────────────────
         if HAS_RICH:
             console.print("\n[bold]🧠 Building Model...[/bold]")
         else:
@@ -1031,6 +1324,9 @@ class Trainer:
 
         self.model = self._build_model()
         self._print_model_info()
+
+        # Print detailed model summary
+        print_model_summary(self.model, model_name=f"{self.args.policy.upper()} Policy")
 
         # ─── DataLoader ───────────────────────────────────────────────────
         self.dataloader = DataLoader(
@@ -1253,6 +1549,8 @@ class Trainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "use_pretrained_vision": getattr(self.args, "use_pretrained_vision", False),
+            "smart_init": getattr(self.args, "smart_init", True),
             "config": {
                 "policy": self.args.policy,
                 "state_dim": 6,
@@ -1447,11 +1745,43 @@ Examples:
     # Hardware
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/mps/cpu, auto-detected)")
 
+    # Pretrained / Transfer Learning
+    parser.add_argument(
+        "--pretrained", type=str, default=None,
+        help="Path to pretrained checkpoint for fine-tuning (resumes weights)"
+    )
+    parser.add_argument(
+        "--use-pretrained-vision", action="store_true",
+        help="Use pretrained ResNet18 as image encoder backbone (auto-downloads)"
+    )
+    parser.add_argument(
+        "--freeze-vision", action="store_true", default=True,
+        help="Freeze pretrained vision backbone (default: True)"
+    )
+    parser.add_argument(
+        "--no-freeze-vision", action="store_true",
+        help="Unfreeze pretrained vision backbone (fine-tune everything)"
+    )
+    parser.add_argument(
+        "--smart-init", action="store_true", default=True,
+        help="Use improved weight initialization for transformer (default: True)"
+    )
+    parser.add_argument(
+        "--no-smart-init", action="store_true",
+        help="Disable improved weight initialization"
+    )
+
     args = parser.parse_args()
 
     # Handle image flags
     if args.no_images:
         args.use_images = False
+
+    # Handle freeze/init flags
+    if args.no_freeze_vision:
+        args.freeze_vision = False
+    if args.no_smart_init:
+        args.smart_init = False
 
     return args
 
