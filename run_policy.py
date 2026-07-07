@@ -672,3 +672,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nYou exited by pressing CTRL-c")
         sys.exit(0)
+    except OSError:
+        print("\nOSError occured. This can happen when you plug the cables from the robot before shutting down the script")
+        sys.exit(1)
