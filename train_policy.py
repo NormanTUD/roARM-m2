@@ -52,8 +52,6 @@ Designed for small hardware (4-8GB VRAM / CPU-only fallback).
 import argparse
 import json
 import math
-import os
-import sys
 import time
 import warnings
 from pathlib import Path
@@ -70,6 +68,8 @@ except ImportError:
 import numpy as np
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+os.environ["XMODIFIERS"] = ""
 
 class LiveTrainingPlot:
     """Live matplotlib plot showing training loss curve."""
