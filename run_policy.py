@@ -667,4 +667,8 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nYou exited by pressing CTRL-c")
+        sys.exit(0)
