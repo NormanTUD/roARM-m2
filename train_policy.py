@@ -1407,7 +1407,10 @@ class Trainer:
         return avg_loss, best_batch
 
     def _train_with_rich_progress(self, best_loss, loss_history, start_time):
-        """Training loop with rich progress bars and time estimates."""
+        """Training loop with rich progress bars, time estimates, and live matplotlib plot."""
+        # Initialize live plot (shows matplotlib window)
+        plot = LiveTrainingPlot(self.args.epochs) if HAS_MATPLOTLIB else None
+
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -1468,6 +1471,15 @@ class Trainer:
                     # Update batch progress bar
                     progress.update(batch_task, advance=1)
 
+                    # Update plot every batch (shows live loss curve)
+                    if plot:
+                        batch_avg = epoch_loss / num_batches
+                        plot.update(
+                            epoch + (num_batches / len(self.dataloader)),
+                            batch_avg,
+                            best_loss,
+                        )
+
                 avg_loss = epoch_loss / max(num_batches, 1)
                 loss_history.append(avg_loss)
 
@@ -1475,8 +1487,12 @@ class Trainer:
                 improved = ""
                 if avg_loss < best_loss:
                     best_loss = avg_loss
-                    improved = " â­�"
+                    improved = " ⭐"
                     self._save_checkpoint("best")
+
+                # Update plot at epoch boundary (clean epoch-level point)
+                if plot:
+                    plot.update(epoch + 1, avg_loss, best_loss)
 
                 # Update epoch progress
                 lr = self.optimizer.param_groups[0]["lr"]
@@ -1484,16 +1500,23 @@ class Trainer:
                     epoch_task,
                     advance=1,
                     description=(
-                        f"Epoch {epoch+1}/{self.args.epochs}"
-                        f"Loss: {avg_loss:.6f}{improved}"
-                        f"Best: {best_loss:.6f}"
+                        f"Epoch {epoch+1}/{self.args.epochs} │ "
+                        f"Loss: {avg_loss:.6f}{improved} │ "
+                        f"Best: {best_loss:.6f} │ "
                         f"LR: {lr:.2e}"
-                    )
+                    ),
                 )
 
                 # Periodic checkpoint
                 if (epoch + 1) % self.args.save_every == 0:
                     self._save_checkpoint(f"epoch_{epoch+1}")
+
+        # Save and close plot
+        if plot:
+            output_dir = Path(self.args.output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            plot.save(str(output_dir / "training_loss.png"))
+            plot.close()
 
         self._save_final(best_loss, loss_history, start_time)
 
