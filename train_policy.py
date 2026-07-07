@@ -96,19 +96,18 @@ class LiveTrainingPlot:
         self._fig, (self._ax_batch, self._ax_epoch) = plt.subplots(
             1, 2, figsize=(14, 5)
         )
-        self._fig.suptitle('🤖 LeRobot ACT Training', fontsize=14, fontweight='bold')
+        self._fig.suptitle('\U0001f916 LeRobot ACT Training', fontsize=14, fontweight='bold')
 
         # --- Left subplot: Batch loss ---
         self._ax_batch.set_xlabel('Batch (global)')
         self._ax_batch.set_ylabel('Loss')
         self._ax_batch.set_title('Batch Loss (live)')
-        self._ax_batch.set_xlim(0, self._total_batches)
         self._ax_batch.grid(True, alpha=0.3)
         self._line_batch, = self._ax_batch.plot(
             [], [], 'b-', linewidth=0.8, alpha=0.7, label='Batch Loss'
         )
         self._line_batch_smooth, = self._ax_batch.plot(
-            [], [], 'r-', linewidth=1.5, label='Smoothed (EMA)'
+            [], [], 'r-', linewidth=2.0, label='Smoothed (EMA)'
         )
         self._ax_batch.legend(loc='upper right')
 
@@ -116,10 +115,9 @@ class LiveTrainingPlot:
         self._ax_epoch.set_xlabel('Epoch')
         self._ax_epoch.set_ylabel('Loss')
         self._ax_epoch.set_title('Epoch Loss')
-        self._ax_epoch.set_xlim(0, total_epochs)
         self._ax_epoch.grid(True, alpha=0.3)
         self._line_epoch, = self._ax_epoch.plot(
-            [], [], 'b-o', linewidth=1.5, markersize=3, label='Avg Epoch Loss'
+            [], [], 'b-o', linewidth=1.5, markersize=4, label='Avg Epoch Loss'
         )
         self._line_best, = self._ax_epoch.plot(
             [], [], 'r--', linewidth=1, alpha=0.7, label='Best Loss'
@@ -128,12 +126,16 @@ class LiveTrainingPlot:
 
         self._fig.tight_layout(rect=[0, 0, 1, 0.93])
         plt.show(block=False)
-        plt.pause(0.01)
+        plt.pause(0.05)
 
         # EMA smoothing state
         self._ema_loss = None
         self._ema_alpha = 0.1
         self._smoothed_losses = []
+
+        # Throttle batch plot updates (don't redraw every single batch)
+        self._last_batch_draw_time = 0
+        self._batch_draw_interval = 0.1  # seconds between redraws
 
     def update_batch(self, batch_loss: float):
         """Call after each batch to update the left (batch) subplot."""
@@ -150,23 +152,33 @@ class LiveTrainingPlot:
             self._ema_loss = self._ema_alpha * batch_loss + (1 - self._ema_alpha) * self._ema_loss
         self._smoothed_losses.append(self._ema_loss)
 
+        # Throttle redraws - only update visually every N ms
+        now = time.time()
+        if now - self._last_batch_draw_time < self._batch_draw_interval:
+            return  # Skip visual update, data is still recorded
+        self._last_batch_draw_time = now
+
         # Update batch plot lines
         self._line_batch.set_data(self._batch_indices, self._batch_losses)
         self._line_batch_smooth.set_data(self._batch_indices, self._smoothed_losses)
 
-        # Auto-scale Y axis
-        if self._batch_losses:
-            recent = self._batch_losses[-max(200, self._total_batches_per_epoch):]
-            valid = [l for l in recent if np.isfinite(l)]
-            if valid:
-                ymin = min(valid) * 0.9
-                ymax = max(valid) * 1.1
-                self._ax_batch.set_ylim(max(0, ymin), ymax)
+        # KEY FIX: X-axis tracks current progress, not total
+        # Show from 0 to current_batch with a small margin, so the line is always visible
+        x_max = self._batch_counter * 1.05  # 5% padding ahead
+        self._ax_batch.set_xlim(0, max(10, x_max))
 
-        self._ax_batch.set_xlim(0, max(self._total_batches, self._batch_counter + 1))
+        # Auto-scale Y axis using ALL data so far
+        valid = [l for l in self._batch_losses if np.isfinite(l)]
+        if valid:
+            ymin = min(valid)
+            ymax = max(valid)
+            # Add padding so line isn't squished to edges
+            margin = max((ymax - ymin) * 0.1, ymax * 0.05, 1e-6)
+            self._ax_batch.set_ylim(max(0, ymin - margin), ymax + margin)
+
         self._ax_batch.set_title(
-            f'Batch Loss (batch {self._batch_counter}/{self._total_batches}) | '
-            f'Current: {batch_loss:.6f}'
+            f'Batch Loss ({self._batch_counter}/{self._total_batches}) | '
+            f'Current: {batch_loss:.6f} | EMA: {self._ema_loss:.6f}'
         )
 
         self._fig.canvas.draw_idle()
@@ -184,19 +196,27 @@ class LiveTrainingPlot:
         self._line_epoch.set_data(epochs, self._epoch_losses)
         self._line_best.set_data(epochs, self._epoch_best_losses)
 
-        # Auto-scale Y axis
-        if self._epoch_losses:
-            valid = [l for l in self._epoch_losses if np.isfinite(l)]
-            if valid:
-                ymin = min(valid) * 0.9
-                ymax = max(valid) * 1.1
-                self._ax_epoch.set_ylim(max(0, ymin), ymax)
+        # KEY FIX: X-axis tracks current progress with padding
+        x_max = epoch * 1.05
+        self._ax_epoch.set_xlim(0, max(2, x_max))
 
-        self._ax_epoch.set_xlim(0, max(self._total_epochs, epoch + 1))
+        # Auto-scale Y axis using ALL epoch data
+        all_vals = self._epoch_losses + self._epoch_best_losses
+        valid = [l for l in all_vals if np.isfinite(l)]
+        if valid:
+            ymin = min(valid)
+            ymax = max(valid)
+            margin = max((ymax - ymin) * 0.1, ymax * 0.05, 1e-6)
+            self._ax_epoch.set_ylim(max(0, ymin - margin), ymax + margin)
+
         self._ax_epoch.set_title(
             f'Epoch {epoch}/{self._total_epochs} | '
             f'Loss: {avg_loss:.6f} | Best: {best_loss:.6f}'
         )
+
+        # Also update batch x-axis to show full expected range now that we have scale info
+        # After first epoch, we know the pace - expand batch x-axis to full range
+        self._ax_batch.set_xlim(0, max(self._batch_counter * 1.05, self._total_batches))
 
         self._fig.canvas.draw_idle()
         self._fig.canvas.flush_events()
@@ -206,8 +226,14 @@ class LiveTrainingPlot:
         """Save the final plot."""
         if not self._enabled:
             return
+        # Final x-axis: set to actual data range for clean saved image
+        if self._batch_indices:
+            self._ax_batch.set_xlim(0, self._batch_indices[-1] * 1.02)
+        if self._epoch_losses:
+            self._ax_epoch.set_xlim(0, len(self._epoch_losses) + 1)
+        self._fig.tight_layout(rect=[0, 0, 1, 0.93])
         self._fig.savefig(path, dpi=150, bbox_inches='tight')
-        print(f"  📊 Plot saved to: {path}")
+        print(f"  \U0001f4ca Plot saved to: {path}")
 
     def close(self):
         if self._enabled:
