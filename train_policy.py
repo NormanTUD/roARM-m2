@@ -1738,7 +1738,7 @@ class Trainer:
 def load_model(checkpoint_path: str, device: str = None) -> nn.Module:
     """
     Load a trained model for inference.
-    Fixed version that correctly restores use_pretrained_vision flag.
+    Detects architecture from state_dict keys to handle all edge cases.
     """
     if device is None:
         if torch.cuda.is_available():
@@ -1750,10 +1750,35 @@ def load_model(checkpoint_path: str, device: str = None) -> nn.Module:
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint["config"]
+    state_dict = checkpoint["model_state_dict"]
+
+    # === DETECT ARCHITECTURE FROM STATE_DICT KEYS ===
+    has_image_encoder_weights = any(k.startswith("image_encoder.") for k in state_dict.keys())
+
+    # ResNet keys have nested structure like "image_encoder.0.4.0.conv1.weight"
+    # Simple CNN keys are flat like "image_encoder.0.weight"
+    has_pretrained_vision_weights = any(
+        "image_encoder.0.4." in k or "image_encoder.0.5." in k
+        for k in state_dict.keys()
+    )
+
+    # Override config based on what's actually in the state_dict
+    use_images = config.get("use_images", False) or has_image_encoder_weights
+    use_pretrained_vision = checkpoint.get("use_pretrained_vision", False) or has_pretrained_vision_weights
+
+    print(f"  [load_model] use_images={use_images}, use_pretrained_vision={use_pretrained_vision}")
+    print(f"  [load_model] HAS_TORCHVISION={HAS_TORCHVISION}")
+    print(f"  [load_model] has_image_encoder_weights={has_image_encoder_weights}")
+    print(f"  [load_model] has_pretrained_vision_weights={has_pretrained_vision_weights}")
+
+    if use_pretrained_vision and not HAS_TORCHVISION:
+        raise RuntimeError(
+            "Checkpoint was trained with pretrained ResNet18 vision encoder, "
+            "but torchvision is not installed! Install it:\n"
+            "  pip install torchvision"
+        )
 
     # Rebuild model
-    from train_policy import ACTPolicy, DiffusionPolicy, TDMPCPolicy
-
     policy_map = {
         "act": ACTPolicy,
         "diffusion": DiffusionPolicy,
@@ -1766,19 +1791,39 @@ def load_model(checkpoint_path: str, device: str = None) -> nn.Module:
         "action_dim": config["action_dim"],
         "chunk_size": config["chunk_size"],
         "hidden_dim": config["hidden_dim"],
-        "use_images": config.get("use_images", False),
+        "use_images": use_images,
     }
 
     if config["policy"] == "act":
         kwargs["num_heads"] = config.get("num_heads", 4)
         kwargs["num_layers"] = config.get("num_layers", 4)
-        # FIX: Restore pretrained vision flag from checkpoint
-        kwargs["use_pretrained_vision"] = checkpoint.get("use_pretrained_vision", False)
+        kwargs["use_pretrained_vision"] = use_pretrained_vision
     elif config["policy"] == "diffusion":
         kwargs["num_diffusion_steps"] = config.get("diffusion_steps", 20)
 
+    print(f"  [load_model] Building {config['policy']} with kwargs: { {k:v for k,v in kwargs.items() if k != 'hidden_dim'} }")
+
     model = policy_cls(**kwargs)
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Verify keys match before loading
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys = set(state_dict.keys())
+    missing = model_keys - ckpt_keys
+    unexpected = ckpt_keys - model_keys
+
+    if missing or unexpected:
+        print(f"  [load_model] WARNING: Key mismatch!")
+        if missing:
+            print(f"    Missing ({len(missing)}): {list(missing)[:5]}...")
+        if unexpected:
+            print(f"    Unexpected ({len(unexpected)}): {list(unexpected)[:5]}...")
+        raise RuntimeError(
+            f"Architecture mismatch: model expects {len(model_keys)} keys, "
+            f"checkpoint has {len(ckpt_keys)} keys. "
+            f"Missing: {len(missing)}, Unexpected: {len(unexpected)}"
+        )
+
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
@@ -1787,7 +1832,6 @@ def load_model(checkpoint_path: str, device: str = None) -> nn.Module:
     model._config = config
 
     return model
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CLI

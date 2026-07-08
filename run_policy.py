@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "torch",
+#     "torchvision",
 #     "numpy",
 #     "opencv-python",
 #     "pyserial",
@@ -14,6 +15,8 @@ import sys
 
 def _ensure_uv():
     if os.environ.get("_UV_SAFE_ENV") == "1":
+        return
+    if __name__ != "__main__":
         return
     os.environ["_UV_SAFE_ENV"] = "1"
     from datetime import datetime, timedelta, timezone
