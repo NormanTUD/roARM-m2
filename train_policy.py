@@ -1738,12 +1738,7 @@ class Trainer:
 def load_model(checkpoint_path: str, device: str = None) -> nn.Module:
     """
     Load a trained model for inference.
-    
-    Usage:
-        model = load_model("output/model_final.pt")
-        # Get action chunk from current state
-        state = torch.tensor([[0.0, 0.0, 90.0, 180.0, 0.0]])
-        actions = model.sample(state)  # or model(state) for ACT
+    Fixed version that correctly restores use_pretrained_vision flag.
     """
     if device is None:
         if torch.cuda.is_available():
@@ -1753,10 +1748,12 @@ def load_model(checkpoint_path: str, device: str = None) -> nn.Module:
         else:
             device = "cpu"
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint["config"]
 
     # Rebuild model
+    from train_policy import ACTPolicy, DiffusionPolicy, TDMPCPolicy
+
     policy_map = {
         "act": ACTPolicy,
         "diffusion": DiffusionPolicy,
@@ -1775,6 +1772,8 @@ def load_model(checkpoint_path: str, device: str = None) -> nn.Module:
     if config["policy"] == "act":
         kwargs["num_heads"] = config.get("num_heads", 4)
         kwargs["num_layers"] = config.get("num_layers", 4)
+        # FIX: Restore pretrained vision flag from checkpoint
+        kwargs["use_pretrained_vision"] = checkpoint.get("use_pretrained_vision", False)
     elif config["policy"] == "diffusion":
         kwargs["num_diffusion_steps"] = config.get("diffusion_steps", 20)
 
