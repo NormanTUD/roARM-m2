@@ -124,7 +124,7 @@ class PolicyRunner:
         # 1. Load model
         print(f"\n  [1/3] Loading model: {self._model_path}")
         try:
-            self._model = load_model_fixed(self._model_path, device=None)
+            self._model = load_model(self._model_path, device=None)
             self._stats = getattr(self._model, '_stats', {})
             self._config = getattr(self._model, '_config', {})
             self._chunk_size = self._config.get('chunk_size', 10)
