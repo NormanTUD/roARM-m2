@@ -8,7 +8,14 @@ from .hardware import RoArmHardware, ArmState
 from .vision import VisionSystem, Detection, BoundingBox
 from .dsl import DSLParser, DSLInterpreter, DSLRecorder
 from .recorder import SessionRecorder
-from .policy import BBoxPolicy, BBoxObservation, train_policy
+
+# Policy braucht torch — optional
+try:
+    from .policy import BBoxPolicy, BBoxObservation, train_policy
+except ImportError:
+    BBoxPolicy = None
+    BBoxObservation = None
+    train_policy = None
 
 __all__ = [
     "RoArmHardware", "ArmState",
