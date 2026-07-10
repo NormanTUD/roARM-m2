@@ -52,8 +52,8 @@ START_POSITION_DEG = {
 }
 
 # Aufnahme-Einstellungen
-RECORD_HZ = 20            # Aufnahme-Rate: 20 Hz (alle 50ms ein Sample)
-MOVE_THRESHOLD_DEG = 0.3  # Mindestbewegung in Grad um aufzuzeichnen
+RECORD_HZ = 50            # statt 20
+MOVE_THRESHOLD_DEG = 0.1  # statt 0.3
 POSITION_TOLERANCE = 1.0  # Toleranz für Startposition in Grad
 
 # Serielle Verbindung

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""play.py - RoArm-M2-S Playback (Clean Edition)
-Spielt .roarm Dateien ab. Keine Interpolation, keine Backlash-Kompensation.
-Fährt exakt die aufgezeichneten Punkte ab mit korrektem Timing.
-Zeigt jeden Schritt live in der Konsole.
+"""play_teached.py - RoArm-M2-S Playback mit Lookahead-Geschwindigkeitssteuerung
+Erkennt Richtungsänderungen voraus und bremst rechtzeitig ab.
+Schnell bei gleichbleibender Richtung, langsam bei Richtungswechsel/Stopp.
 """
 # /// script
 # requires-python = ">=3.10"
@@ -53,6 +52,15 @@ START_POSITION_DEG = {
 POSITION_TOLERANCE = 1.0
 BAUDRATE = 115200
 
+# Lookahead-Parameter
+LOOKAHEAD_POINTS = 5        # Wie viele Punkte vorausschauen
+SPD_MAX = 80                # Maximale Geschwindigkeit (Firmware-Einheit)
+SPD_MIN = 8                 # Minimale Geschwindigkeit
+ACC_MAX = 40                # Maximale Beschleunigung
+ACC_MIN = 5                 # Minimale Beschleunigung
+DIRECTION_THRESHOLD = 0.3   # Ab wann gilt eine Achse als "bewegt" (Grad)
+BRAKE_COSINE_THRESHOLD = 0.5  # Unter diesem Cosinus-Wert wird gebremst (0=90°, -1=180°)
+
 
 # ============================================================
 # HILFSFUNKTIONEN
@@ -82,7 +90,174 @@ def clear_line():
 
 
 # ============================================================
-# ARM-VERBINDUNG (identisch zum teach.py)
+# LOOKAHEAD GESCHWINDIGKEITSBERECHNUNG
+# ============================================================
+
+def compute_direction_vector(wp_from: dict, wp_to: dict) -> list:
+    """Berechnet den Richtungsvektor zwischen zwei Wegpunkten (4D: b,s,e,h)."""
+    return [
+        wp_to["b"] - wp_from["b"],
+        wp_to["s"] - wp_from["s"],
+        wp_to["e"] - wp_from["e"],
+        wp_to["h"] - wp_from["h"],
+    ]
+
+
+def vector_magnitude(v: list) -> float:
+    """Betrag eines Vektors."""
+    return math.sqrt(sum(x * x for x in v))
+
+
+def cosine_similarity(v1: list, v2: list) -> float:
+    """
+    Kosinus-Ähnlichkeit zwischen zwei Vektoren.
+    +1 = gleiche Richtung, 0 = rechtwinklig, -1 = entgegengesetzt.
+    """
+    mag1 = vector_magnitude(v1)
+    mag2 = vector_magnitude(v2)
+    if mag1 < 0.01 or mag2 < 0.01:
+        return 0.0  # Einer der Vektoren ist ~null → "Stopp" → bremsen
+    dot = sum(a * b for a, b in zip(v1, v2))
+    return dot / (mag1 * mag2)
+
+
+def compute_speed_for_waypoint(waypoints: list, index: int, speed_factor: float) -> tuple:
+    """
+    Berechnet optimale (spd, acc) für einen Wegpunkt basierend auf:
+    1. Wie schnell muss ich sein um rechtzeitig beim nächsten Punkt zu sein?
+    2. Kommt bald eine Richtungsänderung? → Abbremsen
+    3. Geht es in die gleiche Richtung weiter? → Schnell bleiben
+    
+    Returns: (spd, acc)
+    """
+    total = len(waypoints)
+    wp = waypoints[index]
+    
+    # --- Basis-Geschwindigkeit aus Zeitintervall ---
+    if index < total - 1:
+        dt = (waypoints[index + 1]["t"] - wp["t"]) / speed_factor
+        vec_current = compute_direction_vector(wp, waypoints[index + 1])
+        distance = vector_magnitude(vec_current)
+    else:
+        # Letzter Punkt → langsam ankommen
+        return (SPD_MIN, ACC_MIN)
+    
+    if dt <= 0 or distance < 0.05:
+        # Kein Zeitunterschied oder keine Bewegung
+        return (SPD_MIN, ACC_MIN)
+    
+    # Benötigte Grad/Sekunde
+    deg_per_sec = distance / dt
+    
+    # Basis-Speed aus benötigter Geschwindigkeit (Firmware-Kalibrierung)
+    # Der Faktor hängt von der Firmware ab - hier ~1:1 Mapping
+    base_spd = max(SPD_MIN, min(SPD_MAX, int(deg_per_sec * 0.8)))
+    
+    # --- Lookahead: Richtungsänderung erkennen ---
+    min_cosine = 1.0  # Schlechteste Richtungsübereinstimmung im Lookahead
+    approaching_stop = False
+    
+    for look in range(1, LOOKAHEAD_POINTS + 1):
+        future_idx = index + look
+        if future_idx >= total - 1:
+            # Ende der Aufnahme naht → abbremsen
+            remaining_points = total - 1 - index
+            if remaining_points <= 3:
+                approaching_stop = True
+            break
+        
+        # Richtungsvektor des zukünftigen Segments
+        vec_future = compute_direction_vector(
+            waypoints[future_idx], waypoints[future_idx + 1]
+        )
+        
+        # Vergleiche aktuelle Richtung mit zukünftiger
+        cos_sim = cosine_similarity(vec_current, vec_future)
+        
+        # Je weiter weg der Lookahead, desto weniger Gewicht
+        # (nahe Richtungsänderungen sind wichtiger)
+        weight = 1.0 - (look - 1) * 0.15  # 1.0, 0.85, 0.7, 0.55, 0.4
+        weighted_cos = cos_sim * weight + (1.0 - weight)  # Bias Richtung "kein Bremsen" für ferne Punkte
+        
+        min_cosine = min(min_cosine, weighted_cos)
+        
+        # Prüfe ob zukünftiges Segment ein "Stopp" ist (sehr kleine Bewegung)
+        future_mag = vector_magnitude(vec_future)
+        future_dt = (waypoints[future_idx + 1]["t"] - waypoints[future_idx]["t"]) / speed_factor
+        if future_dt > 0 and future_mag / future_dt < 2.0:  # < 2°/s = quasi Stillstand
+            if look <= 3:
+                approaching_stop = True
+    
+    # --- Speed-Modifikation basierend auf Lookahead ---
+    
+    if approaching_stop:
+        # Stopp kommt → stark abbremsen
+        # Je näher am Stopp, desto langsamer
+        remaining = total - 1 - index
+        brake_factor = max(0.2, min(1.0, remaining / 5.0))
+        final_spd = max(SPD_MIN, int(base_spd * brake_factor * 0.6))
+        final_acc = max(ACC_MIN, int(final_spd * 0.4))
+    
+    elif min_cosine < BRAKE_COSINE_THRESHOLD:
+        # Richtungsänderung kommt → proportional abbremsen
+        # min_cosine: 0.5 → leicht bremsen, 0.0 → mittel, -1.0 → stark
+        # Mapping: cosine [−1, 0.5] → brake_factor [0.25, 1.0]
+        brake_factor = max(0.25, (min_cosine + 1.0) / (BRAKE_COSINE_THRESHOLD + 1.0))
+        final_spd = max(SPD_MIN, int(base_spd * brake_factor))
+        final_acc = max(ACC_MIN, int(final_spd * 0.5))
+    
+    else:
+        # Gleiche Richtung → volle Geschwindigkeit
+        final_spd = base_spd
+        final_acc = max(ACC_MIN, min(ACC_MAX, int(final_spd * 0.6)))
+    
+    return (final_spd, final_acc)
+
+
+def precompute_speeds(waypoints: list, speed_factor: float) -> list:
+    """
+    Berechnet für ALLE Wegpunkte die optimale Geschwindigkeit vor.
+    Zweiter Pass: Rückwärts-Glättung damit Bremsungen nicht zu spät kommen.
+    
+    Returns: Liste von (spd, acc) Tupeln.
+    """
+    total = len(waypoints)
+    speeds = []
+    
+    # --- Pass 1: Vorwärts - Lookahead-basierte Geschwindigkeit ---
+    for i in range(total):
+        spd, acc = compute_speed_for_waypoint(waypoints, i, speed_factor)
+        speeds.append([spd, acc])
+    
+    # --- Pass 2: Rückwärts - Sicherstellen dass wir rechtzeitig bremsen können ---
+    # Wenn Punkt i+1 langsam ist, darf Punkt i nicht zu schnell sein
+    # (sonst kann der Arm nicht rechtzeitig abbremsen)
+    MAX_SPEED_JUMP = 15  # Maximaler Speed-Unterschied zwischen aufeinanderfolgenden Punkten
+    
+    for i in range(total - 2, -1, -1):
+        next_spd = speeds[i + 1][0]
+        current_spd = speeds[i][0]
+        
+        # Wenn der nächste Punkt viel langsamer ist, müssen wir jetzt schon bremsen
+        if current_spd > next_spd + MAX_SPEED_JUMP:
+            speeds[i][0] = next_spd + MAX_SPEED_JUMP
+            speeds[i][1] = max(ACC_MIN, int(speeds[i][0] * 0.5))
+    
+    # --- Pass 3: Vorwärts - Sanftes Beschleunigen ---
+    # Nicht von 0 auf 100 springen
+    for i in range(1, total):
+        prev_spd = speeds[i - 1][0]
+        current_spd = speeds[i][0]
+        
+        if current_spd > prev_spd + MAX_SPEED_JUMP:
+            speeds[i][0] = prev_spd + MAX_SPEED_JUMP
+            speeds[i][1] = max(ACC_MIN, int(speeds[i][0] * 0.5))
+    
+    return [(s[0], s[1]) for s in speeds]
+
+
+# ============================================================
+# ARM-VERBINDUNG
 # ============================================================
 
 class RoArmConnection:
@@ -97,7 +272,6 @@ class RoArmConnection:
         self._ser.reset_output_buffer()
 
     def send_cmd(self, cmd: dict) -> str:
-        """Sendet einen JSON-Befehl und liest die Antwort."""
         with self._lock:
             self._ser.reset_input_buffer()
             msg = json.dumps(cmd, separators=(',', ':'))
@@ -119,7 +293,6 @@ class RoArmConnection:
             return response
 
     def read_position_raw(self) -> dict:
-        """Liest die aktuelle Position EINMAL. Gibt dict mit Radians zurück."""
         resp = self.send_cmd({"T": 105})
         if not resp:
             return None
@@ -135,7 +308,6 @@ class RoArmConnection:
         return None
 
     def read_position_deg(self) -> dict:
-        """Liest Position und konvertiert zu Grad. Kein Filter, kein Averaging."""
         raw = self.read_position_raw()
         if raw is None:
             return None
@@ -148,7 +320,6 @@ class RoArmConnection:
 
     def move_to(self, b_deg: float, s_deg: float, e_deg: float, h_deg: float,
                 spd: int = 20, acc: int = 10):
-        """Bewegt den Arm zu einer Position in Grad."""
         cmd = {
             "T": 122,
             "b": round(b_deg, 2),
@@ -161,7 +332,6 @@ class RoArmConnection:
         self.send_cmd(cmd)
 
     def torque_off(self):
-        """Schaltet alle Servos frei."""
         self.send_cmd({"T": 210, "cmd": 0})
         time.sleep(0.03)
         for sid in range(1, 5):
@@ -169,7 +339,6 @@ class RoArmConnection:
             time.sleep(0.02)
 
     def torque_on(self):
-        """Schaltet alle Servos fest."""
         self.send_cmd({"T": 210, "cmd": 1})
         time.sleep(0.03)
         for sid in range(1, 5):
@@ -192,15 +361,6 @@ class RoArmConnection:
 # ============================================================
 
 def parse_roarm_file(filepath: str) -> dict:
-    """
-    Parst eine .roarm Datei. Gibt zurück:
-    {
-        "waypoints": [{"t": ..., "b": ..., "s": ..., "e": ..., "h": ...}, ...],
-        "gripper_cmds": [{"t": ..., "cmd": "OPEN"/"CLOSE"}, ...],
-        "config": {"hz": ..., "threshold": ...},
-        "start_pos": {"b": ..., "s": ..., "e": ..., "h": ...},
-    }
-    """
     waypoints = []
     gripper_cmds = []
     config = {"hz": 20, "threshold": 0.3}
@@ -212,7 +372,6 @@ def parse_roarm_file(filepath: str) -> dict:
             if not line:
                 continue
 
-            # Kommentare und Config
             if line.startswith("#CONFIG"):
                 parts = line.split(" ", 1)
                 if len(parts) == 2:
@@ -232,7 +391,6 @@ def parse_roarm_file(filepath: str) -> dict:
             if line.startswith("#"):
                 continue
 
-            # MOVE Befehle
             if line.startswith("MOVE"):
                 parts = line.split()
                 vals = {}
@@ -247,7 +405,6 @@ def parse_roarm_file(filepath: str) -> dict:
                     "h": vals.get("h", 180.0),
                 })
 
-            # GRIPPER Befehle
             elif line.startswith("GRIPPER"):
                 parts = line.split()
                 cmd = parts[1] if len(parts) > 1 else "OPEN"
@@ -274,9 +431,10 @@ def parse_roarm_file(filepath: str) -> dict:
 
 class RoArmPlayer:
     """
-    Spielt .roarm Dateien ab.
-    KEIN Kalman, KEIN Backlash, KEINE Interpolation.
-    Fährt exakt die aufgezeichneten Punkte mit korrektem Timing ab.
+    Spielt .roarm Dateien ab mit Lookahead-Geschwindigkeitssteuerung.
+    - Gleiche Richtung → schnell
+    - Richtungsänderung voraus → frühzeitig abbremsen
+    - Keine Glättung, keine Interpolation, kein Verschlucken
     """
 
     def __init__(self, filepath: str, port: str = None, speed: float = 1.0,
@@ -288,6 +446,7 @@ class RoArmPlayer:
         self._verify = verify
         self._arm: RoArmConnection = None
         self._data = None
+        self._precomputed_speeds = None
 
     def connect(self) -> bool:
         port = self._port or find_arm_port()
@@ -297,20 +456,19 @@ class RoArmPlayer:
         print(f"🔌 Verbinde mit {port}...")
         try:
             self._arm = RoArmConnection(port)
-            print(f"   ✓ Verbunden")
+            print(f"   ✅ Verbunden")
             return True
         except Exception as e:
             print(f"   ❌ Fehler: {e}")
             return False
 
     def load(self) -> bool:
-        """Lädt und validiert die .roarm Datei."""
         path = Path(self._filepath)
         if not path.exists():
             print(f"❌ Datei nicht gefunden: {path}")
             return False
 
-        print(f"📂 Lade: {path.name}")
+        print(f"📄 Lade: {path.name}")
         self._data = parse_roarm_file(str(path))
 
         wps = self._data["waypoints"]
@@ -318,15 +476,30 @@ class RoArmPlayer:
             print("   ❌ Keine Wegpunkte in der Datei!")
             return False
 
-        print(f"   ✓ {len(wps)} Wegpunkte geladen")
+        print(f"   ✅ {len(wps)} Wegpunkte geladen")
         print(f"   Dauer: {wps[-1]['t']:.2f}s (bei {self._speed}x → {wps[-1]['t']/self._speed:.2f}s)")
         print(f"   Gripper-Befehle: {len(self._data['gripper_cmds'])}")
-        print(f"   Start: b={self._data['start_pos']['b']:.2f}° "
-              f"s={self._data['start_pos']['s']:.2f}° "
-              f"e={self._data['start_pos']['e']:.2f}° "
-              f"h={self._data['start_pos']['h']:.2f}°")
 
-        # Zeige Bewegungsbereich
+        # Geschwindigkeiten vorberechnen
+        print(f"\n🧮 Berechne Lookahead-Geschwindigkeiten...")
+        self._precomputed_speeds = precompute_speeds(wps, self._speed)
+        
+        # Statistik anzeigen
+        spds = [s[0] for s in self._precomputed_speeds]
+        print(f"   Speed-Bereich: {min(spds)} - {max(spds)} (Ø {sum(spds)/len(spds):.1f})")
+        
+        # Zeige Brems-Zonen
+        brake_zones = 0
+        in_brake = False
+        for i, (spd, _) in enumerate(self._precomputed_speeds):
+            if spd < SPD_MAX * 0.4 and not in_brake:
+                brake_zones += 1
+                in_brake = True
+            elif spd >= SPD_MAX * 0.4:
+                in_brake = False
+        print(f"   Erkannte Brems-Zonen: {brake_zones}")
+
+        # Bewegungsbereich
         for j in ["b", "s", "e", "h"]:
             vals = [wp[j] for wp in wps]
             print(f"   {j}: {min(vals):.2f}° → {max(vals):.2f}° (Δ{max(vals)-min(vals):.2f}°)")
@@ -334,7 +507,6 @@ class RoArmPlayer:
         return True
 
     def go_to_start(self) -> bool:
-        """Fährt zur Startposition der Aufnahme."""
         start = self._data["start_pos"]
         print(f"\n📍 Fahre zur Startposition...")
         print(f"   Ziel: b={start['b']:.2f}° s={start['s']:.2f}° "
@@ -343,11 +515,9 @@ class RoArmPlayer:
         self._arm.torque_on()
         time.sleep(0.2)
 
-        # Erste Bewegung
         self._arm.move_to(start["b"], start["s"], start["e"], start["h"], spd=25, acc=10)
         time.sleep(2.0)
 
-        # Zweite, langsame Bewegung
         self._arm.move_to(start["b"], start["s"], start["e"], start["h"], spd=10, acc=5)
         time.sleep(1.5)
 
@@ -359,19 +529,12 @@ class RoArmPlayer:
                       f"e={pos['e']:.2f}° h={pos['h']:.2f}°")
                 print(f"   Max Fehler: {max_err:.2f}°")
                 if max_err > POSITION_TOLERANCE:
-                    print(f"   ⚠ Abweichung > {POSITION_TOLERANCE}°, nochmal...")
                     self._arm.move_to(start["b"], start["s"], start["e"], start["h"], spd=5, acc=3)
                     time.sleep(2.0)
-                    pos = self._arm.read_position_deg()
-                    if pos:
-                        max_err = max(abs(pos[j] - start[j]) for j in ["b", "s", "e", "h"])
-                        print(f"   Neuer Fehler: {max_err:.2f}°")
                 else:
-                    print(f"   ✓ OK")
-            else:
-                print(f"   ⚠ Kann Position nicht lesen")
+                    print(f"   ✅ OK")
 
-        # Zum ersten Wegpunkt fahren (falls anders als Start)
+        # Zum ersten Wegpunkt
         first_wp = self._data["waypoints"][0]
         self._arm.move_to(first_wp["b"], first_wp["s"], first_wp["e"], first_wp["h"], spd=15, acc=8)
         time.sleep(1.0)
@@ -379,27 +542,25 @@ class RoArmPlayer:
         return True
 
     def play_once(self):
-        """Spielt die Aufnahme einmal ab."""
+        """Spielt die Aufnahme einmal ab mit vorberechneten Lookahead-Geschwindigkeiten."""
         wps = self._data["waypoints"]
+        speeds = self._precomputed_speeds
         gripper_cmds = sorted(self._data["gripper_cmds"], key=lambda x: x["t"])
         gripper_idx = 0
 
         total_wps = len(wps)
-        print(f"\n▶ WIEDERGABE ({total_wps} Wegpunkte, Speed: {self._speed}x)")
+        print(f"\n▶ WIEDERGABE ({total_wps} Wegpunkte, Speed: {self._speed}x, Lookahead: {LOOKAHEAD_POINTS})")
         print(f"   {'─' * 55}")
 
-        # Letzter gesendeter Befehl (für Delta-Berechnung)
         last_sent = {"b": wps[0]["b"], "s": wps[0]["s"], "e": wps[0]["e"], "h": wps[0]["h"]}
-
         playback_start = time.time()
         commands_sent = 0
         skipped = 0
 
         for i, wp in enumerate(wps):
-            # Ziel-Zeitpunkt berechnen (mit Speed-Faktor)
             target_time = playback_start + (wp["t"] / self._speed)
 
-            # Gripper-Befehle die vor diesem Zeitpunkt liegen ausführen
+            # Gripper-Befehle
             while gripper_idx < len(gripper_cmds):
                 gc = gripper_cmds[gripper_idx]
                 if gc["t"] <= wp["t"]:
@@ -410,71 +571,65 @@ class RoArmPlayer:
                         self._arm.gripper_open()
                         print(f"\n   ✋ GRIPPER AUF [{gc['t']:.2f}s]")
                     time.sleep(0.3)
-                    # Zeit-Kompensation für Gripper-Pause
                     playback_start += 0.3
                     gripper_idx += 1
                 else:
                     break
 
-            # Warten bis der richtige Zeitpunkt ist
+            # Warten bis Zeitpunkt
             now = time.time()
             wait_time = target_time - now
             if wait_time > 0:
                 time.sleep(wait_time)
             elif wait_time < -0.1:
-                # Wir sind zu spät - Wegpunkt überspringen wenn nicht der letzte
                 if i < total_wps - 1:
                     skipped += 1
                     continue
 
-            # Berechne Delta zum letzten gesendeten Befehl
-            delta_b = abs(wp["b"] - last_sent["b"])
-            delta_s = abs(wp["s"] - last_sent["s"])
-            delta_e = abs(wp["e"] - last_sent["e"])
-            delta_h = abs(wp["h"] - last_sent["h"])
-            max_delta = max(delta_b, delta_s, delta_e, delta_h)
+            # Delta prüfen
+            max_delta = max(
+                abs(wp["b"] - last_sent["b"]),
+                abs(wp["s"] - last_sent["s"]),
+                abs(wp["e"] - last_sent["e"]),
+                abs(wp["h"] - last_sent["h"]),
+            )
 
-            # NUR senden wenn sich tatsächlich was bewegt hat (> 0.05°)
-            # Das verhindert unnötige Befehle die den Bus überlasten
             if max_delta < 0.05 and i < total_wps - 1:
                 skipped += 1
                 continue
 
-            # Befehl senden - DIREKT, ohne Backlash, ohne Kompensation
-            # spd=0, acc=0 = so schnell wie möglich (Firmware-Default)
-            self._arm.move_to(wp["b"], wp["s"], wp["e"], wp["h"], spd=0, acc=0)
+            # Vorberechnete Geschwindigkeit verwenden
+            spd, acc = speeds[i]
+
+            # Befehl senden
+            self._arm.move_to(wp["b"], wp["s"], wp["e"], wp["h"], spd=spd, acc=acc)
             commands_sent += 1
             last_sent = {"b": wp["b"], "s": wp["s"], "e": wp["e"], "h": wp["h"]}
 
-            # Live-Ausgabe
+            # Live-Ausgabe mit Speed-Info
             elapsed = time.time() - playback_start
-            delta_str = ""
-            if max_delta >= 0.1:
-                parts = []
-                if delta_b >= 0.1: parts.append(f"b:{wp['b']-last_sent['b']:+.2f}")
-                if delta_s >= 0.1: parts.append(f"s:{wp['s']-last_sent['s']:+.2f}")
-                if delta_e >= 0.1: parts.append(f"e:{wp['e']-last_sent['e']:+.2f}")
-                if delta_h >= 0.1: parts.append(f"h:{wp['h']-last_sent['h']:+.2f}")
-                delta_str = " | " + " ".join(parts)
+            # Speed-Balken visualisieren
+            bar_len = int((spd / SPD_MAX) * 20)
+            bar = "█" * bar_len + "░" * (20 - bar_len)
 
             clear_line()
             sys.stdout.write(
                 f"   ▶ {i+1:4d}/{total_wps} "
                 f"[{elapsed:6.2f}s] "
                 f"b={wp['b']:7.2f}° s={wp['s']:7.2f}° "
-                f"e={wp['e']:7.2f}° h={wp['h']:7.2f}°"
-                f"{delta_str}"
+                f"e={wp['e']:7.2f}° h={wp['h']:7.2f}° "
+                f"|{bar}| spd={spd:2d} acc={acc:2d}"
             )
             sys.stdout.flush()
 
-        # Letzten Punkt nochmal senden für Präzision
+        # Letzten Punkt präzise anfahren
         last_wp = wps[-1]
         time.sleep(0.1)
-        self._arm.move_to(last_wp["b"], last_wp["s"], last_wp["e"], last_wp["h"], spd=10, acc=5)
-        time.sleep(0.5)
+        self._arm.move_to(last_wp["b"], last_wp["s"], last_wp["e"], last_wp["h"], spd=8, acc=4)
+        time.sleep(0.8)
 
         actual_duration = time.time() - playback_start
-        print(f"\n\n   ⏹ Fertig!")
+        print(f"\n\n   ⏱ Fertig!")
         print(f"   Dauer: {actual_duration:.2f}s (Soll: {wps[-1]['t']/self._speed:.2f}s)")
         print(f"   Befehle gesendet: {commands_sent}/{total_wps}")
         print(f"   Übersprungen: {skipped}")
@@ -492,27 +647,21 @@ class RoArmPlayer:
                       f"e={pos['e']:.2f}° h={pos['h']:.2f}°")
 
     def run(self):
-        """Hauptprogramm."""
         print("=" * 60)
-        print("  RoArm-M2-S PLAY MODE")
-        print("  Spielt aufgezeichnete Bewegungen exakt ab")
-        print("  Keine Interpolation, keine Kompensation")
+        print("  RoArm-M2-S PLAY MODE (Lookahead)")
+        print("  Schnell bei gleicher Richtung, bremst vor Richtungswechsel")
         print("=" * 60)
 
-        # Laden
         if not self.load():
             return
 
-        # Verbinden
         if not self.connect():
             return
 
-        # Zur Startposition
         if not self.go_to_start():
             self._arm.close()
             return
 
-        # Warten
         print(f"\n{'─' * 60}")
         print(f"  Bereit! Drücke ENTER um die Wiedergabe zu starten.")
         if self._loop:
@@ -541,7 +690,7 @@ class RoArmPlayer:
         self._arm.torque_on()
         time.sleep(0.3)
         self._arm.close()
-        print("✓ Fertig!\n")
+        print("✅ Fertig!\n")
 
 
 # ============================================================
@@ -549,8 +698,9 @@ class RoArmPlayer:
 # ============================================================
 
 def main():
+    global LOOKAHEAD_POINTS, SPD_MAX, SPD_MIN
     import argparse
-    p = argparse.ArgumentParser(description="RoArm-M2-S Play Mode - Aufnahmen abspielen")
+    p = argparse.ArgumentParser(description="RoArm-M2-S Play Mode - Lookahead Geschwindigkeitssteuerung")
     p.add_argument("file", type=str, help=".roarm Datei zum Abspielen")
     p.add_argument("--port", type=str, default=None, help="Serieller Port (auto-detect)")
     p.add_argument("--speed", type=float, default=1.0,
@@ -559,7 +709,18 @@ def main():
                    help="Endlos wiederholen")
     p.add_argument("--no-verify", action="store_true",
                    help="Positionsverifikation überspringen")
+    p.add_argument("--lookahead", type=int, default=LOOKAHEAD_POINTS,
+                   help=f"Lookahead-Punkte (default: {LOOKAHEAD_POINTS})")
+    p.add_argument("--spd-max", type=int, default=SPD_MAX,
+                   help=f"Max Speed (default: {SPD_MAX})")
+    p.add_argument("--spd-min", type=int, default=SPD_MIN,
+                   help=f"Min Speed (default: {SPD_MIN})")
     args = p.parse_args()
+
+    # Globale Parameter überschreiben wenn angegeben
+    LOOKAHEAD_POINTS = args.lookahead
+    SPD_MAX = args.spd_max
+    SPD_MIN = args.spd_min
 
     player = RoArmPlayer(
         filepath=args.file,
