@@ -599,10 +599,11 @@ class DSLRecorder:
             action = frame["action"]
             ts = frame["timestamp"]
 
-            # Wait einfügen wenn Pause > 0.3s
-            if prev_time and (ts - prev_time) > 0.3:
-                wait_time = round(ts - prev_time, 1)
-                lines.append(f"wait {wait_time}")
+            # Wait einfügen — IMMER die tatsächliche Zeit zwischen Frames
+            if prev_time:
+                wait_time = round(ts - prev_time, 3)
+                if wait_time > 0.005:  # Nur wenn > 5ms (filter noise)
+                    lines.append(f"wait {wait_time}")
 
             # Nur move wenn sich was geändert hat
             if prev_state is None or self._state_changed(prev_state, state):
@@ -632,14 +633,6 @@ class DSLRecorder:
         if not frames:
             return f"function {name}():\n  # leer"
 
-        # Defaults aus den Frames extrahieren
-        first = frames[0]["state"]
-        params = []
-
-        # Finde welche Werte sich ändern → die werden Parameter
-        all_bases = [f["state"].base_deg for f in frames]
-        all_shoulders = [f["state"].shoulder_deg for f in frames]
-
         lines = [f"function {name}(speed=medium):"]
 
         prev_state = None
@@ -649,9 +642,11 @@ class DSLRecorder:
             state = frame["state"]
             ts = frame["timestamp"]
 
-            if prev_time and (ts - prev_time) > 0.3:
-                wait_time = round(ts - prev_time, 1)
-                lines.append(f"  wait {wait_time}")
+            # Wait einfügen — tatsächliche Zeit
+            if prev_time:
+                wait_time = round(ts - prev_time, 3)
+                if wait_time > 0.005:
+                    lines.append(f"  wait {wait_time}")
 
             if prev_state is None or self._state_changed(prev_state, state):
                 move_parts = []
