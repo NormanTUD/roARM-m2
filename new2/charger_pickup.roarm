@@ -1,0 +1,42 @@
+# charger_pickup.roarm
+# Aufgezeichnet am 2026-07-10, bearbeitet von Hand
+
+defaults:
+  speed: medium
+  acceleration: 100
+
+function pick_charger(speed=medium, height=90):
+  move base=0 shoulder=10 elbow=$height hand=180 speed=$speed
+  wait 0.5
+  gripper open
+  move base=-15 shoulder=25 elbow=45 hand=180
+  wait 0.3
+  gripper close
+  wait 0.2
+  move base=0 shoulder=0 elbow=90 hand=180
+
+function look_around(step=30, pause=1.0):
+  move base=-90 shoulder=0 elbow=45 hand=180
+  wait $pause
+  move base=-60 shoulder=0 elbow=45 hand=180
+  wait $pause
+  move base=-30 shoulder=0 elbow=45 hand=180
+  wait $pause
+  move base=0 shoulder=0 elbow=45 hand=180
+  wait $pause
+  move base=30 shoulder=0 elbow=45 hand=180
+  wait $pause
+  move base=60 shoulder=0 elbow=45 hand=180
+  wait $pause
+  move base=90 shoulder=0 elbow=45 hand=180
+
+function find_and_pick(target="charger"):
+  call look_around
+  when see $target:
+    move_toward $target
+    call pick_charger
+  otherwise:
+    print "Objekt nicht gefunden"
+
+# Hauptprogramm
+call find_and_pick target="charger"
