@@ -1,0 +1,20 @@
+roarm/
+├── lib/
+│   ├── __init__.py
+│   ├── arm.py              # Hardware abstraction (from roarm_m2s.py, simplified)
+│   ├── vision.py           # YOLO pipeline: detect → bounding boxes only
+│   ├── dsl.py              # DSL parser, interpreter, step-debugger
+│   ├── recorder.py         # Records actions → DSL format
+│   └── policy.py           # Neural network (sees only bounding boxes, not raw pixels)
+├── scripts/
+│   ├── record.py           # Record sessions → .roarm files
+│   ├── replay.py           # Replay .roarm files step-by-step
+│   ├── train.py            # Train policy from .roarm recordings
+│   ├── run.py              # Run trained policy
+│   └── annotate.py         # Export frames as JPGs for YOLO annotation
+├── programs/               # User-written .roarm scripts
+│   ├── pick_bottle.roarm
+│   └── scan_table.roarm
+└── models/
+    ├── yolo_custom.pt      # Your fine-tuned YOLO model
+    └── policy.pt           # Trained movement policy
