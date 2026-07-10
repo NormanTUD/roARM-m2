@@ -820,7 +820,6 @@ class TeachRecorder:
         cv2.destroyAllWindows()
         print("  Beendet")
 
-
 def main():
     import argparse
     p = argparse.ArgumentParser()
