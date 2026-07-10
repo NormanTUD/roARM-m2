@@ -5,6 +5,7 @@
 #     "opencv-python",
 #     "numpy",
 #     "pyserial",
+#     "torch",
 # ]
 # ///
 
