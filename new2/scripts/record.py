@@ -349,32 +349,31 @@ class SessionRecorder:
         time_factor = min(time_factor, 3.0)
 
         spd = self.SPEED_LEVELS[self._speed_level]
-        step = spd["step"]
         moved = False
 
         if "base_left" in self._keys_down:
-            self._state.base_deg = min(90, self._state.base_deg + step * time_factor)
+            self._state.base_deg = min(90, self._state.base_deg + spd["base"] * time_factor)
             moved = True
         if "base_right" in self._keys_down:
-            self._state.base_deg = max(-90, self._state.base_deg - step * time_factor)
+            self._state.base_deg = max(-90, self._state.base_deg - spd["base"] * time_factor)
             moved = True
         if "shoulder_up" in self._keys_down:
-            self._state.shoulder_deg = min(60, self._state.shoulder_deg + step * time_factor)
+            self._state.shoulder_deg = min(60, self._state.shoulder_deg + spd["shoulder"] * time_factor)
             moved = True
         if "shoulder_down" in self._keys_down:
-            self._state.shoulder_deg = max(-30, self._state.shoulder_deg - step * time_factor)
+            self._state.shoulder_deg = max(-30, self._state.shoulder_deg - spd["shoulder"] * time_factor)
             moved = True
         if "elbow_up" in self._keys_down:
-            self._state.elbow_deg = max(0, self._state.elbow_deg - step * time_factor)
+            self._state.elbow_deg = max(0, self._state.elbow_deg - spd["elbow"] * time_factor)
             moved = True
         if "elbow_down" in self._keys_down:
-            self._state.elbow_deg = min(180, self._state.elbow_deg + step * time_factor)
+            self._state.elbow_deg = min(180, self._state.elbow_deg + spd["elbow"] * time_factor)
             moved = True
         if "hand_left" in self._keys_down:
-            self._state.hand_deg = max(0, self._state.hand_deg - step * time_factor)
+            self._state.hand_deg = max(0, self._state.hand_deg - spd["hand"] * time_factor)
             moved = True
         if "hand_right" in self._keys_down:
-            self._state.hand_deg = min(270, self._state.hand_deg + step * time_factor)
+            self._state.hand_deg = min(270, self._state.hand_deg + spd["hand"] * time_factor)
             moved = True
 
         if moved:
