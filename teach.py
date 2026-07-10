@@ -281,7 +281,6 @@ class TeachRecorder:
         self._running = True
         last_rec = 0
         interval = 1.0 / self.POLL_HZ
-
         last_key_time = 0
 
         try:
@@ -316,13 +315,18 @@ class TeachRecorder:
 
                 key = cv2.waitKey(30) & 0xFF
 
+                # Debounce: ignore keys that arrive within 300ms of the last one
+                if key != 255:
+                    if (time.time() - last_key_time) < 0.3:
+                        continue
+                    last_key_time = time.time()
+
                 if key == ord('q'):
                     self._running = False
                 elif key == ord('r'):
                     if not self._recording:
-                        # Guard against repeated triggers
-                        if self._session_dir is None or not self._recording:
-                            self._create_session()
+                        self._create_session()
+                        self._rec_start_time = time.time()
                         self._recording = True
                         last_rec = time.time()
                         print("  ● AUFNAHME GESTARTET")
@@ -330,7 +334,7 @@ class TeachRecorder:
                         self._recording = False
                         self._save_script()
                         print("  ■ AUFNAHME GESTOPPT")
-                        self._session_dir = None  # Reset so next R creates fresh session
+                        self._session_dir = None
                 elif key == ord(' '):
                     if self._recording:
                         self._record_waypoint(frame)
@@ -351,7 +355,7 @@ class TeachRecorder:
                     self._arm.set_led(0)
                     print("    LED AUS")
                 elif key in [ord('1'), ord('2'), ord('3'), ord('4'), ord('5')]:
-                    level = (key - ord('0')) * 51  # 1=51, 2=102, 3=153, 4=204, 5=255
+                    level = (key - ord('0')) * 51
                     if self._recording:
                         self._commands.append(f"LED {level}")
                     self._arm.set_led(level)
@@ -366,7 +370,6 @@ class TeachRecorder:
                         if scripts:
                             print(f"  Abspielen: {scripts[-1].name}")
                             os.system(f"python3 play_roarm.py '{scripts[-1]}'")
-                            # Re-enable teach mode
                             self._arm.torque_off()
                         else:
                             print("    Kein Skript!")
