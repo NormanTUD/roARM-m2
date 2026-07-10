@@ -6,6 +6,7 @@
 #     "numpy",
 #     "pyserial",
 #     "torch",
+#     "ultralytics",
 # ]
 # ///
 
