@@ -828,7 +828,7 @@ def main():
     p.add_argument("--camera", type=int, default=2)
     p.add_argument("--output", type=str, default="teach_recordings")
     p.add_argument("--manual", action="store_true")
-    p.add_argument("--hz", type=int, default=50)
+    p.add_argument("--hz", type=int, default=200)
     p.add_argument("--wait", type=float, default=1.0)
     p.add_argument("--threshold", type=float, default=0.15)
     p.add_argument("--avg", type=int, default=7, help="Number of readings for median filter")
