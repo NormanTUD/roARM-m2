@@ -28,55 +28,167 @@ def _ensure_uv():
 _ensure_uv()
 
 """
-RoArm-M2-S Teach & Record
-==========================
-Führe den Arm per Hand, drücke Tasten für Greifer/LED, und alles wird
-in einer .roarm-Skriptdatei + Kamerabildern aufgezeichnet.
+RoArm-M2-S Teach & Record (Direct Serial)
+==========================================
+Direkte serielle Kommunikation mit dem Arm via JSON-Befehle.
+Kein externer Wrapper nötig.
 
 Steuerung (im OpenCV-Fenster):
-  SPACE  → Wegpunkt aufzeichnen (aktuelle Position)
-  O      → Greifer öffnen (wird aufgezeichnet)
-  C      → Greifer schließen (wird aufgezeichnet)
+  R      → Aufnahme starten/stoppen
+  SPACE  → Manueller Wegpunkt (bei --manual)
+  O      → Greifer öffnen
+  C      → Greifer schließen
   L      → LED an (255)
   K      → LED aus (0)
-  W      → Wartezeit einfügen (1s, konfigurierbar)
-  R      → Aufnahme starten/stoppen
-  P      → Aufgezeichnetes Skript abspielen
+  W      → Wartezeit einfügen
+  P      → Letztes Skript abspielen
   Q      → Beenden
-
-Die .roarm-Datei ist eine einfache zeilenbasierte Sprache:
-  #CONFIG speed_scale=1.0
-  #CONFIG spd=50
-  #CONFIG acc=100
-  MOVE b=0.0 s=0.0 e=90.0 h=180.0
-  GRIPPER OPEN
-  GRIPPER CLOSE
-  LED 255
-  LED 0
-  WAIT 1.0
-  FRAME frame_000001.jpg
 """
 
 import json
 import time
+import math
 import threading
+import serial
+import serial.tools.list_ports
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 
 import cv2
 
-# Import our arm library
-from roarm_m2s import RoArmM2S
+
+def find_arm_port() -> str:
+    """Findet den seriellen Port des RoArm-M2-S."""
+    ports = list(serial.tools.list_ports.comports())
+    # Bevorzuge USB-Serial-Ports
+    for p in ports:
+        desc = (p.description or "").lower()
+        if "usb" in desc or "ch340" in desc or "cp210" in desc or "ftdi" in desc:
+            return p.device
+    # Auf Linux: /dev/ttyUSB*
+    for p in ports:
+        if "ttyUSB" in p.device or "ttyACM" in p.device:
+            return p.device
+    if ports:
+        return ports[0].device
+    return None
+
+
+class RoArmDirect:
+    """Direkte serielle Kommunikation mit dem RoArm-M2-S."""
+
+    def __init__(self, port: str = None, baudrate: int = 115200):
+        if port is None:
+            port = find_arm_port()
+        if port is None:
+            raise RuntimeError("Kein serieller Port gefunden! Bitte --port angeben.")
+        self.port = port
+        self._ser = serial.Serial(port, baudrate=baudrate, timeout=1.0, dsrdtr=None)
+        self._ser.setRTS(False)
+        self._ser.setDTR(False)
+        self._lock = threading.Lock()
+        time.sleep(0.5)
+        # Buffer leeren
+        self._ser.reset_input_buffer()
+
+    def send_cmd(self, cmd: dict) -> str:
+        """Sendet JSON-Befehl, gibt Antwort zurück."""
+        with self._lock:
+            msg = json.dumps(cmd, separators=(',', ':'))
+            self._ser.write(msg.encode() + b'\n')
+            self._ser.flush()
+            time.sleep(0.05)
+            # Antwort lesen (bis zu 500ms warten)
+            response = ""
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if self._ser.in_waiting:
+                    line = self._ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        response = line
+                        # Wenn es JSON mit T:1051 ist, sofort zurück
+                        if '"T":1051' in line or '"T": 1051' in line:
+                            return line
+                else:
+                    time.sleep(0.01)
+            return response
+
+    def get_feedback(self) -> dict:
+        """Holt Servo-Feedback via CMD_SERVO_RAD_FEEDBACK {T:105}."""
+        # Buffer leeren
+        with self._lock:
+            self._ser.reset_input_buffer()
+
+        resp = self.send_cmd({"T": 105})
+
+        # Versuche JSON zu parsen
+        # Manchmal kommen mehrere Zeilen, wir suchen die mit T:1051
+        if not resp:
+            # Nochmal versuchen, mehr lesen
+            time.sleep(0.1)
+            with self._lock:
+                while self._ser.in_waiting:
+                    line = self._ser.readline().decode('utf-8', errors='ignore').strip()
+                    if '"T":1051' in line or '"T": 1051' in line:
+                        resp = line
+                        break
+
+        if not resp:
+            return None
+
+        # Finde JSON in der Antwort
+        try:
+            # Manchmal ist Müll davor
+            start = resp.find('{')
+            end = resp.rfind('}')
+            if start >= 0 and end > start:
+                data = json.loads(resp[start:end+1])
+                if data.get("T") == 1051 or "b" in data:
+                    return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+    def torque_off(self):
+        """Torque Lock ausschalten - Arm frei bewegbar."""
+        self.send_cmd({"T": 210, "cmd": 0})
+
+    def torque_on(self):
+        """Torque Lock einschalten."""
+        self.send_cmd({"T": 210, "cmd": 1})
+
+    def move_radians(self, b: float, s: float, e: float, t: float, spd: int = 0, acc: int = 10):
+        """Bewegt alle Gelenke (Radians)."""
+        self.send_cmd({"T": 102, "base": b, "shoulder": s, "elbow": e, "hand": t, "spd": spd, "acc": acc})
+
+    def move_degrees(self, b: float, s: float, e: float, h: float, spd: int = 10, acc: int = 10):
+        """Bewegt alle Gelenke (Grad)."""
+        self.send_cmd({"T": 122, "b": b, "s": s, "e": e, "h": h, "spd": spd, "acc": acc})
+
+    def gripper_open(self):
+        """Greifer öffnen (EoAT auf ~1.08 rad = offen)."""
+        self.send_cmd({"T": 106, "cmd": 1.08, "spd": 0, "acc": 0})
+
+    def gripper_close(self):
+        """Greifer schließen (EoAT auf 3.14 rad = geschlossen)."""
+        self.send_cmd({"T": 106, "cmd": 3.14, "spd": 0, "acc": 0})
+
+    def set_led(self, brightness: int):
+        """LED setzen (0-255)."""
+        self.send_cmd({"T": 114, "led": brightness})
+
+    def move_init(self):
+        """Zur Startposition."""
+        self.send_cmd({"T": 100})
+
+    def disconnect(self):
+        if self._ser and self._ser.is_open:
+            self._ser.close()
 
 
 class TeachRecorder:
-    """
-    Teach-Modus: Torque aus, Arm per Hand führen, Wegpunkte aufzeichnen.
-    Erzeugt .roarm Skriptdatei + Kamerabilder.
-    """
-
-    POLL_HZ = 10  # Wie oft Position abgefragt wird bei kontinuierlicher Aufnahme
+    POLL_HZ = 10
 
     def __init__(self, port: str = None, camera_index: int = 2,
                  output_dir: str = "teach_recordings",
@@ -85,81 +197,89 @@ class TeachRecorder:
         self._camera_index = camera_index
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._continuous = continuous  # Kontinuierlich aufzeichnen vs. nur bei SPACE
+        self._continuous = continuous
         self._wait_seconds = wait_seconds
 
-        self._arm: RoArmM2S = None
+        self._arm: RoArmDirect = None
         self._camera = None
 
         self._recording = False
-        self._commands: list = []  # Liste von Skript-Zeilen
+        self._commands: list = []
         self._frame_count = 0
         self._session_dir: Path = None
         self._images_dir: Path = None
         self._script_path: Path = None
 
-        # Config defaults (werden in .roarm geschrieben)
         self._speed_scale = 1.0
-        self._spd = 50
-        self._acc = 100
+        self._spd = 0
+        self._acc = 10
 
         self._running = False
         self._window_name = "RoArm Teach & Record"
 
     def setup(self) -> bool:
-        """Hardware initialisieren."""
         print("=" * 60)
-        print("  RoArm-M2-S Teach & Record")
+        print("  RoArm-M2-S Teach & Record (Direct Serial)")
         print("=" * 60)
 
         # Arm verbinden
         print("\n  [1/3] Arm verbinden...")
         try:
-            self._arm = RoArmM2S(port=self._port, enable_vision=False)
-            print(f"    ✓ Verbunden: {self._arm.port}")
+            self._arm = RoArmDirect(port=self._port)
+            print(f"    OK Verbunden: {self._arm.port}")
         except Exception as e:
-            print(f"    ✗ Fehler: {e}")
+            print(f"    FEHLER: {e}")
             return False
 
-        # Kamera
-        print(f"  [2/3] Kamera {self._camera_index}...")
+        # Kamera - NUR den angegebenen Index verwenden, kein Fallback
+        print(f"  [2/3] Kamera Index {self._camera_index}...")
         self._camera = cv2.VideoCapture(self._camera_index)
-        if not self._camera.isOpened():
-            for idx in [0, 2, 1, 4]:
-                self._camera = cv2.VideoCapture(idx)
-                if self._camera.isOpened():
-                    self._camera_index = idx
-                    break
         if self._camera.isOpened():
             self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self._camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            print(f"    ✓ Kamera {self._camera_index}")
+            print(f"    OK Kamera {self._camera_index}")
         else:
-            print("    ⚠ Keine Kamera (läuft ohne Bilder)")
+            print(f"    WARNUNG: Kamera {self._camera_index} nicht verfügbar!")
+            print("    Verfügbare Kameras testen...")
             self._camera = None
+            for idx in range(5):
+                test = cv2.VideoCapture(idx)
+                if test.isOpened():
+                    print(f"      Kamera {idx}: verfügbar")
+                    test.release()
+                else:
+                    print(f"      Kamera {idx}: nicht verfügbar")
+            print("    Starte ohne Kamera. Nutze --camera <index>")
 
-        # Torque ausschalten → Arm per Hand führbar
-        print("  [3/3] Torque Lock AUS (Arm frei bewegbar)...")
-        self._arm.set_torque(enable=False)
+        # Torque ausschalten
+        print("  [3/3] Torque Lock AUS...")
+        self._arm.torque_off()
         time.sleep(0.5)
-        print("    ✓ Arm ist jetzt frei bewegbar!")
+
+        # Test: Feedback lesen
+        print("  [Test] Feedback lesen...")
+        fb = self._arm.get_feedback()
+        if fb:
+            print(f"    OK Feedback: b={fb.get('b',0):.3f} s={fb.get('s',0):.3f} e={fb.get('e',0):.3f} t={fb.get('t',0):.3f}")
+        else:
+            print("    WARNUNG: Kein Feedback erhalten! Prüfe Verbindung.")
+            print("    (Versuche trotzdem weiterzumachen...)")
 
         print("\n  Steuerung:")
-        print("    SPACE → Wegpunkt aufzeichnen")
-        print("    O/C   → Greifer öffnen/schließen")
-        print("    L/K   → LED an/aus")
-        print("    W     → Wartezeit einfügen")
-        print("    R     → Aufnahme Start/Stop")
-        print("    P     → Skript abspielen")
-        print("    Q     → Beenden")
+        print("    R     = Aufnahme Start/Stop")
+        print("    SPACE = Manueller Wegpunkt")
+        print("    O/C   = Greifer öffnen/schließen")
+        print("    L/K   = LED an/aus")
+        print("    W     = Wartezeit")
+        print("    P     = Abspielen")
+        print("    Q     = Beenden")
         if self._continuous:
-            print(f"\n    [Kontinuierlich-Modus: {self.POLL_HZ} Hz Aufzeichnung]")
+            print(f"    [Kontinuierlich: {self.POLL_HZ} Hz]")
         print()
         return True
 
     def _create_session(self):
-        """Erstellt neues Aufnahme-Verzeichnis."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._session_dir = self._output_dir / f"session_{timestamp}"
         self._images_dir = self._session_dir / "frames"
@@ -167,10 +287,9 @@ class TeachRecorder:
         self._script_path = self._session_dir / f"program_{timestamp}.roarm"
         self._commands = []
         self._frame_count = 0
-        print(f"\n  📁 Session: {self._session_dir}")
+        print(f"\n  Session: {self._session_dir}")
 
     def _save_frame(self, frame) -> str:
-        """Speichert Kamerabild, gibt Dateinamen zurück."""
         if frame is None:
             return ""
         self._frame_count += 1
@@ -180,41 +299,36 @@ class TeachRecorder:
         return filename
 
     def _get_arm_position(self) -> dict:
-        """Holt aktuelle Gelenkwinkel vom Arm (Feedback)."""
-        status = self._arm.get_status()
-        if status:
-            import math
+        """Holt aktuelle Gelenkwinkel vom Arm (Radians → Grad)."""
+        fb = self._arm.get_feedback()
+        if fb and "b" in fb:
             return {
-                "b": round(math.degrees(status.base_rad), 2),
-                "s": round(math.degrees(status.shoulder_rad), 2),
-                "e": round(math.degrees(status.elbow_rad), 2),
-                "h": round(math.degrees(status.eoat_rad), 2),
+                "b": round(math.degrees(fb["b"]), 2),
+                "s": round(math.degrees(fb["s"]), 2),
+                "e": round(math.degrees(fb["e"]), 2),
+                "h": round(math.degrees(fb["t"]), 2),  # "t" im Feedback = hand/EoAT
             }
         return None
 
     def _record_waypoint(self, frame=None):
-        """Zeichnet aktuellen Wegpunkt auf."""
         pos = self._get_arm_position()
         if pos is None:
-            print("    ⚠ Konnte Position nicht lesen!")
+            print("    !! Konnte Position nicht lesen!")
             return
 
-        # MOVE Befehl
         cmd = f"MOVE b={pos['b']} s={pos['s']} e={pos['e']} h={pos['h']}"
         self._commands.append(cmd)
 
-        # Kamerabild
         if frame is not None:
             filename = self._save_frame(frame)
             if filename:
                 self._commands.append(f"FRAME {filename}")
 
-        print(f"    📍 Waypoint: B={pos['b']:.1f} S={pos['s']:.1f} E={pos['e']:.1f} H={pos['h']:.1f}")
+        print(f"    + Waypoint: B={pos['b']:.1f} S={pos['s']:.1f} E={pos['e']:.1f} H={pos['h']:.1f}")
 
     def _save_script(self):
-        """Speichert die .roarm Skriptdatei."""
         if not self._commands:
-            print("    ⚠ Nichts aufgezeichnet!")
+            print("    !! Nichts aufgezeichnet!")
             return
 
         lines = [
@@ -231,23 +345,19 @@ class TeachRecorder:
         with open(self._script_path, 'w') as f:
             f.write("\n".join(lines) + "\n")
 
-        print(f"\n  💾 Gespeichert: {self._script_path}")
-        print(f"     {len(self._commands)} Befehle, {self._frame_count} Frames")
+        print(f"\n  Gespeichert: {self._script_path}")
+        print(f"  {len(self._commands)} Befehle, {self._frame_count} Frames")
 
     def _play_script(self, script_path: Path = None):
-        """Spielt ein .roarm Skript ab."""
         path = script_path or self._script_path
         if not path or not path.exists():
-            print("    ⚠ Kein Skript zum Abspielen!")
+            print("    !! Kein Skript zum Abspielen!")
             return
 
-        print(f"\n  ▶ Abspielen: {path.name}")
-
-        # Torque wieder an
-        self._arm.set_torque(enable=True)
+        print(f"\n  > Abspielen: {path.name}")
+        self._arm.torque_on()
         time.sleep(0.3)
 
-        # Config defaults
         spd = self._spd
         acc = self._acc
         speed_scale = self._speed_scale
@@ -257,11 +367,10 @@ class TeachRecorder:
 
         for line in lines:
             line = line.strip()
-            if not line or line.startswith("#") and not line.startswith("#CONFIG"):
+            if not line or (line.startswith("#") and not line.startswith("#CONFIG")):
                 continue
 
             if line.startswith("#CONFIG"):
-                # Parse config
                 _, kv = line.split(" ", 1)
                 key, val = kv.split("=")
                 if key == "speed_scale":
@@ -276,15 +385,13 @@ class TeachRecorder:
             cmd = parts[0]
 
             if cmd == "MOVE":
-                # Parse: MOVE b=X s=X e=X h=X
                 vals = {}
                 for p in parts[1:]:
                     k, v = p.split("=")
                     vals[k] = float(v)
-
-                actual_spd = int(spd * speed_scale)
-                actual_acc = int(acc * speed_scale)
-                self._arm.move_joints_degrees(
+                actual_spd = max(1, int(spd * speed_scale)) if spd > 0 else 0
+                actual_acc = max(1, int(acc * speed_scale)) if acc > 0 else 0
+                self._arm.move_degrees(
                     b=vals.get("b", 0),
                     s=vals.get("s", 0),
                     e=vals.get("e", 90),
@@ -292,8 +399,7 @@ class TeachRecorder:
                     spd=actual_spd,
                     acc=actual_acc
                 )
-                # Warte proportional zur Geschwindigkeit
-                time.sleep(0.3 / speed_scale)
+                time.sleep(0.1 / max(speed_scale, 0.1))
 
             elif cmd == "GRIPPER":
                 action = parts[1] if len(parts) > 1 else "OPEN"
@@ -309,31 +415,16 @@ class TeachRecorder:
 
             elif cmd == "WAIT":
                 wait_time = float(parts[1]) if len(parts) > 1 else 1.0
-                wait_time /= speed_scale
-                time.sleep(wait_time)
+                time.sleep(wait_time / max(speed_scale, 0.1))
 
             elif cmd == "FRAME":
-                pass  # Frames sind nur für KI-Training, nicht für Playback
+                pass
 
-            # Live-Anzeige während Playback
-            if self._camera:
-                self._camera.grab()
-                ret, frame = self._camera.retrieve()
-                if ret:
-                    cv2.putText(frame, f"REPLAY: {line[:50]}", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    cv2.imshow(self._window_name, frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-
-        print("  ■ Abspielen beendet")
-
-        # Torque wieder aus für weiteres Teaching
-        self._arm.set_torque(enable=False)
+        print("  Abspielen beendet")
+        self._arm.torque_off()
         time.sleep(0.3)
 
     def run(self):
-        """Hauptschleife."""
         if not self.setup():
             return
 
@@ -343,7 +434,6 @@ class TeachRecorder:
 
         try:
             while self._running:
-                # Frame holen
                 frame = None
                 if self._camera:
                     self._camera.grab()
@@ -351,7 +441,6 @@ class TeachRecorder:
                     if not ret:
                         frame = None
 
-                # Kontinuierliche Aufnahme
                 now = time.time()
                 if self._recording and self._continuous:
                     if now - last_record_time >= record_interval:
@@ -360,28 +449,26 @@ class TeachRecorder:
 
                 # Anzeige
                 if frame is not None:
-                    # Status-Overlay
                     status_color = (0, 0, 255) if self._recording else (200, 200, 200)
-                    status_text = "● REC" if self._recording else "○ IDLE"
+                    status_text = "REC" if self._recording else "IDLE"
                     cv2.putText(frame, status_text, (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-
                     if self._recording:
                         cv2.putText(frame, f"Cmds: {len(self._commands)}", (10, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-                    cv2.putText(frame, "R=Rec O/C=Grip L/K=LED W=Wait P=Play Q=Quit",
-                                (10, frame.shape[0] - 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
-
                     cv2.imshow(self._window_name, frame)
+                else:
+                    # Ohne Kamera: kleines schwarzes Fenster für Tasteneingabe
+                    dummy = np.zeros((100, 400, 3), dtype=np.uint8)
+                    status_text = "REC" if self._recording else "IDLE"
+                    cv2.putText(dummy, f"{status_text} | Cmds: {len(self._commands)}", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.imshow(self._window_name, dummy)
 
-                # Tasteneingabe
                 key = cv2.waitKey(30) & 0xFF
 
                 if key == ord('q'):
                     self._running = False
-
                 elif key == ord('r'):
                     if not self._recording:
                         self._create_session()
@@ -392,49 +479,40 @@ class TeachRecorder:
                         self._recording = False
                         self._save_script()
                         print("  ■ AUFNAHME GESTOPPT")
-
                 elif key == ord(' '):
-                    # Manueller Wegpunkt (auch ohne kontinuierliche Aufnahme)
                     if self._recording:
                         self._record_waypoint(frame)
-
                 elif key == ord('o'):
                     if self._recording:
                         self._commands.append("GRIPPER OPEN")
-                        print("    🤏 Greifer ÖFFNEN")
+                        print("    Greifer OFFEN")
                     self._arm.gripper_open()
-
                 elif key == ord('c'):
                     if self._recording:
                         self._commands.append("GRIPPER CLOSE")
-                        print("    🤏 Greifer SCHLIESSEN")
+                        print("    Greifer ZU")
                     self._arm.gripper_close()
-
                 elif key == ord('l'):
                     if self._recording:
                         self._commands.append("LED 255")
-                        print("    💡 LED AN")
+                        print("    LED AN")
                     self._arm.set_led(255)
-
                 elif key == ord('k'):
                     if self._recording:
                         self._commands.append("LED 0")
-                        print("    💡 LED AUS")
+                        print("    LED AUS")
                     self._arm.set_led(0)
-
                 elif key == ord('w'):
                     if self._recording:
                         self._commands.append(f"WAIT {self._wait_seconds}")
-                        print(f"    ⏱ WAIT {self._wait_seconds}s")
-
+                        print(f"    WAIT {self._wait_seconds}s")
                 elif key == ord('p'):
                     if not self._recording:
-                        # Finde letztes Skript
                         scripts = sorted(self._output_dir.rglob("*.roarm"))
                         if scripts:
                             self._play_script(scripts[-1])
                         else:
-                            print("    ⚠ Kein Skript gefunden!")
+                            print("    !! Kein Skript gefunden!")
 
         except KeyboardInterrupt:
             print("\n  [Abgebrochen]")
@@ -442,34 +520,29 @@ class TeachRecorder:
             self._shutdown()
 
     def _shutdown(self):
-        """Aufräumen."""
         if self._recording:
             self._recording = False
             self._save_script()
-
         if self._arm:
-            self._arm.set_torque(enable=True)
+            self._arm.torque_on()
             time.sleep(0.3)
-            self._arm.park()
-            time.sleep(1.0)
+            self._arm.move_init()
+            time.sleep(2.0)
             self._arm.set_led(0)
             self._arm.disconnect()
-
         if self._camera:
             self._camera.release()
-
         cv2.destroyAllWindows()
-        print("\n  ✓ Beendet")
+        print("\n  Beendet")
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="RoArm-M2-S Teach & Record")
-    parser.add_argument("--port", type=str, default=None, help="Serieller Port")
-    parser.add_argument("--camera", type=int, default=2, help="Kamera-Index")
+    parser = argparse.ArgumentParser(description="RoArm-M2-S Teach & Record (Direct Serial)")
+    parser.add_argument("--port", type=str, default=None, help="Serieller Port (z.B. /dev/ttyUSB0)")
+    parser.add_argument("--camera", type=int, default=2, help="Kamera-Index (default: 2)")
     parser.add_argument("--output", type=str, default="teach_recordings", help="Output-Verzeichnis")
-    parser.add_argument("--manual", action="store_true",
-                        help="Nur bei SPACE aufzeichnen (nicht kontinuierlich)")
+    parser.add_argument("--manual", action="store_true", help="Nur bei SPACE aufzeichnen")
     parser.add_argument("--hz", type=int, default=10, help="Aufnahme-Frequenz (Hz)")
     parser.add_argument("--wait", type=float, default=1.0, help="Standard-Wartezeit (s)")
     args = parser.parse_args()
