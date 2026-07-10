@@ -4,6 +4,7 @@
 # dependencies = [
 #     "opencv-python",
 #     "numpy",
+#     "torch",
 #     "pyserial",
 # ]
 # ///
