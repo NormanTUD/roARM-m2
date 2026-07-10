@@ -365,6 +365,7 @@ def parse_roarm_file(filepath: str) -> dict:
     gripper_cmds = []
     config = {"hz": 20, "threshold": 0.3}
     start_pos = None
+    offset = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
 
     with open(filepath, 'r') as f:
         for line in f:
@@ -386,6 +387,13 @@ def parse_roarm_file(filepath: str) -> dict:
                     k, v = p.split("=")
                     vals[k] = float(v)
                 start_pos = vals
+                continue
+
+            if line.startswith("#OFFSET"):
+                parts = line.split()[1:]
+                for p in parts:
+                    k, v = p.split("=")
+                    offset[k.strip()] = float(v.strip())
                 continue
 
             if line.startswith("#"):
@@ -422,8 +430,44 @@ def parse_roarm_file(filepath: str) -> dict:
         "gripper_cmds": gripper_cmds,
         "config": config,
         "start_pos": start_pos,
+        "offset": offset,
     }
 
+# Konstante oben bei den anderen Konstanten hinzufügen:
+OFFSET_BLEND_POINTS = 5
+ENDPOINT_SETTLE_PASSES = 3
+ENDPOINT_FINAL_SPD = 3
+ENDPOINT_FINAL_ACC = 1
+ENDPOINT_SETTLE_WAIT = 0.8
+
+
+def apply_offset_to_waypoints(waypoints: list, offset: dict, blend_points: int = OFFSET_BLEND_POINTS) -> list:
+    """
+    Wendet den Offset auf die letzten N Wegpunkte an (linearer Blend).
+    So wird der Endpunkt korrigiert ohne den restlichen Pfad zu verzerren.
+    """
+    has_offset = any(abs(v) > 0.001 for v in offset.values())
+    if not has_offset:
+        return waypoints
+
+    total = len(waypoints)
+    blend_start = max(0, total - blend_points)
+    result = []
+
+    for i, wp in enumerate(waypoints):
+        if i < blend_start:
+            result.append(wp.copy())
+        else:
+            progress = (i - blend_start) / max(1, total - 1 - blend_start)
+            result.append({
+                "t": wp["t"],
+                "b": round(wp["b"] + offset["b"] * progress, 2),
+                "s": round(wp["s"] + offset["s"] * progress, 2),
+                "e": round(wp["e"] + offset["e"] * progress, 2),
+                "h": round(wp["h"] + offset["h"] * progress, 2),
+            })
+
+    return result
 
 # ============================================================
 # PLAYER
@@ -438,15 +482,17 @@ class RoArmPlayer:
     """
 
     def __init__(self, filepath: str, port: str = None, speed: float = 1.0,
-                 loop: bool = False, verify: bool = True):
+                 loop: bool = False, verify: bool = True, manual_offset: dict = None):
         self._filepath = filepath
         self._port = port
         self._speed = speed
         self._loop = loop
         self._verify = verify
+        self._manual_offset = manual_offset
         self._arm: RoArmConnection = None
         self._data = None
         self._precomputed_speeds = None
+        self._corrected_waypoints = None
 
     def connect(self) -> bool:
         port = self._port or find_arm_port()
@@ -480,18 +526,31 @@ class RoArmPlayer:
         print(f"   Dauer: {wps[-1]['t']:.2f}s (bei {self._speed}x → {wps[-1]['t']/self._speed:.2f}s)")
         print(f"   Gripper-Befehle: {len(self._data['gripper_cmds'])}")
 
-        # Geschwindigkeiten vorberechnen
+        # Offset bestimmen und anwenden
+        offset = self._manual_offset if self._manual_offset else self._data["offset"]
+        has_offset = any(abs(v) > 0.001 for v in offset.values())
+
+        if has_offset:
+            print(f"\n   📐 Offset-Korrektur aktiv:")
+            print(f"      Δb={offset['b']:+.3f}° Δs={offset['s']:+.3f}° "
+                  f"Δe={offset['e']:+.3f}° Δh={offset['h']:+.3f}°")
+            print(f"      Blend über letzte {OFFSET_BLEND_POINTS} Punkte")
+            self._corrected_waypoints = apply_offset_to_waypoints(wps, offset)
+        else:
+            self._corrected_waypoints = wps
+
+        # Geschwindigkeiten vorberechnen (auf korrigierten Waypoints)
         print(f"\n🧮 Berechne Lookahead-Geschwindigkeiten...")
-        self._precomputed_speeds = precompute_speeds(wps, self._speed)
-        
+        self._precomputed_speeds = precompute_speeds(self._corrected_waypoints, self._speed)
+
         # Statistik anzeigen
         spds = [s[0] for s in self._precomputed_speeds]
         print(f"   Speed-Bereich: {min(spds)} - {max(spds)} (Ø {sum(spds)/len(spds):.1f})")
-        
+
         # Zeige Brems-Zonen
         brake_zones = 0
         in_brake = False
-        for i, (spd, _) in enumerate(self._precomputed_speeds):
+        for spd, _ in self._precomputed_speeds:
             if spd < SPD_MAX * 0.4 and not in_brake:
                 brake_zones += 1
                 in_brake = True
@@ -499,9 +558,8 @@ class RoArmPlayer:
                 in_brake = False
         print(f"   Erkannte Brems-Zonen: {brake_zones}")
 
-        # Bewegungsbereich
         for j in ["b", "s", "e", "h"]:
-            vals = [wp[j] for wp in wps]
+            vals = [wp[j] for wp in self._corrected_waypoints]
             print(f"   {j}: {min(vals):.2f}° → {max(vals):.2f}° (Δ{max(vals)-min(vals):.2f}°)")
 
         return True
@@ -534,16 +592,16 @@ class RoArmPlayer:
                 else:
                     print(f"   ✅ OK")
 
-        # Zum ersten Wegpunkt
-        first_wp = self._data["waypoints"][0]
+        # Zum ersten Wegpunkt (korrigiert)
+        first_wp = self._corrected_waypoints[0]
         self._arm.move_to(first_wp["b"], first_wp["s"], first_wp["e"], first_wp["h"], spd=15, acc=8)
         time.sleep(1.0)
 
         return True
 
     def play_once(self):
-        """Spielt die Aufnahme einmal ab mit vorberechneten Lookahead-Geschwindigkeiten."""
-        wps = self._data["waypoints"]
+        """Spielt die Aufnahme einmal ab mit Offset-Korrektur und Precision-Endpunkt."""
+        wps = self._corrected_waypoints
         speeds = self._precomputed_speeds
         gripper_cmds = sorted(self._data["gripper_cmds"], key=lambda x: x["t"])
         gripper_idx = 0
@@ -608,7 +666,6 @@ class RoArmPlayer:
 
             # Live-Ausgabe mit Speed-Info
             elapsed = time.time() - playback_start
-            # Speed-Balken visualisieren
             bar_len = int((spd / SPD_MAX) * 20)
             bar = "█" * bar_len + "░" * (20 - bar_len)
 
@@ -622,14 +679,41 @@ class RoArmPlayer:
             )
             sys.stdout.flush()
 
-        # Letzten Punkt präzise anfahren
+        # ============================================================
+        # PRECISION ENDPOINT (Feature 2): Mehrfaches Nachsetzen
+        # ============================================================
         last_wp = wps[-1]
-        time.sleep(0.1)
-        self._arm.move_to(last_wp["b"], last_wp["s"], last_wp["e"], last_wp["h"], spd=8, acc=4)
-        time.sleep(0.8)
+        print(f"\n\n   🎯 Precision-Endpunkt ({ENDPOINT_SETTLE_PASSES} Passes):")
 
+        speeds_sequence = [
+            (8, 4),    # Pass 1: mittel
+            (5, 2),    # Pass 2: langsam
+            (ENDPOINT_FINAL_SPD, ENDPOINT_FINAL_ACC),  # Pass 3: sehr langsam
+        ]
+
+        for pass_num in range(ENDPOINT_SETTLE_PASSES):
+            spd, acc = speeds_sequence[min(pass_num, len(speeds_sequence) - 1)]
+
+            self._arm.move_to(last_wp["b"], last_wp["s"], last_wp["e"], last_wp["h"],
+                              spd=spd, acc=acc)
+            time.sleep(ENDPOINT_SETTLE_WAIT)
+
+            # Position prüfen
+            pos = self._arm.read_position_deg()
+            if pos:
+                err = max(abs(pos[j] - last_wp[j]) for j in ["b", "s", "e", "h"])
+                status = "✅" if err < 0.3 else "⚠️"
+                print(f"      Pass {pass_num + 1}: spd={spd} acc={acc} → "
+                      f"Fehler={err:.3f}° {status}")
+                if err < 0.15:
+                    print(f"      → Präzision erreicht, fertig")
+                    break
+            else:
+                print(f"      Pass {pass_num + 1}: spd={spd} acc={acc} → (kein Read)")
+
+        # Statistik
         actual_duration = time.time() - playback_start
-        print(f"\n\n   ⏱ Fertig!")
+        print(f"\n   ⏱ Fertig!")
         print(f"   Dauer: {actual_duration:.2f}s (Soll: {wps[-1]['t']/self._speed:.2f}s)")
         print(f"   Befehle gesendet: {commands_sent}/{total_wps}")
         print(f"   Übersprungen: {skipped}")
@@ -700,7 +784,7 @@ class RoArmPlayer:
 def main():
     global LOOKAHEAD_POINTS, SPD_MAX, SPD_MIN
     import argparse
-    p = argparse.ArgumentParser(description="RoArm-M2-S Play Mode - Lookahead Geschwindigkeitssteuerung")
+    p = argparse.ArgumentParser(description="RoArm-M2-S Play Mode - Precision Edition")
     p.add_argument("file", type=str, help=".roarm Datei zum Abspielen")
     p.add_argument("--port", type=str, default=None, help="Serieller Port (auto-detect)")
     p.add_argument("--speed", type=float, default=1.0,
@@ -715,12 +799,22 @@ def main():
                    help=f"Max Speed (default: {SPD_MAX})")
     p.add_argument("--spd-min", type=int, default=SPD_MIN,
                    help=f"Min Speed (default: {SPD_MIN})")
+    p.add_argument("--offset", type=str, default=None,
+                   help="Manueller Offset: 'b=0.5,s=-0.3,e=0.1,h=0.0'")
     args = p.parse_args()
 
-    # Globale Parameter überschreiben wenn angegeben
+    # Globale Parameter überschreiben
     LOOKAHEAD_POINTS = args.lookahead
     SPD_MAX = args.spd_max
     SPD_MIN = args.spd_min
+
+    # Manuellen Offset parsen
+    manual_offset = None
+    if args.offset:
+        manual_offset = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
+        for part in args.offset.split(","):
+            k, v = part.strip().split("=")
+            manual_offset[k.strip()] = float(v.strip())
 
     player = RoArmPlayer(
         filepath=args.file,
@@ -728,9 +822,13 @@ def main():
         speed=args.speed,
         loop=args.loop,
         verify=not args.no_verify,
+        manual_offset=manual_offset,
     )
     player.run()
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
