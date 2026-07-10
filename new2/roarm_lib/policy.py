@@ -1,17 +1,6 @@
 """
 Policy-Modul: Neuronales Netz das NUR Bounding Boxes sieht.
-
-Kernidee (Faserbündel-Analogie):
-- Die Basis-Mannigfaltigkeit ist der YOLO-BBox-Raum (Position/Größe der Objekte)
-- Die Faser darüber ist der Raum der nützlichen Bewegungen
-- Wenn die Position im Raum bekannt ist (via BBoxes), kann die gesamte
-  Bewegungs-Mannigfaltigkeit invariant transformiert werden
-- → Viel schnelleres Lernen weil keine irrelevanten Pixel-Daten
-
-Input: [bbox1_cx, bbox1_cy, bbox1_w, bbox1_h, bbox1_conf, ..., arm_state]
-Output: [action_chunk]
-
-Das NN sieht NIEMALS rohe Bilder — nur die abstrahierten BBox-Koordinaten.
+...
 """
 
 import json
@@ -20,6 +9,12 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
+HAS_TORCH = False
+nn = None
+optim = None
+Dataset = None
+DataLoader = None
+
 try:
     import torch
     import torch.nn as nn
@@ -27,8 +22,7 @@ try:
     from torch.utils.data import Dataset, DataLoader
     HAS_TORCH = True
 except ImportError:
-    HAS_TORCH = False
-
+    pass
 
 class BBoxObservation:
     """
@@ -117,129 +111,138 @@ class BBoxObservation:
         return vec
 
 
-class BBoxPolicy(nn.Module):
-    """
-    Policy-Netzwerk das NUR BBox-Koordinaten + Arm-State sieht.
-
-    Architektur:
-    - Input: [max_objects * (5 + num_classes) + 6] (BBoxes + Arm)
-    - Hidden: Transformer-Encoder (lernt Beziehungen zwischen Objekten)
-    - Output: Action-Chunk [chunk_size, 6]
-
-    Vorteile gegenüber Bild-basiertem Ansatz:
-    - Extrem kleiner Input (z.B. 81 statt 640*480*3 = 921600)
-    - Invariant gegenüber Textur, Beleuchtung, Hintergrund
-    - Lernt nur räumliche Beziehungen
-    - Trainiert in Minuten statt Stunden
-    """
-
-    def __init__(self, max_objects: int = 5, num_classes: int = 10,
-                 arm_state_dim: int = 6, action_dim: int = 6,
-                 chunk_size: int = 10, hidden_dim: int = 128,
-                 num_heads: int = 4, num_layers: int = 3):
-        super().__init__()
-
-        if not HAS_TORCH:
-            raise ImportError("PyTorch benötigt: pip install torch")
-
-        self.max_objects = max_objects
-        self.num_classes = num_classes
-        self.per_object_dim = 5 + num_classes
-        self.arm_state_dim = arm_state_dim
-        self.action_dim = action_dim
-        self.chunk_size = chunk_size
-        self.hidden_dim = hidden_dim
-
-        input_dim = max_objects * self.per_object_dim + arm_state_dim
-
-        # Encoder
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-        )
-
-        # Object-Attention (lernt welche Objekte relevant sind)
-        self.object_encoder = nn.Sequential(
-            nn.Linear(self.per_object_dim, hidden_dim),
-            nn.ReLU(),
-        )
-
-        self.arm_encoder = nn.Sequential(
-            nn.Linear(arm_state_dim, hidden_dim),
-            nn.ReLU(),
-        )
-
-        # Cross-Attention: Arm-State attended auf Objekte
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=0.1, batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Action-Chunk Decoder
-        self.pos_embed = nn.Parameter(torch.randn(1, chunk_size, hidden_dim) * 0.02)
-
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=hidden_dim, nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=0.1, batch_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
-
-        self.action_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-        )
-
-    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+if HAS_TORCH:
+    class BBoxPolicy(nn.Module):
         """
-        Args:
-            observation: [B, input_dim] — BBoxes + Arm-State
-
-        Returns:
-            actions: [B, chunk_size, action_dim]
+        Policy-Netzwerk das NUR BBox-Koordinaten + Arm-State sieht.
+        ...
         """
-        B = observation.shape[0]
+    class BBoxPolicy(nn.Module):
+        """
+        Policy-Netzwerk das NUR BBox-Koordinaten + Arm-State sieht.
 
-        # Split in Objekte und Arm-State
-        bbox_flat = observation[:, :self.max_objects * self.per_object_dim]
-        arm_state = observation[:, self.max_objects * self.per_object_dim:]
+        Architektur:
+        - Input: [max_objects * (5 + num_classes) + 6] (BBoxes + Arm)
+        - Hidden: Transformer-Encoder (lernt Beziehungen zwischen Objekten)
+        - Output: Action-Chunk [chunk_size, 6]
 
-        # Objekte einzeln kodieren
-        objects = bbox_flat.view(B, self.max_objects, self.per_object_dim)
-        obj_features = self.object_encoder(objects)  # [B, max_objects, hidden]
+        Vorteile gegenüber Bild-basiertem Ansatz:
+        - Extrem kleiner Input (z.B. 81 statt 640*480*3 = 921600)
+        - Invariant gegenüber Textur, Beleuchtung, Hintergrund
+        - Lernt nur räumliche Beziehungen
+        - Trainiert in Minuten statt Stunden
+        """
 
-        # Arm-State kodieren
-        arm_features = self.arm_encoder(arm_state).unsqueeze(1)  # [B, 1, hidden]
+        def __init__(self, max_objects: int = 5, num_classes: int = 10,
+                     arm_state_dim: int = 6, action_dim: int = 6,
+                     chunk_size: int = 10, hidden_dim: int = 128,
+                     num_heads: int = 4, num_layers: int = 3):
+            super().__init__()
 
-        # Zusammen als Sequenz für Transformer
-        sequence = torch.cat([arm_features, obj_features], dim=1)  # [B, 1+max_objects, hidden]
+            if not HAS_TORCH:
+                raise ImportError("PyTorch benötigt: pip install torch")
 
-        # Self-Attention (lernt Beziehungen)
-        encoded = self.transformer(sequence)  # [B, 1+max_objects, hidden]
+            self.max_objects = max_objects
+            self.num_classes = num_classes
+            self.per_object_dim = 5 + num_classes
+            self.arm_state_dim = arm_state_dim
+            self.action_dim = action_dim
+            self.chunk_size = chunk_size
+            self.hidden_dim = hidden_dim
 
-        # Memory für Decoder (alle encoded tokens)
-        memory = encoded
+            input_dim = max_objects * self.per_object_dim + arm_state_dim
 
-        # Action-Chunk dekodieren
-        query = self.pos_embed.expand(B, -1, -1)  # [B, chunk_size, hidden]
-        decoded = self.decoder(query, memory)  # [B, chunk_size, hidden]
+            # Encoder
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim),
+            )
 
-        actions = self.action_head(decoded)  # [B, chunk_size, action_dim]
-        return actions
+            # Object-Attention (lernt welche Objekte relevant sind)
+            self.object_encoder = nn.Sequential(
+                nn.Linear(self.per_object_dim, hidden_dim),
+                nn.ReLU(),
+            )
 
-    @torch.no_grad()
-    def predict(self, observation: np.ndarray) -> np.ndarray:
-        """Inference: Einzelne Observation → Action-Chunk."""
-        self.eval()
-        device = next(self.parameters()).device
-        obs_tensor = torch.from_numpy(observation).unsqueeze(0).to(device)
-        actions = self.forward(obs_tensor)
-        return actions.squeeze(0).cpu().numpy()
+            self.arm_encoder = nn.Sequential(
+                nn.Linear(arm_state_dim, hidden_dim),
+                nn.ReLU(),
+            )
 
+            # Cross-Attention: Arm-State attended auf Objekte
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=num_heads,
+                dim_feedforward=hidden_dim * 2,
+                dropout=0.1, batch_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+            # Action-Chunk Decoder
+            self.pos_embed = nn.Parameter(torch.randn(1, chunk_size, hidden_dim) * 0.02)
+
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=hidden_dim, nhead=num_heads,
+                dim_feedforward=hidden_dim * 2,
+                dropout=0.1, batch_first=True,
+            )
+            self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+
+            self.action_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim),
+            )
+
+        def forward(self, observation: torch.Tensor) -> torch.Tensor:
+            """
+            Args:
+                observation: [B, input_dim] — BBoxes + Arm-State
+
+            Returns:
+                actions: [B, chunk_size, action_dim]
+            """
+            B = observation.shape[0]
+
+            # Split in Objekte und Arm-State
+            bbox_flat = observation[:, :self.max_objects * self.per_object_dim]
+            arm_state = observation[:, self.max_objects * self.per_object_dim:]
+
+            # Objekte einzeln kodieren
+            objects = bbox_flat.view(B, self.max_objects, self.per_object_dim)
+            obj_features = self.object_encoder(objects)  # [B, max_objects, hidden]
+
+            # Arm-State kodieren
+            arm_features = self.arm_encoder(arm_state).unsqueeze(1)  # [B, 1, hidden]
+
+            # Zusammen als Sequenz für Transformer
+            sequence = torch.cat([arm_features, obj_features], dim=1)  # [B, 1+max_objects, hidden]
+
+            # Self-Attention (lernt Beziehungen)
+            encoded = self.transformer(sequence)  # [B, 1+max_objects, hidden]
+
+            # Memory für Decoder (alle encoded tokens)
+            memory = encoded
+
+            # Action-Chunk dekodieren
+            query = self.pos_embed.expand(B, -1, -1)  # [B, chunk_size, hidden]
+            decoded = self.decoder(query, memory)  # [B, chunk_size, hidden]
+
+            actions = self.action_head(decoded)  # [B, chunk_size, action_dim]
+            return actions
+
+        @torch.no_grad()
+        def predict(self, observation: np.ndarray) -> np.ndarray:
+            """Inference: Einzelne Observation → Action-Chunk."""
+            self.eval()
+            device = next(self.parameters()).device
+            obs_tensor = torch.from_numpy(observation).unsqueeze(0).to(device)
+            actions = self.forward(obs_tensor)
+            return actions.squeeze(0).cpu().numpy()
+else:
+    # Platzhalter wenn torch nicht installiert
+    BBoxPolicy = None
+    BBoxDataset = None
 
 class BBoxDataset(Dataset):
     """

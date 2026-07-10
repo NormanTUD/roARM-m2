@@ -9,7 +9,6 @@ from .vision import VisionSystem, Detection, BoundingBox
 from .dsl import DSLParser, DSLInterpreter, DSLRecorder
 from .recorder import SessionRecorder
 
-# Policy braucht torch — optional
 try:
     from .policy import BBoxPolicy, BBoxObservation, train_policy
 except ImportError:
