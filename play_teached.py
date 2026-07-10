@@ -120,17 +120,26 @@ def play(script_path: str, port: str = None, speed_override: float = None):
         parts = line.split()
         cmd = parts[0]
 
-        if cmd == "MOVE":
-            vals = {}
-            for p in parts[1:]:
-                k, v = p.split("=")
-                vals[k] = float(v)
-            actual_spd = max(0, int(spd * speed_scale)) if spd > 0 else 0
-            actual_acc = max(1, int(acc * speed_scale)) if acc > 0 else 0
-            arm.send({"T": 122, "b": vals.get("b", 0), "s": vals.get("s", 0),
-                      "e": vals.get("e", 90), "h": vals.get("h", 180),
-                      "spd": actual_spd, "acc": actual_acc})
-            time.sleep(0.1 / max(speed_scale, 0.1))
+    if cmd == "MOVE":
+        vals = {}
+        for p in parts[1:]:
+            k, v = p.split("=")
+            vals[k] = float(v)
+        
+        # Use recorded timestamp for pacing
+        if "t" in vals and hasattr(play, '_last_t'):
+            wait_time = (vals["t"] - play._last_t) / max(speed_scale, 0.1)
+            if wait_time > 0:
+                time.sleep(wait_time)
+        if "t" in vals:
+            play._last_t = vals["t"]
+        
+        actual_spd = max(0, int(spd * speed_scale)) if spd > 0 else 0
+        actual_acc = max(1, int(acc * speed_scale)) if acc > 0 else 0
+        arm.send({"T": 122, "b": vals.get("b", 0), "s": vals.get("s", 0),
+                  "e": vals.get("e", 90), "h": vals.get("h", 180),
+                  "spd": actual_spd, "acc": actual_acc})
+
 
         elif cmd == "GRIPPER":
             action = parts[1] if len(parts) > 1 else "OPEN"

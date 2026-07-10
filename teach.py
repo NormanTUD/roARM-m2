@@ -249,7 +249,9 @@ class TeachRecorder:
         pos = self._get_arm_position()
         if pos is None:
             return
-        self._commands.append(f"MOVE b={pos['b']} s={pos['s']} e={pos['e']} h={pos['h']}")
+        # Record time since recording started
+        elapsed = time.time() - self._rec_start_time
+        self._commands.append(f"MOVE b={pos['b']} s={pos['s']} e={pos['e']} h={pos['h']} t={elapsed:.3f}")
         if frame is not None:
             fn = self._save_frame(frame)
             if fn:
@@ -279,6 +281,8 @@ class TeachRecorder:
         self._running = True
         last_rec = 0
         interval = 1.0 / self.POLL_HZ
+
+        last_key_time = 0
 
         try:
             while self._running:
@@ -316,7 +320,9 @@ class TeachRecorder:
                     self._running = False
                 elif key == ord('r'):
                     if not self._recording:
-                        self._create_session()
+                        # Guard against repeated triggers
+                        if self._session_dir is None or not self._recording:
+                            self._create_session()
                         self._recording = True
                         last_rec = time.time()
                         print("  ● AUFNAHME GESTARTET")
@@ -324,6 +330,7 @@ class TeachRecorder:
                         self._recording = False
                         self._save_script()
                         print("  ■ AUFNAHME GESTOPPT")
+                        self._session_dir = None  # Reset so next R creates fresh session
                 elif key == ord(' '):
                     if self._recording:
                         self._record_waypoint(frame)
