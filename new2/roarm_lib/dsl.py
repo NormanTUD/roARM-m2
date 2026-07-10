@@ -593,35 +593,45 @@ class DSLRecorder:
         lines.append("# Hauptsequenz")
         prev_time = None
         prev_state = None
+        accumulated_wait = 0.0  # Accumulate time between actual moves
 
         for frame in frames:
             state = frame["state"]
             action = frame["action"]
             ts = frame["timestamp"]
 
-            # Wait einfügen — IMMER die tatsächliche Zeit zwischen Frames
+            # Accumulate time since last event
             if prev_time:
-                wait_time = round(ts - prev_time, 3)
-                if wait_time > 0.005:  # Nur wenn > 5ms (filter noise)
-                    lines.append(f"wait {wait_time}")
+                accumulated_wait += (ts - prev_time)
 
-            # Nur move wenn sich was geändert hat
+            # Only emit move when state actually changed
             if prev_state is None or self._state_changed(prev_state, state):
+                # Emit accumulated wait BEFORE the move (skip for first move)
+                if prev_state is not None and accumulated_wait > 0.005:
+                    lines.append(f"wait {round(accumulated_wait, 3)}")
+                accumulated_wait = 0.0
+
                 move_parts = []
                 move_parts.append(f"base={state.base_deg:.0f}")
                 move_parts.append(f"shoulder={state.shoulder_deg:.0f}")
                 move_parts.append(f"elbow={state.elbow_deg:.0f}")
                 move_parts.append(f"hand={state.hand_deg:.0f}")
                 lines.append(f"move {' '.join(move_parts)}")
+                prev_state = state
 
-            # Gripper
+            # Gripper (always emit immediately)
             if action == "gripper_open":
+                if accumulated_wait > 0.005:
+                    lines.append(f"wait {round(accumulated_wait, 3)}")
+                    accumulated_wait = 0.0
                 lines.append("gripper open")
             elif action == "gripper_close":
+                if accumulated_wait > 0.005:
+                    lines.append(f"wait {round(accumulated_wait, 3)}")
+                    accumulated_wait = 0.0
                 lines.append("gripper close")
 
             prev_time = ts
-            prev_state = state
 
         with open(filename, 'w') as f:
             f.write('\n'.join(lines) + '\n')
@@ -637,18 +647,20 @@ class DSLRecorder:
 
         prev_state = None
         prev_time = None
+        accumulated_wait = 0.0
 
         for frame in frames:
             state = frame["state"]
             ts = frame["timestamp"]
 
-            # Wait einfügen — tatsächliche Zeit
             if prev_time:
-                wait_time = round(ts - prev_time, 3)
-                if wait_time > 0.005:
-                    lines.append(f"  wait {wait_time}")
+                accumulated_wait += (ts - prev_time)
 
             if prev_state is None or self._state_changed(prev_state, state):
+                if prev_state is not None and accumulated_wait > 0.005:
+                    lines.append(f"  wait {round(accumulated_wait, 3)}")
+                accumulated_wait = 0.0
+
                 move_parts = []
                 move_parts.append(f"base={state.base_deg:.0f}")
                 move_parts.append(f"shoulder={state.shoulder_deg:.0f}")
@@ -656,13 +668,19 @@ class DSLRecorder:
                 move_parts.append(f"hand={state.hand_deg:.0f}")
                 move_parts.append("speed=$speed")
                 lines.append(f"  move {' '.join(move_parts)}")
+                prev_state = state
 
             if frame["action"] == "gripper_open":
+                if accumulated_wait > 0.005:
+                    lines.append(f"  wait {round(accumulated_wait, 3)}")
+                    accumulated_wait = 0.0
                 lines.append("  gripper open")
             elif frame["action"] == "gripper_close":
+                if accumulated_wait > 0.005:
+                    lines.append(f"  wait {round(accumulated_wait, 3)}")
+                    accumulated_wait = 0.0
                 lines.append("  gripper close")
 
-            prev_state = state
             prev_time = ts
 
         return '\n'.join(lines)
