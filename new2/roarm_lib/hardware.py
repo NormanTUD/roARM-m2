@@ -117,7 +117,11 @@ class RoArmHardware:
             return lines
 
     def send_nowait(self, command: dict):
-        """Sendet ohne zu warten (für Echtzeit-Steuerung)."""
+        """
+        Sendet ohne zu warten (für Echtzeit-Steuerung).
+        Non-blocking lock — skips if busy to avoid stalling control loop.
+        Drains input buffer to prevent overflow.
+        """
         acquired = self._lock.acquire(blocking=False)
         if not acquired:
             return
@@ -131,7 +135,7 @@ class RoArmHardware:
             self._lock.release()
 
     def move_joints(self, state: ArmState, spd: int = 50, acc: int = 100):
-        """Bewegt alle Gelenke gleichzeitig."""
+        """Bewegt alle Gelenke gleichzeitig (non-blocking)."""
         self.send_nowait({
             "T": 122,
             "b": round(state.base_deg, 1),
@@ -142,15 +146,19 @@ class RoArmHardware:
         })
 
     def gripper_open(self):
-        self.send({"T": 106, "cmd": 1.08, "spd": 0, "acc": 0}, 0.5)
+        """Non-blocking gripper open."""
+        self.send_nowait({"T": 106, "cmd": 1.08, "spd": 0, "acc": 0})
 
     def gripper_close(self):
-        self.send({"T": 106, "cmd": 3.14, "spd": 0, "acc": 0}, 0.5)
+        """Non-blocking gripper close."""
+        self.send_nowait({"T": 106, "cmd": 3.14, "spd": 0, "acc": 0})
 
     def set_led(self, brightness: int):
-        self.send({"T": 114, "led": brightness}, 0.1)
+        """Non-blocking LED set."""
+        self.send_nowait({"T": 114, "led": brightness})
 
     def park(self):
+        """Blocking park (used at shutdown)."""
         self.send({"T": 122, "b": 0, "s": 0, "e": 90, "h": 180, "spd": 15, "acc": 10}, 2.0)
 
     def disconnect(self):
@@ -162,3 +170,4 @@ class RoArmHardware:
 
     def __exit__(self, *args):
         self.disconnect()
+
