@@ -143,7 +143,7 @@ class RoArmDirect:
 
 
 class TeachRecorder:
-    POLL_HZ = 10
+    POLL_HZ = 50
 
     def __init__(self, port=None, camera_index=2, output_dir="teach_recordings",
                  continuous=True, wait_seconds=1.0, move_threshold=1.5):
@@ -543,10 +543,10 @@ def main():
     p.add_argument("--camera", type=int, default=2)
     p.add_argument("--output", type=str, default="teach_recordings")
     p.add_argument("--manual", action="store_true")
-    p.add_argument("--hz", type=int, default=10)
+    p.add_argument("--hz", type=int, default=50)  # Changed from 10
     p.add_argument("--wait", type=float, default=1.0)
-    p.add_argument("--threshold", type=float, default=1.5,
-                   help="Movement threshold in degrees (default: 1.5)")
+    p.add_argument("--threshold", type=float, default=0.3,
+               help="Movement threshold in degrees (default: 0.3)")  # Lower threshold
     args = p.parse_args()
 
     rec = TeachRecorder(port=args.port, camera_index=args.camera,
