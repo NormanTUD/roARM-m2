@@ -2,16 +2,19 @@
 """calibrate.py - RoArm-M2-S Kinematisches Kalibrierungsmodell
 
 Workflow:
-1. Roboter fährt N vordefinierte Posen an
-2. Wartet bis Arm stillsteht (aktives Polling)
-3. Misst Servo-Feedback (oder User misst manuell)
-4. Modell wird gefittet: Soll → Korrektur
-5. Kalibrierungsdatei + Diagnostik wird gespeichert
+1. Roboter fährt N vordefinierte Posen an (mehrfach, parametrisierbar)
+2. Zwischen jeder Pose fährt er in eine sichere UP-Position (Kollisionsvermeidung)
+3. Wartet bis Arm stillsteht (aktives Polling)
+4. Misst Servo-Feedback (oder User misst manuell)
+5. Modell wird gefittet: Soll → Korrektur
+6. Kalibrierungsdatei + Diagnostik wird gespeichert
 
 Flags:
   --auto         Akzeptiert Servo-Werte automatisch (kein User-Input)
   --no-identify  Überspringt Gelenk-Identifikation
   --port PORT    Serieller Port (sonst auto-detect)
+  --repeats N    Wie oft jede Pose angefahren wird (default: 3)
+  --pose-set     Welches Posen-Set: 'standard', 'extended', 'minimal'
 """
 # /// script
 # requires-python = ">=3.10"
@@ -56,20 +59,115 @@ import threading
 BAUDRATE = 115200
 JOINTS = ["b", "s", "e"]
 
-CALIBRATION_POSES = [
+# --- SAFE UP POSITION ---
+# Diese Position wird zwischen JEDER Pose angefahren.
+# Muss so gewählt sein, dass der Arm über allen Hindernissen auf dem Schreibtisch ist.
+# s=0 und e=90 = Arm zeigt gerade nach oben/vorne, weit weg vom Tisch.
+SAFE_UP_POSITION = {
+    "b": 0.0,
+    "s": 0.0,
+    "e": 90.0,
+    "h": 180.0,
+}
+
+# Geschwindigkeit für Safe-Up Bewegung
+SAFE_UP_SPD = 25
+SAFE_UP_ACC = 12
+
+# --- MEHRFACH-MESSUNGEN ---
+# Jede Pose wird REPEATS_PER_POSE mal angefahren (immer über UP-Position).
+# Mehr Wiederholungen = bessere Kalibrierung (Repeatability wird gemittelt).
+REPEATS_PER_POSE = 3
+
+# --- POSEN-SETS ---
+# Erweitert: Mehr Posen in allen Richtungen, aber NUR sichere Bereiche
+# (kein ganz nach unten wo Boden/Widerstand ist)
+
+# Grenzen des sicheren Arbeitsraums (parametrisiert)
+SAFE_LIMITS = {
+    "b_min": -90.0,   # Base links max
+    "b_max": 90.0,    # Base rechts max
+    "s_min": -15.0,   # Shoulder runter (NICHT weiter, da Tisch!)
+    "s_max": 45.0,    # Shoulder hoch
+    "e_min": 30.0,    # Ellbogen eng (NICHT weiter, Kollision!)
+    "e_max": 150.0,   # Ellbogen weit
+}
+
+# Minimales Set (schnell, 8 Posen)
+CALIBRATION_POSES_MINIMAL = [
     {"b": 0.0,   "s": 0.0,   "e": 90.0,  "h": 180.0},   # Home
     {"b": -45.0, "s": 0.0,   "e": 90.0,  "h": 180.0},   # Links
     {"b": 45.0,  "s": 0.0,   "e": 90.0,  "h": 180.0},   # Rechts
     {"b": 0.0,   "s": 30.0,  "e": 90.0,  "h": 180.0},   # Schulter hoch
-    {"b": 0.0,   "s": -20.0, "e": 90.0,  "h": 180.0},   # Schulter runter
-    {"b": 0.0,   "s": 0.0,   "e": 45.0,  "h": 180.0},   # Ellbogen eng
+    {"b": 0.0,   "s": -10.0, "e": 90.0,  "h": 180.0},   # Schulter leicht runter
+    {"b": 0.0,   "s": 0.0,   "e": 50.0,  "h": 180.0},   # Ellbogen eng
+    {"b": 0.0,   "s": 0.0,   "e": 130.0, "h": 180.0},   # Ellbogen weit
+    {"b": -30.0, "s": 20.0,  "e": 60.0,  "h": 180.0},   # Kombi
+]
+
+# Standard-Set (12 Posen, wie bisher)
+CALIBRATION_POSES_STANDARD = [
+    {"b": 0.0,   "s": 0.0,   "e": 90.0,  "h": 180.0},   # Home
+    {"b": -45.0, "s": 0.0,   "e": 90.0,  "h": 180.0},   # Links
+    {"b": 45.0,  "s": 0.0,   "e": 90.0,  "h": 180.0},   # Rechts
+    {"b": 0.0,   "s": 30.0,  "e": 90.0,  "h": 180.0},   # Schulter hoch
+    {"b": 0.0,   "s": -10.0, "e": 90.0,  "h": 180.0},   # Schulter runter (sicher)
+    {"b": 0.0,   "s": 0.0,   "e": 50.0,  "h": 180.0},   # Ellbogen eng
     {"b": 0.0,   "s": 0.0,   "e": 135.0, "h": 180.0},   # Ellbogen weit
     {"b": -30.0, "s": 20.0,  "e": 60.0,  "h": 180.0},   # Kombi 1
     {"b": 30.0,  "s": 20.0,  "e": 60.0,  "h": 180.0},   # Kombi 2
-    {"b": -30.0, "s": -10.0, "e": 120.0, "h": 180.0},   # Kombi 3
-    {"b": 30.0,  "s": -10.0, "e": 120.0, "h": 180.0},   # Kombi 4
+    {"b": -30.0, "s": -5.0,  "e": 120.0, "h": 180.0},   # Kombi 3
+    {"b": 30.0,  "s": -5.0,  "e": 120.0, "h": 180.0},   # Kombi 4
     {"b": 0.0,   "s": 15.0,  "e": 70.0,  "h": 180.0},   # Zentrum
 ]
+
+# Erweitertes Set (24 Posen, bessere Abdeckung des Arbeitsraums)
+CALIBRATION_POSES_EXTENDED = [
+    # === Boden-Berührung (links, mitte, rechts) ===
+    {"b": -90.0, "s": -15.0, "e": 30.0,  "h": 180.0},   # Ganz links, Boden
+    {"b": 0.0,   "s": -15.0, "e": 30.0,  "h": 180.0},   # Exakt Mitte, Boden
+    {"b": 90.0,  "s": -15.0, "e": 30.0,  "h": 180.0},   # Ganz rechts, Boden
+
+    # === Einzelachsen-Sweeps ===
+    # Base sweep (Schulter/Ellbogen neutral)
+    {"b": -90.0, "s": 0.0,   "e": 90.0,  "h": 180.0},   # Base ganz links
+    {"b": -60.0, "s": 0.0,   "e": 90.0,  "h": 180.0},   # Base links
+    {"b": -30.0, "s": 0.0,   "e": 90.0,  "h": 180.0},   # Base leicht links
+    {"b": 0.0,   "s": 0.0,   "e": 90.0,  "h": 180.0},   # Home
+    {"b": 30.0,  "s": 0.0,   "e": 90.0,  "h": 180.0},   # Base leicht rechts
+    {"b": 60.0,  "s": 0.0,   "e": 90.0,  "h": 180.0},   # Base rechts
+    {"b": 90.0,  "s": 0.0,   "e": 90.0,  "h": 180.0},   # Base ganz rechts
+
+    # Shoulder sweep (Base/Ellbogen neutral)
+    {"b": 0.0,   "s": -10.0, "e": 90.0,  "h": 180.0},   # Schulter leicht runter
+    {"b": 0.0,   "s": 15.0,  "e": 90.0,  "h": 180.0},   # Schulter mittel
+    {"b": 0.0,   "s": 30.0,  "e": 90.0,  "h": 180.0},   # Schulter hoch
+    {"b": 0.0,   "s": 45.0,  "e": 90.0,  "h": 180.0},   # Schulter ganz hoch
+
+    # Elbow sweep (Base/Schulter neutral)
+    {"b": 0.0,   "s": 0.0,   "e": 40.0,  "h": 180.0},   # Ellbogen sehr eng
+    {"b": 0.0,   "s": 0.0,   "e": 65.0,  "h": 180.0},   # Ellbogen eng
+    {"b": 0.0,   "s": 0.0,   "e": 115.0, "h": 180.0},   # Ellbogen weit
+    {"b": 0.0,   "s": 0.0,   "e": 140.0, "h": 180.0},   # Ellbogen sehr weit
+
+    # === Kombinationen (Multi-Achsen) ===
+    {"b": -45.0, "s": 25.0,  "e": 60.0,  "h": 180.0},   # Links-Hoch-Eng
+    {"b": 45.0,  "s": 25.0,  "e": 60.0,  "h": 180.0},   # Rechts-Hoch-Eng
+    {"b": -45.0, "s": 25.0,  "e": 120.0, "h": 180.0},   # Links-Hoch-Weit
+    {"b": 45.0,  "s": 25.0,  "e": 120.0, "h": 180.0},   # Rechts-Hoch-Weit
+    {"b": -45.0, "s": -5.0,  "e": 70.0,  "h": 180.0},   # Links-Runter-Eng
+    {"b": 45.0,  "s": -5.0,  "e": 70.0,  "h": 180.0},   # Rechts-Runter-Eng
+    {"b": -60.0, "s": 15.0,  "e": 80.0,  "h": 180.0},   # Weit-Links-Mittel
+    {"b": 60.0,  "s": 15.0,  "e": 80.0,  "h": 180.0},   # Weit-Rechts-Mittel
+    {"b": 0.0,   "s": 35.0,  "e": 50.0,  "h": 180.0},   # Zentrum-Hoch-Eng
+]
+
+# Mapping für CLI
+POSE_SETS = {
+    "minimal": CALIBRATION_POSES_MINIMAL,
+    "standard": CALIBRATION_POSES_STANDARD,
+    "extended": CALIBRATION_POSES_EXTENDED,
+}
 
 
 # ============================================================
@@ -343,6 +441,83 @@ class RoArmConnection:
 
 
 # ============================================================
+# SAFE-UP BEWEGUNG (Kollisionsvermeidung)
+# ============================================================
+
+def move_to_safe_up(arm: RoArmConnection, current_pose: dict = None):
+    """
+    Fährt den Arm in die sichere UP-Position.
+    
+    Strategie:
+    1. Zuerst Ellbogen auf 90° (Arm nach oben klappen)
+    2. Dann Schulter auf 0° (Arm gerade)
+    3. Dann Base auf 0° (Drehung zur Mitte)
+    
+    So wird vermieden, dass der Arm beim Drehen irgendwo anstößt.
+    """
+    up = SAFE_UP_POSITION
+
+    if current_pose:
+        # Schritt 1: Ellbogen sicher hochklappen (wichtigste Achse zuerst!)
+        arm.move_to(
+            current_pose["b"], current_pose["s"], up["e"], up["h"],
+            spd=SAFE_UP_SPD, acc=SAFE_UP_ACC
+        )
+        arm.wait_until_settled(tolerance_deg=1.5, stable_count=3, timeout=8.0)
+
+        # Schritt 2: Schulter in sichere Position
+        arm.move_to(
+            current_pose["b"], up["s"], up["e"], up["h"],
+            spd=SAFE_UP_SPD, acc=SAFE_UP_ACC
+        )
+        arm.wait_until_settled(tolerance_deg=1.5, stable_count=3, timeout=8.0)
+
+        # Schritt 3: Base zur Mitte
+        arm.move_to(
+            up["b"], up["s"], up["e"], up["h"],
+            spd=SAFE_UP_SPD, acc=SAFE_UP_ACC
+        )
+        arm.wait_until_settled(tolerance_deg=1.0, stable_count=3, timeout=8.0)
+    else:
+        # Direkt zur UP-Position (wenn keine aktuelle Pose bekannt)
+        arm.move_to(up["b"], up["s"], up["e"], up["h"], spd=SAFE_UP_SPD, acc=SAFE_UP_ACC)
+        arm.wait_until_settled(tolerance_deg=1.0, stable_count=4, timeout=10.0)
+
+
+def move_from_safe_up_to_pose(arm: RoArmConnection, target_pose: dict):
+    """
+    Fährt von der UP-Position sicher zur Zielpose.
+    
+    Strategie (umgekehrt):
+    1. Base drehen (Arm ist oben, kann frei drehen)
+    2. Schulter einstellen
+    3. Ellbogen zum Ziel (letztes, da am nächsten an Hindernissen)
+    """
+    up = SAFE_UP_POSITION
+
+    # Schritt 1: Base zum Ziel drehen (Arm ist oben = sicher)
+    arm.move_to(
+        target_pose["b"], up["s"], up["e"], up["h"],
+        spd=SAFE_UP_SPD, acc=SAFE_UP_ACC
+    )
+    arm.wait_until_settled(tolerance_deg=1.5, stable_count=3, timeout=8.0)
+
+    # Schritt 2: Schulter einstellen
+    arm.move_to(
+        target_pose["b"], target_pose["s"], up["e"], up["h"],
+        spd=SAFE_UP_SPD, acc=SAFE_UP_ACC
+    )
+    arm.wait_until_settled(tolerance_deg=1.5, stable_count=3, timeout=8.0)
+
+    # Schritt 3: Ellbogen zum Ziel (langsamer, da potenziell nah an Hindernissen)
+    arm.move_to(
+        target_pose["b"], target_pose["s"], target_pose["e"], target_pose["h"],
+        spd=15, acc=8
+    )
+    arm.wait_until_settled(tolerance_deg=1.0, stable_count=3, timeout=8.0)
+
+
+# ============================================================
 # GELENK-IDENTIFIKATION
 # ============================================================
 
@@ -397,17 +572,57 @@ def identify_joint(arm, joint: str, current_pose: dict):
 
 
 # ============================================================
+# POSE-VALIDIERUNG
+# ============================================================
+
+def validate_pose(pose: dict) -> bool:
+    """
+    Prüft ob eine Pose innerhalb der sicheren Grenzen liegt.
+    Gibt True zurück wenn sicher, False wenn außerhalb.
+    """
+    if pose["b"] < SAFE_LIMITS["b_min"] or pose["b"] > SAFE_LIMITS["b_max"]:
+        return False
+    if pose["s"] < SAFE_LIMITS["s_min"] or pose["s"] > SAFE_LIMITS["s_max"]:
+        return False
+    if pose["e"] < SAFE_LIMITS["e_min"] or pose["e"] > SAFE_LIMITS["e_max"]:
+        return False
+    return True
+
+
+# ============================================================
 # KALIBRIERUNGS-WORKFLOW
 # ============================================================
 
-def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
-                    skip_identify: bool = False):
+def run_calibration(arm, poses=None, auto_accept: bool = False,
+                    skip_identify: bool = False, repeats: int = REPEATS_PER_POSE,
+                    pose_set_name: str = "standard"):
     """
-    Kalibrierungs-Workflow.
+    Kalibrierungs-Workflow mit:
+    - Mehrfach-Messungen pro Pose (parametrisierbar)
+    - Safe-UP zwischen jeder Pose (Kollisionsvermeidung)
+    - Erweitertes Posen-Set
     
     auto_accept: True = Servo-Werte automatisch akzeptieren (kein User-Input)
     skip_identify: True = Gelenk-Identifikation überspringen
+    repeats: Wie oft jede Pose angefahren wird
+    pose_set_name: 'minimal', 'standard', 'extended'
     """
+    if poses is None:
+        poses = POSE_SETS.get(pose_set_name, CALIBRATION_POSES_STANDARD)
+
+    # Posen validieren
+    valid_poses = []
+    for i, pose in enumerate(poses):
+        if validate_pose(pose):
+            valid_poses.append(pose)
+        else:
+            print(f"  ⚠️  Pose {i+1} übersprungen (außerhalb sicherer Grenzen): "
+                  f"b={pose['b']:.1f}° s={pose['s']:.1f}° e={pose['e']:.1f}°")
+    poses = valid_poses
+
+    if len(poses) < 10:
+        print(f"  ⚠️  Nur {len(poses)} gültige Posen! Mindestens 10 empfohlen für guten Fit.")
+
     commanded = []
     errors = []
     diagnostics = {
@@ -415,19 +630,31 @@ def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
         "overshoot_deg": [],
         "noise_std_deg": [],
         "per_pose": [],
+        "repeats_per_pose": repeats,
+        "pose_set": pose_set_name,
+        "total_measurements": 0,
+        "repeatability_per_pose": [],
     }
 
+    total_measurements = len(poses) * repeats
+
     print(f"\n{'='*60}")
-    print(f"  KALIBRIERUNG - {len(poses)} Posen")
+    print(f"  KALIBRIERUNG - {len(poses)} Posen × {repeats} Wiederholungen = {total_measurements} Messungen")
     print(f"  Kalibriert: b (Base), s (Shoulder), e (Elbow)")
     print(f"  Modus: {'AUTO (Servo-Werte)' if auto_accept else 'MANUELL (User misst)'}")
+    print(f"  Posen-Set: {pose_set_name}")
+    print(f"  Safe-UP Position: b={SAFE_UP_POSITION['b']:.0f}° s={SAFE_UP_POSITION['s']:.0f}° "
+          f"e={SAFE_UP_POSITION['e']:.0f}°")
     print(f"{'='*60}")
 
     if not auto_accept:
-        print(f"\n  Ablauf pro Pose:")
-        print(f"  1. Arm fährt zur Soll-Position (wartet bis stillsteht)")
-        print(f"  2. Du misst den tatsächlichen Winkel (b, s, e)")
-        print(f"  3. Eingabe (oder ENTER = Servo-Wert übernehmen)")
+        print(f"\n  Ablauf pro Messung:")
+        print(f"  1. Arm fährt zur SAFE-UP Position (über Hindernisse)")
+        print(f"  2. Arm fährt zur Soll-Position (sicher von oben)")
+        print(f"  3. Wartet bis Arm stillsteht")
+        print(f"  4. Misst Servo-Feedback")
+        print(f"  5. Zurück zu SAFE-UP")
+        print(f"\n  Jede Pose wird {repeats}× angefahren für bessere Statistik.")
         print(f"\n  Tipp: [w] = Gelenk wackeln lassen")
 
     if not skip_identify and not auto_accept:
@@ -445,136 +672,198 @@ def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
 
     joints_identified = False
     total_start = time.time()
+    measurement_count = 0
 
+    # === Zuerst zur Safe-UP Position fahren ===
+    print(f"\n  🏠 Fahre zur Safe-UP Position...")
+    arm.torque_on()
+    time.sleep(0.2)
+    move_to_safe_up(arm, current_pose=None)
+    print(f"  ✅ Safe-UP erreicht")
+
+    # === Hauptschleife: Jede Pose × Wiederholungen ===
     for i, pose in enumerate(poses):
-        print(f"\n{'─'*60}")
-        print(f"  Pose {i+1}/{len(poses)}")
-        print(f"  Soll: b={pose['b']:.1f}° s={pose['s']:.1f}° e={pose['e']:.1f}°")
+        pose_measurements = []  # Alle Messungen für diese Pose
 
-        # Arm hinfahren
-        arm.torque_on()
-        time.sleep(0.1)
+        for rep in range(repeats):
+            measurement_count += 1
 
-        # Schnell in die Nähe
-        move_start = time.time()
-        arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=20, acc=10)
-        print(f"  ⏳ Fahre zur Position...", end="", flush=True)
-        result_fast = arm.wait_until_settled(tolerance_deg=1.0, stable_count=3)
-        print(f" grob da ({result_fast['settle_time_s']:.1f}s)", flush=True)
+            print(f"\n{'─'*60}")
+            print(f"  Pose {i+1}/{len(poses)} | Wiederholung {rep+1}/{repeats} "
+                  f"| Messung {measurement_count}/{total_measurements}")
+            print(f"  Soll: b={pose['b']:.1f}° s={pose['s']:.1f}° e={pose['e']:.1f}°")
 
-        # Langsam und präzise nachfahren
-        arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
-        print(f"  ⏳ Präzisions-Nachfahrt...", end="", flush=True)
-        result_precise = arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
-        total_settle = time.time() - move_start
-        timed_out = result_precise.get("timeout", False)
-        print(f" {'⚠️ TIMEOUT' if timed_out else '✅ still'} ({total_settle:.1f}s)", flush=True)
+            # --- SCHRITT 1: Safe-UP (falls nicht schon dort) ---
+            if rep > 0 or i > 0:
+                print(f"  ⬆️  Fahre zu Safe-UP...", end="", flush=True)
+                # Aktuelle Position lesen für sichere Rückfahrt
+                current = arm.read_position_deg()
+                if current:
+                    move_to_safe_up(arm, current_pose=current)
+                else:
+                    move_to_safe_up(arm, current_pose=None)
+                print(f" ✅")
 
-        diagnostics["settle_times_s"].append(total_settle)
+            # --- SCHRITT 2: Von Safe-UP zur Zielpose ---
+            print(f"  ⬇️  Fahre zur Pose...", end="", flush=True)
+            move_start = time.time()
+            move_from_safe_up_to_pose(arm, pose)
+            print(f" angekommen", flush=True)
 
-        # Overshoot berechnen (max Abweichung während Bewegung vs. Endposition)
-        if result_precise["readings"] and result_precise["pos"]:
-            final = result_precise["pos"]
-            max_overshoot = 0.0
-            for reading in result_precise["readings"]:
-                for j in JOINTS:
-                    overshoot = abs(reading[j] - final[j])
-                    max_overshoot = max(max_overshoot, overshoot)
-            diagnostics["overshoot_deg"].append(round(max_overshoot, 3))
-        else:
-            diagnostics["overshoot_deg"].append(0.0)
-
-        # Gelenk-Identifikation (nur bei erster Pose, nur wenn gewünscht)
-        if show_joints and not joints_identified:
-            print(f"\n  🔍 GELENK-IDENTIFIKATION:")
-            input(f"     [ENTER] um zu starten...")
-            for joint in ["b", "s", "e", "h"]:
-                identify_joint(arm, joint, pose)
-                time.sleep(0.3)
-            joints_identified = True
-            print(f"\n  ✅ Alle Gelenke identifiziert!")
-
-            # Nochmal zur Pose fahren
-            arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=10, acc=5)
-            arm.wait_until_settled()
+            # --- SCHRITT 3: Präzisions-Nachfahrt ---
             arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
-            arm.wait_until_settled()
+            print(f"  ⏳ Präzisions-Nachfahrt...", end="", flush=True)
+            result_precise = arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
+            total_settle = time.time() - move_start
+            timed_out = result_precise.get("timeout", False)
+            print(f" {'⚠️ TIMEOUT' if timed_out else '✅ still'} ({total_settle:.1f}s)", flush=True)
 
-        # Position auslesen (gemittelt, Arm steht garantiert still)
-        servo_avg = arm.read_position_averaged(n=10, interval=0.05)
-        if servo_avg:
-            print(f"  📊 Servo (Mittel ×{servo_avg['n_samples']}): "
-                  f"b={servo_avg['b']:.3f}° s={servo_avg['s']:.3f}° e={servo_avg['e']:.3f}°")
-            print(f"     Rauschen (σ): "
-                  f"b={servo_avg['b_std']:.4f}° s={servo_avg['s_std']:.4f}° e={servo_avg['e_std']:.4f}°")
-            diagnostics["noise_std_deg"].append({
-                "b": servo_avg["b_std"],
-                "s": servo_avg["s_std"],
-                "e": servo_avg["e_std"],
-            })
-        else:
-            servo_avg = {"b": pose["b"], "s": pose["s"], "e": pose["e"], "h": pose["h"],
-                         "b_std": 0, "s_std": 0, "e_std": 0}
-            print(f"  ⚠️ Konnte Position nicht lesen, verwende Soll-Werte")
-            diagnostics["noise_std_deg"].append({"b": 0, "s": 0, "e": 0})
+            diagnostics["settle_times_s"].append(total_settle)
 
-        # Messung: Auto oder Manuell
-        if auto_accept:
-            measured = {j: servo_avg[j] for j in JOINTS}
-        else:
-            print(f"\n  Miss jetzt die TATSÄCHLICHEN Winkel (nur b, s, e).")
-            print(f"  (Leer = Servo-Wert | [w] = Gelenk wackeln)")
+            # Overshoot berechnen
+            if result_precise["readings"] and result_precise["pos"]:
+                final = result_precise["pos"]
+                max_overshoot = 0.0
+                for reading in result_precise["readings"]:
+                    for j in JOINTS:
+                        overshoot = abs(reading[j] - final[j])
+                        max_overshoot = max(max_overshoot, overshoot)
+                diagnostics["overshoot_deg"].append(round(max_overshoot, 3))
+            else:
+                diagnostics["overshoot_deg"].append(0.0)
 
-            measured = {}
-            for joint in JOINTS:
-                joint_names = {
-                    "b": "BASE (Drehung links/rechts)",
-                    "s": "SHOULDER (Schulter hoch/runter)",
-                    "e": "ELBOW (Ellbogen auf/zu)",
-                }
-                default = servo_avg[joint]
+            # Gelenk-Identifikation (nur bei allererster Messung)
+            if show_joints and not joints_identified and i == 0 and rep == 0:
+                print(f"\n  🔍 GELENK-IDENTIFIKATION:")
+                input(f"     [ENTER] um zu starten...")
+                for joint in ["b", "s", "e", "h"]:
+                    identify_joint(arm, joint, pose)
+                    time.sleep(0.3)
+                joints_identified = True
+                print(f"\n  ✅ Alle Gelenke identifiziert!")
 
-                while True:
-                    val = input(f"    {joint} [{joint_names[joint]}] "
-                               f"(Soll={pose[joint]:.1f}°, Servo={default:.3f}°): ").strip()
-                    if val.lower() == 'w':
-                        identify_joint(arm, joint, pose)
-                        arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
-                        arm.wait_until_settled()
-                        # Neu messen nach Wackeln
-                        servo_avg = arm.read_position_averaged(n=10, interval=0.05)
-                        if servo_avg:
-                            default = servo_avg[joint]
-                        continue
-                    elif val == "":
-                        measured[joint] = default
-                        break
-                    else:
-                        try:
-                            measured[joint] = float(val)
+                # Nochmal zur Pose fahren
+                arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=10, acc=5)
+                arm.wait_until_settled()
+                arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
+                arm.wait_until_settled()
+
+            # --- SCHRITT 4: Position auslesen (gemittelt) ---
+            servo_avg = arm.read_position_averaged(n=10, interval=0.05)
+            if servo_avg:
+                print(f"  📊 Servo (Mittel ×{servo_avg['n_samples']}): "
+                      f"b={servo_avg['b']:.3f}° s={servo_avg['s']:.3f}° e={servo_avg['e']:.3f}°")
+                print(f"     Rauschen (σ): "
+                      f"b={servo_avg['b_std']:.4f}° s={servo_avg['s_std']:.4f}° e={servo_avg['e_std']:.4f}°")
+                diagnostics["noise_std_deg"].append({
+                    "b": servo_avg["b_std"],
+                    "s": servo_avg["s_std"],
+                    "e": servo_avg["e_std"],
+                })
+            else:
+                servo_avg = {"b": pose["b"], "s": pose["s"], "e": pose["e"], "h": pose["h"],
+                             "b_std": 0, "s_std": 0, "e_std": 0}
+                print(f"  ⚠️ Konnte Position nicht lesen, verwende Soll-Werte")
+                diagnostics["noise_std_deg"].append({"b": 0, "s": 0, "e": 0})
+
+            # --- SCHRITT 5: Messung (Auto oder Manuell) ---
+            if auto_accept:
+                measured = {j: servo_avg[j] for j in JOINTS}
+            else:
+                print(f"\n  Miss jetzt die TATSÄCHLICHEN Winkel (nur b, s, e).")
+                print(f"  (Leer = Servo-Wert | [w] = Gelenk wackeln)")
+
+                measured = {}
+                for joint in JOINTS:
+                    joint_names = {
+                        "b": "BASE (Drehung links/rechts)",
+                        "s": "SHOULDER (Schulter hoch/runter)",
+                        "e": "ELBOW (Ellbogen auf/zu)",
+                    }
+                    default = servo_avg[joint]
+
+                    while True:
+                        val = input(f"    {joint} [{joint_names[joint]}] "
+                                   f"(Soll={pose[joint]:.1f}°, Servo={default:.3f}°): ").strip()
+                        if val.lower() == 'w':
+                            identify_joint(arm, joint, pose)
+                            arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
+                            arm.wait_until_settled()
+                            servo_avg = arm.read_position_averaged(n=10, interval=0.05)
+                            if servo_avg:
+                                default = servo_avg[joint]
+                            continue
+                        elif val == "":
+                            measured[joint] = default
                             break
-                        except ValueError:
-                            print(f"      ❌ Ungültige Eingabe, nochmal...")
+                        else:
+                            try:
+                                measured[joint] = float(val)
+                                break
+                            except ValueError:
+                                print(f"      ❌ Ungültige Eingabe, nochmal...")
 
-        # Fehler berechnen
-        error = {j: measured[j] - pose[j] for j in JOINTS}
+            # Fehler berechnen
+            error = {j: measured[j] - pose[j] for j in JOINTS}
+            pose_measurements.append({
+                "measured": measured.copy(),
+                "error": error.copy(),
+                "settle_time_s": total_settle,
+                "timed_out": timed_out,
+            })
+
+            # Pose-Diagnostik speichern
+            pose_diag = {
+                "pose_index": i,
+                "repeat": rep,
+                "commanded": {j: pose[j] for j in JOINTS},
+                "measured": measured,
+                "error": error,
+                "settle_time_s": total_settle,
+                "overshoot_deg": diagnostics["overshoot_deg"][-1],
+                "noise_std": diagnostics["noise_std_deg"][-1],
+                "timed_out": timed_out,
+            }
+            diagnostics["per_pose"].append(pose_diag)
+
+            print(f"  → Fehler: Δb={error['b']:+.3f}° Δs={error['s']:+.3f}° Δe={error['e']:+.3f}°")
+
+        # === Nach allen Wiederholungen: Mittelwert für diese Pose ===
+        avg_error = {}
+        for j in JOINTS:
+            errors_j = [m["error"][j] for m in pose_measurements]
+            avg_error[j] = float(np.mean(errors_j))
+
+        # Repeatability für diese Pose (Standardabweichung über Wiederholungen)
+        if repeats > 1:
+            repeat_std = {}
+            for j in JOINTS:
+                measured_vals = [m["measured"][j] for m in pose_measurements]
+                repeat_std[j] = float(np.std(measured_vals))
+            diagnostics["repeatability_per_pose"].append({
+                "pose_index": i,
+                "commanded": {j: pose[j] for j in JOINTS},
+                "repeat_std_deg": repeat_std,
+                "n_repeats": repeats,
+            })
+            print(f"\n  📈 Pose {i+1} Repeatability (σ über {repeats} Wiederholungen):")
+            print(f"     b={repeat_std['b']:.4f}° s={repeat_std['s']:.4f}° e={repeat_std['e']:.4f}°")
+            print(f"     Mittlerer Fehler: Δb={avg_error['b']:+.3f}° "
+                  f"Δs={avg_error['s']:+.3f}° Δe={avg_error['e']:+.3f}°")
+
+        # Gemittelten Fehler für das Modell verwenden
         commanded.append(pose)
-        errors.append(error)
+        errors.append(avg_error)
 
-        # Pose-Diagnostik speichern
-        pose_diag = {
-            "pose_index": i,
-            "commanded": {j: pose[j] for j in JOINTS},
-            "measured": measured,
-            "error": error,
-            "settle_time_s": total_settle,
-            "overshoot_deg": diagnostics["overshoot_deg"][-1],
-            "noise_std": diagnostics["noise_std_deg"][-1],
-            "timed_out": timed_out,
-        }
-        diagnostics["per_pose"].append(pose_diag)
+    diagnostics["total_measurements"] = measurement_count
 
-        print(f"  → Fehler: Δb={error['b']:+.3f}° Δs={error['s']:+.3f}° Δe={error['e']:+.3f}°")
+    # === Zurück zur Safe-UP Position am Ende ===
+    print(f"\n  🏠 Fahre zurück zu Safe-UP...")
+    current = arm.read_position_deg()
+    if current:
+        move_to_safe_up(arm, current_pose=current)
+    else:
+        move_to_safe_up(arm, current_pose=None)
 
     # ============================================================
     # ZUSAMMENFASSUNG & MODELL FITTEN
@@ -585,11 +874,12 @@ def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
     print(f"  ERGEBNIS")
     print(f"{'='*60}")
 
-    print(f"\n  ⏱️  Gesamtzeit: {total_time:.1f}s ({total_time/len(poses):.1f}s pro Pose)")
+    print(f"\n  ⏱️  Gesamtzeit: {total_time:.1f}s ({total_time/total_measurements:.1f}s pro Messung)")
+    print(f"      {len(poses)} Posen × {repeats} Wiederholungen = {total_measurements} Messungen")
 
     # Settle-Time Statistik
     settle_arr = np.array(diagnostics["settle_times_s"])
-    print(f"\n  📐 Settle-Zeiten:")
+    print(f"\n  🔍 Settle-Zeiten:")
     print(f"     Min: {settle_arr.min():.2f}s  Max: {settle_arr.max():.2f}s  "
           f"Mittel: {settle_arr.mean():.2f}s  σ: {settle_arr.std():.2f}s")
 
@@ -606,11 +896,20 @@ def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
     print(f"\n  📉 Servo-Rauschen (σ im Stillstand):")
     print(f"     b: {noise_b.mean():.4f}°  s: {noise_s.mean():.4f}°  e: {noise_e.mean():.4f}°")
 
-    # Fehler-Statistik (vor Kalibrierung)
+    # Repeatability Statistik (über alle Posen)
+    if diagnostics["repeatability_per_pose"]:
+        all_rep_b = [r["repeat_std_deg"]["b"] for r in diagnostics["repeatability_per_pose"]]
+        all_rep_s = [r["repeat_std_deg"]["s"] for r in diagnostics["repeatability_per_pose"]]
+        all_rep_e = [r["repeat_std_deg"]["e"] for r in diagnostics["repeatability_per_pose"]]
+        print(f"\n  🔄 Repeatability (σ über {repeats} Wiederholungen, gemittelt über alle Posen):")
+        print(f"     b: {np.mean(all_rep_b):.4f}°  s: {np.mean(all_rep_s):.4f}°  e: {np.mean(all_rep_e):.4f}°")
+        print(f"     Max: b={max(all_rep_b):.4f}° s={max(all_rep_s):.4f}° e={max(all_rep_e):.4f}°")
+
+    # Fehler-Statistik (vor Kalibrierung) - basierend auf gemittelten Fehlern
     err_b = np.array([e["b"] for e in errors])
     err_s = np.array([e["s"] for e in errors])
     err_e = np.array([e["e"] for e in errors])
-    print(f"\n  🎯 Positionsfehler (Soll vs. Ist):")
+    print(f"\n  🎯 Positionsfehler (Soll vs. Ist, gemittelt über Wiederholungen):")
     print(f"     b: mean={err_b.mean():+.3f}° σ={err_b.std():.3f}° "
           f"max={np.abs(err_b).max():.3f}°")
     print(f"     s: mean={err_s.mean():+.3f}° σ={err_s.std():.3f}° "
@@ -618,16 +917,14 @@ def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
     print(f"     e: mean={err_e.mean():+.3f}° σ={err_e.std():.3f}° "
           f"max={np.abs(err_e).max():.3f}°")
 
-    # Repeatability-Test: Nochmal Home anfahren und messen
-    print(f"\n  🔄 Repeatability-Test (fahre Home nochmal an)...")
-    arm.move_to(poses[0]["b"], poses[0]["s"], poses[0]["e"], poses[0]["h"], spd=20, acc=10)
-    arm.wait_until_settled(tolerance_deg=1.0, stable_count=3)
+    # Repeatability-Test: Home nochmal anfahren (über Safe-UP!)
+    print(f"\n  🔄 Repeatability-Test (fahre Home nochmal an über Safe-UP)...")
+    move_from_safe_up_to_pose(arm, poses[0])
     arm.move_to(poses[0]["b"], poses[0]["s"], poses[0]["e"], poses[0]["h"], spd=5, acc=3)
-    result_repeat = arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
+    arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
     repeat_pos = arm.read_position_averaged(n=10, interval=0.05)
 
-    if repeat_pos and servo_avg:
-        # Vergleiche mit erster Home-Messung
+    if repeat_pos:
         first_home = diagnostics["per_pose"][0]["measured"]
         repeat_err = {j: abs(repeat_pos[j] - first_home[j]) for j in JOINTS}
         print(f"     Repeatability (Home→...→Home): "
@@ -654,7 +951,7 @@ def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
 
     # Modell fitten
     print(f"\n{'─'*60}")
-    print(f"  Fitte Kalibrierungsmodell...")
+    print(f"  Fitte Kalibrierungsmodell ({len(commanded)} Datenpunkte, je gemittelt über {repeats} Messungen)...")
 
     model = CalibrationModel()
     residuals = model.fit(commanded, errors)
@@ -678,11 +975,19 @@ def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
     cal_path.parent.mkdir(exist_ok=True)
     model.save(str(cal_path), diagnostics=diagnostics)
 
-    # Auch rohe Diagnostik separat speichern (für spätere Analyse)
+    # Auch rohe Diagnostik separat speichern
     diag_path = Path("calibration") / "roarm_diagnostics.json"
     with open(diag_path, 'w') as f:
         json.dump(diagnostics, f, indent=2)
     print(f"  📊 Diagnostik gespeichert: {diag_path}")
+
+    # Zurück zu Safe-UP am Ende
+    print(f"\n  🏠 Fahre zurück zu Safe-UP...")
+    current = arm.read_position_deg()
+    if current:
+        move_to_safe_up(arm, current_pose=current)
+    else:
+        move_to_safe_up(arm, current_pose=None)
 
     return model
 
@@ -699,6 +1004,11 @@ def main():
                    help="Servo-Werte automatisch akzeptieren (kein User-Input)")
     p.add_argument("--no-identify", action="store_true",
                    help="Gelenk-Identifikation überspringen")
+    p.add_argument("--repeats", type=int, default=REPEATS_PER_POSE,
+                   help=f"Wiederholungen pro Pose (default: {REPEATS_PER_POSE})")
+    p.add_argument("--pose-set", type=str, default="standard",
+                   choices=list(POSE_SETS.keys()),
+                   help="Posen-Set: minimal (8), standard (12), extended (24)")
     args = p.parse_args()
 
     port = args.port or find_arm_port()
@@ -706,7 +1016,7 @@ def main():
         print("❌ Kein serieller Port gefunden!")
         sys.exit(1)
 
-    print(f"🔌 Verbinde mit {port}...")
+    print(f"📌 Verbinde mit {port}...")
     try:
         arm = RoArmConnection(port)
         print(f"   ✅ Verbunden")
@@ -715,10 +1025,16 @@ def main():
         sys.exit(1)
 
     try:
-        model = run_calibration(arm, auto_accept=args.auto, skip_identify=args.no_identify)
+        model = run_calibration(
+            arm,
+            auto_accept=args.auto,
+            skip_identify=args.no_identify,
+            repeats=args.repeats,
+            pose_set_name=args.pose_set,
+        )
         print(f"\n✅ Kalibrierung abgeschlossen!")
         print(f"   Datei: calibration/roarm_calibration.cal")
-        print(f"   Wird automatisch von play_teached.py geladen.")
+        print(f"   Wird automatisch von play.py geladen.")
     except KeyboardInterrupt:
         print("\n\n   ⏹ Abgebrochen!")
     finally:
@@ -729,4 +1045,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
