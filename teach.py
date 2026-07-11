@@ -226,7 +226,7 @@ class RoArmConnection:
 # ============================================================
 
 class TeachRecorder:
-    def __init__(self, port: str = None, output_dir: str = "teach_recordings",
+    def __init__(self, port: str = None, output_dir: str = "recordings",
                  hz: int = RECORD_HZ, threshold: float = MOVE_THRESHOLD_DEG,
                  gravity_comp: bool = True):
         self._port = port
@@ -659,7 +659,7 @@ def main():
                    help=f"Aufnahme-Frequenz (default: {RECORD_HZ})")
     p.add_argument("--threshold", type=float, default=MOVE_THRESHOLD_DEG,
                    help=f"Bewegungs-Schwelle in Grad (default: {MOVE_THRESHOLD_DEG})")
-    p.add_argument("--output", type=str, default="teach_recordings",
+    p.add_argument("--output", type=str, default="recordings",
                    help="Ausgabe-Verzeichnis")
     p.add_argument("--no-gravity-comp", action="store_true",
                    help="Gravity Compensation deaktivieren")
