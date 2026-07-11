@@ -320,16 +320,21 @@ class RoArmConnection:
 
     def move_to(self, b_deg: float, s_deg: float, e_deg: float, h_deg: float,
                 spd: int = 20, acc: int = 10):
-        cmd = {
-            "T": 122,
-            "b": round(b_deg, 2),
-            "s": round(s_deg, 2),
-            "e": round(e_deg, 2),
-            "h": round(h_deg, 2),
-            "spd": spd,
-            "acc": acc,
-        }
-        self.send_cmd(cmd)
+        """Sendet korrigierten Befehl unter Berücksichtigung der Kalibrierung."""
+        if self._cal_model and self._cal_model.is_fitted:
+            correction = self._cal_model.predict_correction(
+                {"b": b, "s": s, "e": e, "h": h}
+            )
+            # GEGENSTEUERN: Wenn der Arm systematisch zu weit rechts landet,
+            # befehlen wir etwas weiter links
+            b_corr = b - correction["b"]
+            s_corr = s - correction["s"]
+            e_corr = e - correction["e"]
+            h_corr = h - correction["h"]
+        else:
+            b_corr, s_corr, e_corr, h_corr = b, s, e, h
+        
+        self._arm.move_to(b_corr, s_corr, e_corr, h_corr, spd=spd, acc=acc)
 
     def torque_off(self):
         self.send_cmd({"T": 210, "cmd": 0})
@@ -493,6 +498,14 @@ class RoArmPlayer:
         self._data = None
         self._precomputed_speeds = None
         self._corrected_waypoints = None
+
+        self._cal_model = None
+        cal_path = Path("calibration/roarm_calibration.cal")
+        if cal_path.exists():
+            self._cal_model = CalibrationModel.load(str(cal_path))
+            print(f"📐 Kalibrierungsmodell geladen")
+        else:
+            print(f"📐 Kalibrierungsmodell NICHT geladen")
 
     def connect(self) -> bool:
         port = self._port or find_arm_port()
