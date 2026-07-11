@@ -87,9 +87,9 @@ REPEATS_PER_POSE = 3
 SAFE_LIMITS = {
     "b_min": -90.0,   # Base links max
     "b_max": 90.0,    # Base rechts max
-    "s_min": -15.0,   # Shoulder runter (NICHT weiter, da Tisch!)
+    "s_min": -25.0,   # weiter runter erlauben
     "s_max": 45.0,    # Shoulder hoch
-    "e_min": 30.0,    # Ellbogen eng (NICHT weiter, Kollision!)
+    "e_min": 20.0,    # Ellbogen noch gestreckter
     "e_max": 150.0,   # Ellbogen weit
 }
 
