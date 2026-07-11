@@ -41,8 +41,8 @@ from pathlib import Path
 # Kalibrierungsmodell (optional)
 try:
     import numpy as np
-    from calibrate import CalibrationModel
-except ImportError:
+    from calibrate import CalibrationModel, JOINTS
+except (ImportError, ModuleNotFoundError):
     CalibrationModel = None
 
 # ============================================================
@@ -348,8 +348,8 @@ class RoArmConnection:
             b = b - correction["b"]
             s = s - correction["s"]
             e = e - correction["e"]
-            h = h - correction["h"]
-        self._arm._move_corrected(b, s, e, h, spd=spd, acc=acc)
+            # h nicht korrigieren (Gripper)
+        self._arm.move_to(b, s, e, h, spd=spd, acc=acc)
 
     def torque_off(self):
         self.send_cmd({"T": 210, "cmd": 0})
@@ -515,12 +515,18 @@ class RoArmPlayer:
         self._corrected_waypoints = None
 
         self._cal_model = None
-        cal_path = Path("calibration/roarm_calibration.cal")
-        if cal_path.exists():
-            self._cal_model = CalibrationModel.load(str(cal_path))
-            print(f"📐 Kalibrierungsmodell geladen")
+        if CalibrationModel is not None:
+            cal_path = Path("calibration/roarm_calibration.cal")
+            if cal_path.exists():
+                try:
+                    self._cal_model = CalibrationModel.load(str(cal_path))
+                    print(f"📐 Kalibrierungsmodell geladen")
+                except Exception as e:
+                    print(f"⚠️ Kalibrierung fehlgeschlagen: {e}")
+            else:
+                print(f"📐 Keine Kalibrierungsdatei gefunden (optional)")
         else:
-            print(f"📐 Kalibrierungsmodell NICHT geladen")
+            print(f"📐 numpy/calibrate nicht verfügbar, keine Kalibrierung")
 
     def connect(self) -> bool:
         port = self._port or find_arm_port()
@@ -854,9 +860,6 @@ def main():
     )
     player.run()
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
