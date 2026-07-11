@@ -37,6 +37,12 @@ import serial
 import serial.tools.list_ports
 from pathlib import Path
 
+# Kalibrierungsmodell (optional)
+try:
+    import numpy as np
+    from calibrate import CalibrationModel
+except ImportError:
+    CalibrationModel = None
 
 # ============================================================
 # KONFIGURATION
@@ -320,21 +326,29 @@ class RoArmConnection:
 
     def move_to(self, b_deg: float, s_deg: float, e_deg: float, h_deg: float,
                 spd: int = 20, acc: int = 10):
+        cmd = {
+            "T": 122,
+            "b": round(b_deg, 2),
+            "s": round(s_deg, 2),
+            "e": round(e_deg, 2),
+            "h": round(h_deg, 2),
+            "spd": spd,
+            "acc": acc,
+        }
+        self.send_cmd(cmd)
+
+    def _move_corrected(self, b: float, s: float, e: float, h: float,
+                        spd: int = 20, acc: int = 10):
         """Sendet korrigierten Befehl unter Berücksichtigung der Kalibrierung."""
         if self._cal_model and self._cal_model.is_fitted:
             correction = self._cal_model.predict_correction(
                 {"b": b, "s": s, "e": e, "h": h}
             )
-            # GEGENSTEUERN: Wenn der Arm systematisch zu weit rechts landet,
-            # befehlen wir etwas weiter links
-            b_corr = b - correction["b"]
-            s_corr = s - correction["s"]
-            e_corr = e - correction["e"]
-            h_corr = h - correction["h"]
-        else:
-            b_corr, s_corr, e_corr, h_corr = b, s, e, h
-        
-        self._arm.move_to(b_corr, s_corr, e_corr, h_corr, spd=spd, acc=acc)
+            b = b - correction["b"]
+            s = s - correction["s"]
+            e = e - correction["e"]
+            h = h - correction["h"]
+        self._arm._move_corrected(b, s, e, h, spd=spd, acc=acc)
 
     def torque_off(self):
         self.send_cmd({"T": 210, "cmd": 0})
@@ -673,7 +687,7 @@ class RoArmPlayer:
             spd, acc = speeds[i]
 
             # Befehl senden
-            self._arm.move_to(wp["b"], wp["s"], wp["e"], wp["h"], spd=spd, acc=acc)
+            self._move_corrected(wp["b"], wp["s"], wp["e"], wp["h"], spd=spd, acc=acc)
             commands_sent += 1
             last_sent = {"b": wp["b"], "s": wp["s"], "e": wp["e"], "h": wp["h"]}
 
