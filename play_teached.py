@@ -7,6 +7,7 @@ Schnell bei gleichbleibender Richtung, langsam bei Richtungswechsel/Stopp.
 # requires-python = ">=3.10"
 # dependencies = [
 #     "pyserial",
+#     "numpy",
 # ]
 # ///
 
