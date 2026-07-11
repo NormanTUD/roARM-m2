@@ -3,14 +3,15 @@
 
 Workflow:
 1. Roboter fährt N vordefinierte Posen an
-2. User misst die TATSÄCHLICHE Position (Winkelmesser, Lineal, Kamera)
-3. Modell wird gefittet: Soll → Korrektur
-4. Kalibrierungsdatei wird gespeichert (.cal)
+2. Wartet bis Arm stillsteht (aktives Polling)
+3. Misst Servo-Feedback (oder User misst manuell)
+4. Modell wird gefittet: Soll → Korrektur
+5. Kalibrierungsdatei + Diagnostik wird gespeichert
 
-Beim Playback: Soll_korrigiert = Soll + Modell(Soll)
-
-HINWEIS: "h" ist der Gripper (EOAT), kein echtes Rotationsgelenk.
-         Kalibriert werden nur b (Base), s (Shoulder), e (Elbow).
+Flags:
+  --auto         Akzeptiert Servo-Werte automatisch (kein User-Input)
+  --no-identify  Überspringt Gelenk-Identifikation
+  --port PORT    Serieller Port (sonst auto-detect)
 """
 # /// script
 # requires-python = ">=3.10"
@@ -53,11 +54,8 @@ import threading
 # ============================================================
 
 BAUDRATE = 115200
-
-# Die 3 echten Gelenke (h = Gripper, wird nicht kalibriert)
 JOINTS = ["b", "s", "e"]
 
-# Kalibrierposen - nur b, s, e variieren. h bleibt bei 180 (Gripper geschlossen)
 CALIBRATION_POSES = [
     {"b": 0.0,   "s": 0.0,   "e": 90.0,  "h": 180.0},   # Home
     {"b": -45.0, "s": 0.0,   "e": 90.0,  "h": 180.0},   # Links
@@ -92,16 +90,11 @@ class CalibrationModel:
     """
 
     def __init__(self):
-        self.coefficients = {
-            "b": None,
-            "s": None,
-            "e": None,
-        }
+        self.coefficients = {"b": None, "s": None, "e": None}
         self.is_fitted = False
         self.residuals = {}
 
     def _build_features(self, poses: list) -> np.ndarray:
-        """Baut die Feature-Matrix für Polynom 2. Ordnung (3 Variablen)."""
         X = []
         for pose in poses:
             b, s, e = pose["b"], pose["s"], pose["e"]
@@ -115,34 +108,21 @@ class CalibrationModel:
         return np.array(X)
 
     def fit(self, commanded_poses: list, measured_errors: list):
-        """
-        Fittet das Modell.
-
-        commanded_poses: Liste von {"b":..., "s":..., "e":..., "h":...}
-        measured_errors: Liste von {"b": error_b, "s": error_s, "e": error_e}
-                        wobei error = gemessen - befohlen
-        """
         X = self._build_features(commanded_poses)
-
         for joint in JOINTS:
             y = np.array([err[joint] for err in measured_errors])
-
             lambda_reg = 0.01
             XtX = X.T @ X + lambda_reg * np.eye(X.shape[1])
             Xty = X.T @ y
             self.coefficients[joint] = np.linalg.solve(XtX, Xty)
-
             y_pred = X @ self.coefficients[joint]
             self.residuals[joint] = np.sqrt(np.mean((y - y_pred)**2))
-
         self.is_fitted = True
         return self.residuals
 
     def predict_correction(self, pose: dict) -> dict:
-        """Gibt die Korrektur für eine Soll-Pose zurück."""
         if not self.is_fitted:
             return {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
-
         X = self._build_features([pose])
         correction = {"h": 0.0}
         for joint in JOINTS:
@@ -152,8 +132,7 @@ class CalibrationModel:
                 correction[joint] = 0.0
         return correction
 
-    def save(self, filepath: str):
-        """Speichert das Modell als JSON."""
+    def save(self, filepath: str, diagnostics: dict = None):
         data = {
             "type": "polynomial_calibration_v2",
             "note": "h is gripper (EOAT), not calibrated",
@@ -161,20 +140,19 @@ class CalibrationModel:
             "joints": {},
             "residuals": self.residuals,
         }
+        if diagnostics:
+            data["diagnostics"] = diagnostics
         for joint in JOINTS:
             if self.coefficients[joint] is not None:
                 data["joints"][joint] = self.coefficients[joint].tolist()
-
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
         print(f"✅ Kalibrierung gespeichert: {filepath}")
 
     @classmethod
     def load(cls, filepath: str) -> "CalibrationModel":
-        """Lädt ein gespeichertes Modell."""
         with open(filepath, 'r') as f:
             data = json.load(f)
-
         model = cls()
         for joint in JOINTS:
             if joint in data.get("joints", {}):
@@ -277,25 +255,23 @@ class RoArmConnection:
         self.send_cmd(cmd)
 
     def wait_until_settled(self, tolerance_deg: float = 0.3, stable_count: int = 5,
-                           poll_interval: float = 0.15, timeout: float = 12.0):
+                           poll_interval: float = 0.15, timeout: float = 15.0) -> dict:
         """
         Wartet bis der Arm stillsteht.
-        Liest wiederholt die Position und prüft ob sich nichts mehr ändert.
-
-        tolerance_deg: Max. Änderung zwischen zwei Lesungen (pro Gelenk) um als "still" zu gelten
-        stable_count: Wie viele aufeinanderfolgende stabile Lesungen nötig sind
-        poll_interval: Sekunden zwischen Lesungen
-        timeout: Max. Wartezeit bevor aufgegeben wird
+        Gibt dict zurück: {"pos": final_pos, "settle_time_s": float, "readings": list}
         """
         stable = 0
         last_pos = None
         start = time.time()
+        all_readings = []
 
         while time.time() - start < timeout:
             pos = self.read_position_deg()
             if pos is None:
                 time.sleep(poll_interval)
                 continue
+
+            all_readings.append({"t": time.time() - start, **pos})
 
             if last_pos is not None:
                 max_delta = max(
@@ -306,15 +282,46 @@ class RoArmConnection:
                 if max_delta < tolerance_deg:
                     stable += 1
                     if stable >= stable_count:
-                        return pos  # Arm steht still
+                        settle_time = time.time() - start
+                        return {
+                            "pos": pos,
+                            "settle_time_s": settle_time,
+                            "readings": all_readings,
+                        }
                 else:
                     stable = 0
 
             last_pos = pos
             time.sleep(poll_interval)
 
-        # Timeout - gib letzte bekannte Position zurück
-        return last_pos
+        # Timeout
+        settle_time = time.time() - start
+        return {
+            "pos": last_pos,
+            "settle_time_s": settle_time,
+            "readings": all_readings,
+            "timeout": True,
+        }
+
+    def read_position_averaged(self, n: int = 8, interval: float = 0.04) -> dict:
+        """Liest n Positionen und gibt den Mittelwert zurück."""
+        readings = []
+        for _ in range(n):
+            pos = self.read_position_deg()
+            if pos:
+                readings.append(pos)
+            time.sleep(interval)
+
+        if not readings:
+            return None
+
+        avg = {}
+        for joint in ["b", "s", "e", "h"]:
+            values = [r[joint] for r in readings]
+            avg[joint] = round(np.mean(values), 3)
+            avg[f"{joint}_std"] = round(np.std(values), 4)
+        avg["n_samples"] = len(readings)
+        return avg
 
     def torque_off(self):
         self.send_cmd({"T": 210, "cmd": 0})
@@ -340,10 +347,6 @@ class RoArmConnection:
 # ============================================================
 
 def identify_joint(arm, joint: str, current_pose: dict):
-    """
-    Bewegt ein einzelnes Gelenk hin und her damit der User sieht welches es ist.
-    Für "h" (Gripper) wird T:106 verwendet (auf/zu).
-    """
     WIGGLE_AMOUNT = 15.0
     WIGGLE_SPD = 20
     WIGGLE_ACC = 10
@@ -369,7 +372,6 @@ def identify_joint(arm, joint: str, current_pose: dict):
         time.sleep(0.5)
     else:
         print(f"      Bewege jetzt ±{WIGGLE_AMOUNT}° hin und her...")
-
         pose_plus = current_pose.copy()
         pose_minus = current_pose.copy()
         pose_plus[joint] = current_pose[joint] + WIGGLE_AMOUNT
@@ -398,38 +400,51 @@ def identify_joint(arm, joint: str, current_pose: dict):
 # KALIBRIERUNGS-WORKFLOW
 # ============================================================
 
-def run_calibration(arm, poses=CALIBRATION_POSES):
+def run_calibration(arm, poses=CALIBRATION_POSES, auto_accept: bool = False,
+                    skip_identify: bool = False):
     """
-    Interaktiver Kalibrierungs-Workflow.
-    Kalibriert nur b, s, e (die 3 echten Gelenke).
-    h (Gripper) wird übersprungen.
+    Kalibrierungs-Workflow.
+    
+    auto_accept: True = Servo-Werte automatisch akzeptieren (kein User-Input)
+    skip_identify: True = Gelenk-Identifikation überspringen
     """
     commanded = []
     errors = []
+    diagnostics = {
+        "settle_times_s": [],
+        "overshoot_deg": [],
+        "noise_std_deg": [],
+        "per_pose": [],
+    }
 
     print(f"\n{'='*60}")
     print(f"  KALIBRIERUNG - {len(poses)} Posen")
     print(f"  Kalibriert: b (Base), s (Shoulder), e (Elbow)")
-    print(f"  NICHT kalibriert: h (Gripper/EOAT)")
+    print(f"  Modus: {'AUTO (Servo-Werte)' if auto_accept else 'MANUELL (User misst)'}")
     print(f"{'='*60}")
 
-    print(f"\n  Ablauf pro Pose:")
-    print(f"  1. Arm fährt zur Soll-Position (wartet bis er stillsteht)")
-    print(f"  2. Du misst den tatsächlichen Winkel (b, s, e)")
-    print(f"  3. Eingabe (oder ENTER = Servo-Wert übernehmen)")
+    if not auto_accept:
+        print(f"\n  Ablauf pro Pose:")
+        print(f"  1. Arm fährt zur Soll-Position (wartet bis stillsteht)")
+        print(f"  2. Du misst den tatsächlichen Winkel (b, s, e)")
+        print(f"  3. Eingabe (oder ENTER = Servo-Wert übernehmen)")
+        print(f"\n  Tipp: [w] = Gelenk wackeln lassen")
 
-    print(f"\n  Messmethoden:")
-    print(f"  • Digitaler Winkelmesser an jedem Gelenk")
-    print(f"  • Oder: Endpunkt-Position mit Lineal messen")
+    if not skip_identify and not auto_accept:
+        print(f"\n  Soll ich bei der ersten Pose alle Gelenke einzeln bewegen")
+        print(f"  damit du siehst welches welches ist? (j/n)")
+        show_joints = input("  > ").strip().lower() != 'n'
+    else:
+        show_joints = False
 
-    # Gelenk-Identifikation?
-    print(f"\n  Soll ich bei der ersten Pose alle Gelenke einzeln bewegen")
-    print(f"  damit du siehst welches welches ist? (j/n)")
-    show_joints = input("  > ").strip().lower() != 'n'
-
-    input("\n  [ENTER] um zu starten...")
+    if not auto_accept:
+        input("\n  [ENTER] um zu starten...")
+    else:
+        print(f"\n  Starte automatische Kalibrierung...\n")
+        time.sleep(1.0)
 
     joints_identified = False
+    total_start = time.time()
 
     for i, pose in enumerate(poses):
         print(f"\n{'─'*60}")
@@ -438,33 +453,46 @@ def run_calibration(arm, poses=CALIBRATION_POSES):
 
         # Arm hinfahren
         arm.torque_on()
-        time.sleep(0.2)
+        time.sleep(0.1)
 
         # Schnell in die Nähe
-        arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=15, acc=8)
+        move_start = time.time()
+        arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=20, acc=10)
         print(f"  ⏳ Fahre zur Position...", end="", flush=True)
-        arm.wait_until_settled()
-        print(f" angekommen.", flush=True)
+        result_fast = arm.wait_until_settled(tolerance_deg=1.0, stable_count=3)
+        print(f" grob da ({result_fast['settle_time_s']:.1f}s)", flush=True)
 
         # Langsam und präzise nachfahren
         arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
         print(f"  ⏳ Präzisions-Nachfahrt...", end="", flush=True)
-        arm.wait_until_settled()
-        print(f" fertig.", flush=True)
+        result_precise = arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
+        total_settle = time.time() - move_start
+        timed_out = result_precise.get("timeout", False)
+        print(f" {'⚠️ TIMEOUT' if timed_out else '✅ still'} ({total_settle:.1f}s)", flush=True)
 
-        # Gelenk-Identifikation (nur bei erster Pose)
+        diagnostics["settle_times_s"].append(total_settle)
+
+        # Overshoot berechnen (max Abweichung während Bewegung vs. Endposition)
+        if result_precise["readings"] and result_precise["pos"]:
+            final = result_precise["pos"]
+            max_overshoot = 0.0
+            for reading in result_precise["readings"]:
+                for j in JOINTS:
+                    overshoot = abs(reading[j] - final[j])
+                    max_overshoot = max(max_overshoot, overshoot)
+            diagnostics["overshoot_deg"].append(round(max_overshoot, 3))
+        else:
+            diagnostics["overshoot_deg"].append(0.0)
+
+        # Gelenk-Identifikation (nur bei erster Pose, nur wenn gewünscht)
         if show_joints and not joints_identified:
             print(f"\n  🔍 GELENK-IDENTIFIKATION:")
-            print(f"     Ich bewege jetzt jedes Gelenk einzeln.")
             input(f"     [ENTER] um zu starten...")
-
             for joint in ["b", "s", "e", "h"]:
                 identify_joint(arm, joint, pose)
                 time.sleep(0.3)
-
             joints_identified = True
             print(f"\n  ✅ Alle Gelenke identifiziert!")
-            print(f"     h (Gripper) wird NICHT kalibriert.")
 
             # Nochmal zur Pose fahren
             arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=10, acc=5)
@@ -472,82 +500,166 @@ def run_calibration(arm, poses=CALIBRATION_POSES):
             arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
             arm.wait_until_settled()
 
-        # === JETZT erst Position auslesen (Arm steht garantiert still) ===
-        # Mehrfach lesen und Mittelwert bilden für noch bessere Genauigkeit
-        readings = []
-        for _ in range(5):
-            pos = arm.read_position_deg()
-            if pos:
-                readings.append(pos)
-            time.sleep(0.05)
-
-        if readings:
-            servo_pos = {
-                "b": round(np.mean([r["b"] for r in readings]), 2),
-                "s": round(np.mean([r["s"] for r in readings]), 2),
-                "e": round(np.mean([r["e"] for r in readings]), 2),
-                "h": round(np.mean([r["h"] for r in readings]), 2),
-            }
-            print(f"  ✅ Arm steht still. Servo meldet (Mittel aus {len(readings)} Lesungen):")
-            print(f"     b={servo_pos['b']:.2f}° s={servo_pos['s']:.2f}° "
-                  f"e={servo_pos['e']:.2f}°")
+        # Position auslesen (gemittelt, Arm steht garantiert still)
+        servo_avg = arm.read_position_averaged(n=10, interval=0.05)
+        if servo_avg:
+            print(f"  📊 Servo (Mittel ×{servo_avg['n_samples']}): "
+                  f"b={servo_avg['b']:.3f}° s={servo_avg['s']:.3f}° e={servo_avg['e']:.3f}°")
+            print(f"     Rauschen (σ): "
+                  f"b={servo_avg['b_std']:.4f}° s={servo_avg['s_std']:.4f}° e={servo_avg['e_std']:.4f}°")
+            diagnostics["noise_std_deg"].append({
+                "b": servo_avg["b_std"],
+                "s": servo_avg["s_std"],
+                "e": servo_avg["e_std"],
+            })
         else:
-            servo_pos = {"b": pose["b"], "s": pose["s"], "e": pose["e"], "h": pose["h"]}
-            print(f"  ⚠️ Konnte Servo-Position nicht lesen, verwende Soll-Werte")
+            servo_avg = {"b": pose["b"], "s": pose["s"], "e": pose["e"], "h": pose["h"],
+                         "b_std": 0, "s_std": 0, "e_std": 0}
+            print(f"  ⚠️ Konnte Position nicht lesen, verwende Soll-Werte")
+            diagnostics["noise_std_deg"].append({"b": 0, "s": 0, "e": 0})
 
-        # User-Messung (nur b, s, e)
-        print(f"\n  Miss jetzt die TATSÄCHLICHEN Winkel (nur b, s, e).")
-        print(f"  (Leer = Servo-Wert | [w] = Gelenk wackeln)")
+        # Messung: Auto oder Manuell
+        if auto_accept:
+            measured = {j: servo_avg[j] for j in JOINTS}
+        else:
+            print(f"\n  Miss jetzt die TATSÄCHLICHEN Winkel (nur b, s, e).")
+            print(f"  (Leer = Servo-Wert | [w] = Gelenk wackeln)")
 
-        measured = {}
-        for joint in JOINTS:
-            joint_names = {
-                "b": "BASE (Drehung links/rechts)",
-                "s": "SHOULDER (Schulter hoch/runter)",
-                "e": "ELBOW (Ellbogen auf/zu)",
-            }
-            default = servo_pos[joint]
+            measured = {}
+            for joint in JOINTS:
+                joint_names = {
+                    "b": "BASE (Drehung links/rechts)",
+                    "s": "SHOULDER (Schulter hoch/runter)",
+                    "e": "ELBOW (Ellbogen auf/zu)",
+                }
+                default = servo_avg[joint]
 
-            while True:
-                val = input(f"    {joint} [{joint_names[joint]}] "
-                           f"(Soll={pose[joint]:.1f}°, Servo={default:.2f}°): ").strip()
-
-                if val.lower() == 'w':
-                    identify_joint(arm, joint, pose)
-                    arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
-                    arm.wait_until_settled()
-                    continue
-                elif val == "":
-                    measured[joint] = default
-                    break
-                else:
-                    try:
-                        measured[joint] = float(val)
+                while True:
+                    val = input(f"    {joint} [{joint_names[joint]}] "
+                               f"(Soll={pose[joint]:.1f}°, Servo={default:.3f}°): ").strip()
+                    if val.lower() == 'w':
+                        identify_joint(arm, joint, pose)
+                        arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
+                        arm.wait_until_settled()
+                        # Neu messen nach Wackeln
+                        servo_avg = arm.read_position_averaged(n=10, interval=0.05)
+                        if servo_avg:
+                            default = servo_avg[joint]
+                        continue
+                    elif val == "":
+                        measured[joint] = default
                         break
-                    except ValueError:
-                        print(f"      ❌ Ungültige Eingabe, nochmal...")
+                    else:
+                        try:
+                            measured[joint] = float(val)
+                            break
+                        except ValueError:
+                            print(f"      ❌ Ungültige Eingabe, nochmal...")
 
-        # Fehler berechnen: gemessen - befohlen
-        error = {
-            "b": measured["b"] - pose["b"],
-            "s": measured["s"] - pose["s"],
-            "e": measured["e"] - pose["e"],
-        }
-
+        # Fehler berechnen
+        error = {j: measured[j] - pose[j] for j in JOINTS}
         commanded.append(pose)
         errors.append(error)
 
-        print(f"  → Fehler: Δb={error['b']:+.3f}° Δs={error['s']:+.3f}° "
-              f"Δe={error['e']:+.3f}°")
+        # Pose-Diagnostik speichern
+        pose_diag = {
+            "pose_index": i,
+            "commanded": {j: pose[j] for j in JOINTS},
+            "measured": measured,
+            "error": error,
+            "settle_time_s": total_settle,
+            "overshoot_deg": diagnostics["overshoot_deg"][-1],
+            "noise_std": diagnostics["noise_std_deg"][-1],
+            "timed_out": timed_out,
+        }
+        diagnostics["per_pose"].append(pose_diag)
+
+        print(f"  → Fehler: Δb={error['b']:+.3f}° Δs={error['s']:+.3f}° Δe={error['e']:+.3f}°")
+
+    # ============================================================
+    # ZUSAMMENFASSUNG & MODELL FITTEN
+    # ============================================================
+
+    total_time = time.time() - total_start
+    print(f"\n{'='*60}")
+    print(f"  ERGEBNIS")
+    print(f"{'='*60}")
+
+    print(f"\n  ⏱️  Gesamtzeit: {total_time:.1f}s ({total_time/len(poses):.1f}s pro Pose)")
+
+    # Settle-Time Statistik
+    settle_arr = np.array(diagnostics["settle_times_s"])
+    print(f"\n  📐 Settle-Zeiten:")
+    print(f"     Min: {settle_arr.min():.2f}s  Max: {settle_arr.max():.2f}s  "
+          f"Mittel: {settle_arr.mean():.2f}s  σ: {settle_arr.std():.2f}s")
+
+    # Overshoot Statistik
+    overshoot_arr = np.array(diagnostics["overshoot_deg"])
+    print(f"\n  📈 Overshoot (max Abweichung während Bewegung):")
+    print(f"     Min: {overshoot_arr.min():.3f}°  Max: {overshoot_arr.max():.3f}°  "
+          f"Mittel: {overshoot_arr.mean():.3f}°")
+
+    # Rauschen Statistik
+    noise_b = np.array([n["b"] for n in diagnostics["noise_std_deg"]])
+    noise_s = np.array([n["s"] for n in diagnostics["noise_std_deg"]])
+    noise_e = np.array([n["e"] for n in diagnostics["noise_std_deg"]])
+    print(f"\n  📉 Servo-Rauschen (σ im Stillstand):")
+    print(f"     b: {noise_b.mean():.4f}°  s: {noise_s.mean():.4f}°  e: {noise_e.mean():.4f}°")
+
+    # Fehler-Statistik (vor Kalibrierung)
+    err_b = np.array([e["b"] for e in errors])
+    err_s = np.array([e["s"] for e in errors])
+    err_e = np.array([e["e"] for e in errors])
+    print(f"\n  🎯 Positionsfehler (Soll vs. Ist):")
+    print(f"     b: mean={err_b.mean():+.3f}° σ={err_b.std():.3f}° "
+          f"max={np.abs(err_b).max():.3f}°")
+    print(f"     s: mean={err_s.mean():+.3f}° σ={err_s.std():.3f}° "
+          f"max={np.abs(err_s).max():.3f}°")
+    print(f"     e: mean={err_e.mean():+.3f}° σ={err_e.std():.3f}° "
+          f"max={np.abs(err_e).max():.3f}°")
+
+    # Repeatability-Test: Nochmal Home anfahren und messen
+    print(f"\n  🔄 Repeatability-Test (fahre Home nochmal an)...")
+    arm.move_to(poses[0]["b"], poses[0]["s"], poses[0]["e"], poses[0]["h"], spd=20, acc=10)
+    arm.wait_until_settled(tolerance_deg=1.0, stable_count=3)
+    arm.move_to(poses[0]["b"], poses[0]["s"], poses[0]["e"], poses[0]["h"], spd=5, acc=3)
+    result_repeat = arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
+    repeat_pos = arm.read_position_averaged(n=10, interval=0.05)
+
+    if repeat_pos and servo_avg:
+        # Vergleiche mit erster Home-Messung
+        first_home = diagnostics["per_pose"][0]["measured"]
+        repeat_err = {j: abs(repeat_pos[j] - first_home[j]) for j in JOINTS}
+        print(f"     Repeatability (Home→...→Home): "
+              f"Δb={repeat_err['b']:.3f}° Δs={repeat_err['s']:.3f}° Δe={repeat_err['e']:.3f}°")
+        diagnostics["repeatability_deg"] = repeat_err
+    else:
+        diagnostics["repeatability_deg"] = {"b": 0, "s": 0, "e": 0}
+
+    # Diagnostik-Zusammenfassung
+    diagnostics["total_time_s"] = total_time
+    diagnostics["avg_settle_time_s"] = float(settle_arr.mean())
+    diagnostics["max_settle_time_s"] = float(settle_arr.max())
+    diagnostics["avg_overshoot_deg"] = float(overshoot_arr.mean())
+    diagnostics["avg_noise_std_deg"] = {
+        "b": float(noise_b.mean()),
+        "s": float(noise_s.mean()),
+        "e": float(noise_e.mean()),
+    }
+    diagnostics["position_error_stats"] = {
+        "b": {"mean": float(err_b.mean()), "std": float(err_b.std()), "max": float(np.abs(err_b).max())},
+        "s": {"mean": float(err_s.mean()), "std": float(err_s.std()), "max": float(np.abs(err_s).max())},
+        "e": {"mean": float(err_e.mean()), "std": float(err_e.std()), "max": float(np.abs(err_e).max())},
+    }
 
     # Modell fitten
-    print(f"\n{'='*60}")
+    print(f"\n{'─'*60}")
     print(f"  Fitte Kalibrierungsmodell...")
 
     model = CalibrationModel()
     residuals = model.fit(commanded, errors)
 
-    print(f"\n  Modell-Güte (RMS-Residuen):")
+    print(f"\n  Modell-Güte (RMS-Residuen nach Fit):")
     for joint, rms in residuals.items():
         print(f"    {joint}: {rms:.4f}°")
 
@@ -561,10 +673,16 @@ def run_calibration(arm, poses=CALIBRATION_POSES):
     else:
         print(f"  ❌ Schlechte Kalibrierung - evtl. Messfehler?")
 
-    # Speichern
+    # Speichern (mit Diagnostik)
     cal_path = Path("calibration") / "roarm_calibration.cal"
     cal_path.parent.mkdir(exist_ok=True)
-    model.save(str(cal_path))
+    model.save(str(cal_path), diagnostics=diagnostics)
+
+    # Auch rohe Diagnostik separat speichern (für spätere Analyse)
+    diag_path = Path("calibration") / "roarm_diagnostics.json"
+    with open(diag_path, 'w') as f:
+        json.dump(diagnostics, f, indent=2)
+    print(f"  📊 Diagnostik gespeichert: {diag_path}")
 
     return model
 
@@ -577,6 +695,10 @@ def main():
     import argparse
     p = argparse.ArgumentParser(description="RoArm-M2-S Kalibrierung")
     p.add_argument("--port", type=str, default=None, help="Serieller Port (auto-detect)")
+    p.add_argument("--auto", action="store_true",
+                   help="Servo-Werte automatisch akzeptieren (kein User-Input)")
+    p.add_argument("--no-identify", action="store_true",
+                   help="Gelenk-Identifikation überspringen")
     args = p.parse_args()
 
     port = args.port or find_arm_port()
@@ -593,7 +715,7 @@ def main():
         sys.exit(1)
 
     try:
-        model = run_calibration(arm)
+        model = run_calibration(arm, auto_accept=args.auto, skip_identify=args.no_identify)
         print(f"\n✅ Kalibrierung abgeschlossen!")
         print(f"   Datei: calibration/roarm_calibration.cal")
         print(f"   Wird automatisch von play_teached.py geladen.")
@@ -607,3 +729,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
