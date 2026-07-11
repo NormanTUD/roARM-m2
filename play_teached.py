@@ -338,19 +338,6 @@ class RoArmConnection:
         }
         self.send_cmd(cmd)
 
-    def _move_corrected(self, b: float, s: float, e: float, h: float,
-                        spd: int = 20, acc: int = 10):
-        """Sendet korrigierten Befehl unter Berücksichtigung der Kalibrierung."""
-        if self._cal_model and self._cal_model.is_fitted:
-            correction = self._cal_model.predict_correction(
-                {"b": b, "s": s, "e": e, "h": h}
-            )
-            b = b - correction["b"]
-            s = s - correction["s"]
-            e = e - correction["e"]
-            # h nicht korrigieren (Gripper)
-        self._arm.move_to(b, s, e, h, spd=spd, acc=acc)
-
     def torque_off(self):
         self.send_cmd({"T": 210, "cmd": 0})
         time.sleep(0.03)
@@ -528,6 +515,19 @@ class RoArmPlayer:
         else:
             print(f"📐 numpy/calibrate nicht verfügbar, keine Kalibrierung")
 
+    def _move_corrected(self, b: float, s: float, e: float, h: float,
+                        spd: int = 20, acc: int = 10):
+        """Sendet korrigierten Befehl unter Berücksichtigung der Kalibrierung."""
+        if self._cal_model and self._cal_model.is_fitted:
+            correction = self._cal_model.predict_correction(
+                {"b": b, "s": s, "e": e, "h": h}
+            )
+            b = b - correction["b"]
+            s = s - correction["s"]
+            e = e - correction["e"]
+            # h nicht korrigieren (Gripper)
+        self._arm.move_to(b, s, e, h, spd=spd, acc=acc)
+
     def connect(self) -> bool:
         port = self._port or find_arm_port()
         if port is None:
@@ -694,7 +694,7 @@ class RoArmPlayer:
             spd, acc = speeds[i]
 
             # Befehl senden
-            self._arm._move_corrected(wp["b"], wp["s"], wp["e"], wp["h"], spd=spd, acc=acc)
+            self._move_corrected(wp["b"], wp["s"], wp["e"], wp["h"], spd=spd, acc=acc)
             commands_sent += 1
             last_sent = {"b": wp["b"], "s": wp["s"], "e": wp["e"], "h": wp["h"]}
 
