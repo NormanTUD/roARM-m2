@@ -644,7 +644,7 @@ class TeachRecorder:
 
         if filepath:
             print(f"  Zum Abspielen:")
-            print(f"  python3 play_teached.py {filepath}")
+            print(f"  python3 play.py {filepath}")
 
 
 # ============================================================
