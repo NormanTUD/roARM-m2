@@ -57,7 +57,6 @@ BAUDRATE = 115200
 SERIAL_TIMEOUT = 0.1
 
 # Gravity Compensation: Alle N Samples kurz Torque an, Position lesen, Torque aus
-GRAVITY_COMP_EVERY_N = 10  # Alle 10 Samples (= alle 200ms bei 50Hz)
 GRAVITY_COMP_SETTLE_MS = 30  # ms warten nach Torque-an bevor Position gelesen wird
 
 
@@ -420,12 +419,7 @@ class TeachRecorder:
                 # Position lesen - mit oder ohne Gravity Compensation
                 self._sample_counter += 1
 
-                if self._gravity_comp and (self._sample_counter % GRAVITY_COMP_EVERY_N == 0):
-                    # Alle N Samples: Gravity-kompensierte Messung
-                    pos = self._read_with_gravity_comp()
-                else:
-                    # Normaler Read (schnell, bei Torque off)
-                    pos = self._arm.read_position_deg_single()
+                pos = self._arm.read_position_deg_single()
 
                 if pos:
                     self._record_point(pos)
