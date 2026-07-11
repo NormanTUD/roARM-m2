@@ -688,7 +688,7 @@ class RoArmPlayer:
             spd, acc = speeds[i]
 
             # Befehl senden
-            self._move_corrected(wp["b"], wp["s"], wp["e"], wp["h"], spd=spd, acc=acc)
+            self._arm._move_corrected(wp["b"], wp["s"], wp["e"], wp["h"], spd=spd, acc=acc)
             commands_sent += 1
             last_sent = {"b": wp["b"], "s": wp["s"], "e": wp["e"], "h": wp["h"]}
 
