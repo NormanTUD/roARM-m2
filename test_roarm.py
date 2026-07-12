@@ -22,6 +22,7 @@ Ausführen:
 #     "scipy",
 #     "pytest",
 #     "pyserial",
+#     "matplotlib",
 #     "rich",
 # ]
 # ///
