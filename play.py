@@ -613,7 +613,6 @@ class SmoothPlayer:
             print(f"❌ Datei nicht gefunden: {path}")
             return False
 
-        print(f"📁 Lade: {path.name}")
         self._data = parse_roarm_file(str(path))
 
         wps = self._data["waypoints"]
@@ -625,38 +624,38 @@ class SmoothPlayer:
             print(f"   ❌ Mindestens 4 Wegpunkte nötig für Spline (habe {len(wps)})")
             return False
 
-        print(f"   ✅ {len(wps)} Wegpunkte geladen")
-        print(f"   Original-Dauer: {wps[-1]['t']:.2f}s")
-        print(f"   Gripper-Befehle: {len(self._data['gripper_cmds'])}")
-
         # Offset anwenden
         offset = self._manual_offset if self._manual_offset else self._data["offset"]
         has_offset = any(abs(v) > 0.001 for v in offset.values())
 
         if has_offset:
-            print(f"\n   📐 Offset-Korrektur aktiv:")
-            print(f"      Δb={offset['b']:+.3f}° Δs={offset['s']:+.3f}° "
-                  f"Δe={offset['e']:+.3f}° Δh={offset['h']:+.3f}°")
             wps = apply_offset_to_waypoints(wps, offset)
 
         # Trajektorie erstellen
-        print(f"\n🧮 Erstelle glatte Trajektorie (Cubic Spline)...")
         self._trajectory = SmoothTrajectory(wps, self._speed)
         duration = self._trajectory.get_duration()
-        
-        print(f"   Geglättete Dauer: {duration:.2f}s")
-        print(f"   Stream-Rate: {self._stream_hz} Hz")
-        print(f"   Erwartete Befehle: ~{int(duration * self._stream_hz)}")
         
         # Geschwindigkeitsprofil-Statistik
         n_test = 100
         speeds = [self._trajectory.get_speed_at(t) for t in np.linspace(0, duration, n_test)]
-        print(f"   Speed-Profil: min={min(speeds):.2f}x max={max(speeds):.2f}x avg={np.mean(speeds):.2f}x")
 
         # Gelenkbereiche anzeigen
         for j in ["b", "s", "e", "h"]:
             vals = [wp[j] for wp in wps]
-            print(f"   {j}: {min(vals):.2f}° → {max(vals):.2f}° (Δ{max(vals)-min(vals):.2f}°)")
+
+        print_trajectory_info(
+            n_waypoints=len(wps),
+            duration_original=wps[-1]['t'],
+            duration_smooth=duration,
+            stream_hz=self._stream_hz,
+            speed_stats={"min": min(speeds), "max": max(speeds), "avg": float(np.mean(speeds))},
+            joint_ranges={
+                j: {"min": min(wp[j] for wp in wps), "max": max(wp[j] for wp in wps)}
+                for j in ["b", "s", "e", "h"]
+            },
+            has_offset=has_offset,
+            offset=offset,
+        )
 
         # PRE-FLIGHT CHECK
         print(f"\n✈️  Pre-Flight Trajektorien-Check...")
