@@ -11,6 +11,7 @@ Enthält:
 - Gemeinsame Konstanten
 """
 
+import sys
 import json
 import time
 import math
