@@ -838,6 +838,44 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
     # MODELL FITTEN + ERGEBNIS MIT calibration_summary()
     # ═══════════════════════════════════════════════════════════
 
+    console.print(f"\n")
+    console.print(Panel(
+        "[bold]Möchtest du zusätzlich manuelle Verifikationspunkte erfassen?[/]\n\n"
+        "Das verbessert die Kalibrierung mit Real-World Ground Truth.\n"
+        "Du ziehst den Arm an Positionen und sagst wo er wirklich ist.\n\n"
+        "[dim]Empfohlen: 3-5 Punkte an kritischen Arbeitspositionen.[/]",
+        title="Manuelle Verifikation?",
+        border_style="magenta",
+    ))
+    
+    manual_input = input("  Anzahl Punkte (0 = überspringen, empfohlen: 5): ").strip()
+    n_manual = 0
+    try:
+        n_manual = int(manual_input) if manual_input else 0
+    except ValueError:
+        n_manual = 0
+    
+    if n_manual > 0:
+        manual_points = run_manual_verification(arm, n_points=n_manual)
+        
+        if manual_points:
+            # Manuelle Punkte in die Kalibrierungsdaten integrieren
+            old_count = len(commanded)
+            commanded, errors = integrate_manual_points(
+                commanded, errors, manual_points, weight=2.0
+            )
+            new_count = len(commanded)
+            
+            print_success(f"{new_count - old_count} manuelle Datenpunkte hinzugefügt "
+                         f"(gewichtet ×2)")
+            
+            # In Diagnostik speichern
+            diagnostics["manual_verification"] = {
+                "n_points": len(manual_points),
+                "points": manual_points,
+                "weight": 2.0,
+            }
+
     print_section("MODELL FITTEN")
     print_info(f"Fitte Polynom 2. Ordnung ({len(commanded)} Datenpunkte, "
                f"je gemittelt über {repeats} Messungen)...")
@@ -872,6 +910,159 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
         move_to_safe_up(arm, current_pose=None)
 
     return model
+
+# ============================================================
+# MANUELLE VERIFIKATIONSPUNKTE (Real-World Ground Truth)
+# ============================================================
+
+def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
+    """
+    Lässt den User den Arm N mal manuell positionieren.
+    Misst wo der Arm denkt dass er ist (Servo-Feedback),
+    dann korrigiert der User mit der realen Position.
+
+    Returns:
+        Liste von Dicts: {"servo_reading": {...}, "real_position": {...}}
+    """
+    manual_points = []
+
+    print_section("MANUELLE VERIFIKATION (Real-World Ground Truth)")
+    console.print(Panel(
+        f"[bold]Du wirst den Arm [cyan]{n_points}×[/cyan] manuell positionieren.[/]\n\n"
+        "Ablauf pro Punkt:\n"
+        "  1. [ENTER] → Torque wird AUS, Arm ist frei\n"
+        "  2. Ziehe den Arm an eine beliebige Position\n"
+        "  3. [ENTER] → Arm misst wo er denkt dass er ist\n"
+        "  4. Du gibst ein wo er WIRKLICH ist (gemessen)\n"
+        "  5. Diese Info verbessert die Kalibrierung\n\n"
+        "[dim]Tipp: Nutze Lineal, Winkelmesser, oder markierte Punkte\n"
+        "auf dem Tisch als Referenz.[/]",
+        title="Manuelle Verifikation",
+        border_style="magenta",
+        box=box.ROUNDED,
+    ))
+
+    for i in range(n_points):
+        console.print(f"\n  [bold magenta]── Punkt {i+1}/{n_points} ──[/]")
+
+        # Schritt 1: Torque aus, User positioniert
+        console.print("  [dim]Drücke [ENTER] um Torque zu deaktivieren...[/]")
+        input()
+
+        arm.torque_off()
+        time.sleep(0.3)
+
+        console.print("  [bold green]✋ Torque AUS[/] – Ziehe den Arm an die gewünschte Position.")
+        console.print("  [dim]Drücke [ENTER] wenn der Arm an der Zielposition ist...[/]")
+        input()
+
+        # Schritt 2: Messen wo der Arm denkt dass er ist
+        # Kurz Torque an für stabilen Read (wie Gravity Comp in teach.py)
+        arm.torque_on()
+        time.sleep(0.05)  # Minimal, nur für stabilen Servo-Read
+
+        servo_reading = arm.read_position_averaged(n=10, interval=0.05)
+
+        if not servo_reading:
+            print_warning("Konnte Position nicht lesen, überspringe...")
+            arm.torque_off()
+            continue
+
+        console.print(f"\n  [bold]Servo denkt er ist bei:[/]")
+        console.print(f"    b = [cyan]{servo_reading['b']:+8.3f}°[/]  "
+                      f"(σ={servo_reading['b_std']:.4f}°)")
+        console.print(f"    s = [cyan]{servo_reading['s']:+8.3f}°[/]  "
+                      f"(σ={servo_reading['s_std']:.4f}°)")
+        console.print(f"    e = [cyan]{servo_reading['e']:+8.3f}°[/]  "
+                      f"(σ={servo_reading['e_std']:.4f}°)")
+
+        # Schritt 3: User gibt reale Position ein
+        console.print(f"\n  [bold]Wo ist der Arm WIRKLICH? (reale Messung)[/]")
+        console.print(f"  [dim](Leer = Servo-Wert übernehmen, d.h. kein Fehler)[/]")
+
+        real_position = {}
+        for joint in JOINTS:
+            default = servo_reading[joint]
+            while True:
+                val = input(f"    {joint} real [Servo={default:+.3f}°]: ").strip()
+                if val == "":
+                    real_position[joint] = default
+                    break
+                try:
+                    real_position[joint] = float(val)
+                    break
+                except ValueError:
+                    console.print("    [red]Ungültige Eingabe![/]")
+
+        # Differenz anzeigen
+        diff = {j: real_position[j] - servo_reading[j] for j in JOINTS}
+        console.print(f"\n  [bold]Differenz (Real - Servo):[/]")
+        for j in JOINTS:
+            color = "green" if abs(diff[j]) < 0.5 else "yellow" if abs(diff[j]) < 2.0 else "red"
+            console.print(f"    Δ{j} = [{color}]{diff[j]:+.3f}°[/]")
+
+        manual_points.append({
+            "servo_reading": {j: servo_reading[j] for j in JOINTS},
+            "real_position": real_position,
+            "servo_std": {j: servo_reading[f"{j}_std"] for j in JOINTS},
+        })
+
+        # Torque wieder aus für nächsten Punkt (oder an lassen am Ende)
+        if i < n_points - 1:
+            arm.torque_off()
+            time.sleep(0.2)
+
+    # Am Ende Torque an
+    arm.torque_on()
+    time.sleep(0.3)
+
+    console.print(f"\n  [bold green]✅ {len(manual_points)} manuelle Punkte erfasst![/]")
+
+    return manual_points
+
+
+def integrate_manual_points(commanded: list, errors: list,
+                            manual_points: list, weight: float = 2.0):
+    """
+    Integriert manuelle Verifikationspunkte in die Kalibrierungsdaten.
+
+    Die manuellen Punkte werden als zusätzliche Datenpunkte behandelt,
+    wobei die "commanded" Position = Servo-Reading ist und der
+    "error" = Real - Servo.
+
+    Args:
+        commanded: Bisherige Soll-Posen (aus automatischer Kalibrierung)
+        errors: Bisherige Fehler (Ist - Soll)
+        manual_points: Ergebnis von run_manual_verification()
+        weight: Gewichtung der manuellen Punkte (>1 = stärker gewichtet)
+
+    Returns:
+        (new_commanded, new_errors) - Erweiterte Listen
+    """
+    new_commanded = list(commanded)
+    new_errors = list(errors)
+
+    for point in manual_points:
+        servo = point["servo_reading"]
+        real = point["real_position"]
+
+        # Der "commanded" Wert ist hier die Servo-Position
+        # (= was der Arm denkt wo er ist)
+        # Der "error" ist Real - Servo
+        # (= wie weit die Realität vom Servo-Feedback abweicht)
+
+        pose = {j: servo[j] for j in JOINTS}
+        pose["h"] = 180.0  # Dummy
+
+        error = {j: real[j] - servo[j] for j in JOINTS}
+
+        # Mehrfach einfügen für höhere Gewichtung
+        n_copies = max(1, int(weight))
+        for _ in range(n_copies):
+            new_commanded.append(pose)
+            new_errors.append(error)
+
+    return new_commanded, new_errors
 
 # ============================================================
 # MAIN
