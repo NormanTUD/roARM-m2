@@ -58,43 +58,27 @@ HAND_LENGTH = 80.0       # Gripper-Länge
 # ============================================================
 
 def forward_kinematics(b_deg: float, s_deg: float, e_deg: float, h_deg: float) -> dict:
-    """
-    Winkel-Konvention RoArm-M2-S:
-    - b: Base-Rotation um Z. b=0 → nach vorne (+X).
-    - s: Shoulder. Winkel von der Vertikalen nach vorne.
-         s=0 → Oberarm zeigt GERADE NACH OBEN.
-         s=90 → Oberarm horizontal nach vorne.
-    - e: Elbow. Innenwinkel zwischen Ober- und Unterarm.
-         e=90° → rechter Winkel
-         e=180° → gestreckt
-    - h: Hand/Gripper-Rotation
-    """
     b_rad = math.radians(b_deg)
-    s_rad = math.radians(-s_deg)
+    s_rad = math.radians(s_deg)  # NICHT negieren!
 
     base = np.array([0.0, 0.0, 0.0])
     shoulder = np.array([0.0, 0.0, BASE_HEIGHT])
 
-    # Oberarm-Vektor (im XZ-Plane, vor Base-Rotation)
-    # Winkel s von der Vertikalen (+Z) Richtung +X gemessen
-    elbow_local_x = UPPER_ARM * math.sin(s_rad)
-    elbow_local_z = BASE_HEIGHT + UPPER_ARM * math.cos(s_rad)
+    # Shoulder: s=0 → horizontal nach vorne, s>0 → nach oben, s<0 → nach unten
+    # Winkel von der Horizontalen gemessen (nicht von der Vertikalen!)
+    elbow_local_x = UPPER_ARM * math.cos(math.radians(s_deg))
+    elbow_local_z = BASE_HEIGHT + UPPER_ARM * math.sin(math.radians(s_deg))
 
-    # Unterarm: absoluter Winkel von +Z = s + (180° - e)
-    # Begründung:
-    #   - Oberarm zeigt in Richtung "s von +Z"
-    #   - Elbow-Innenwinkel e: bei e=180° ist der Arm gestreckt,
-    #     also Unterarm geht in GLEICHER Richtung wie Oberarm weiter
-    #   - Die Abweichung von "gestreckt" ist (180° - e)
-    #   - Diese Abweichung geht im Uhrzeigersinn (nach vorne/unten)
-    forearm_angle = s_rad + math.radians(180.0 - e_deg)
+    # Elbow: e ist der Innenwinkel zwischen Ober- und Unterarm
+    # e=180° → gestreckt, e=90° → rechter Winkel
+    # Der Unterarm knickt NACH UNTEN relativ zum Oberarm ab
+    forearm_abs_angle = math.radians(s_deg) - math.radians(180.0 - e_deg)
+    
+    wrist_local_x = elbow_local_x + FOREARM * math.cos(forearm_abs_angle)
+    wrist_local_z = elbow_local_z + FOREARM * math.sin(forearm_abs_angle)
 
-    wrist_local_x = elbow_local_x + FOREARM * math.sin(forearm_angle)
-    wrist_local_z = elbow_local_z + FOREARM * math.cos(forearm_angle)
-
-    # Hand: gleiche Richtung wie Unterarm
-    hand_local_x = wrist_local_x + HAND_LENGTH * math.sin(forearm_angle)
-    hand_local_z = wrist_local_z + HAND_LENGTH * math.cos(forearm_angle)
+    hand_local_x = wrist_local_x + HAND_LENGTH * math.cos(forearm_abs_angle)
+    hand_local_z = wrist_local_z + HAND_LENGTH * math.sin(forearm_abs_angle)
 
     # Base-Rotation um Z-Achse
     cos_b = math.cos(b_rad)
