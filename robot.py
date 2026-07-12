@@ -19,6 +19,69 @@ import serial
 import serial.tools.list_ports
 from typing import Optional
 
+# Am Anfang von robot.py hinzufügen (nach den bestehenden Imports):
+
+import logging
+from datetime import datetime
+
+# ============================================================
+# ZENTRALES COMMAND-LOGGING
+# ============================================================
+
+def setup_command_logger(log_dir: str = "logs") -> logging.Logger:
+    """Richtet den zentralen Command-Logger ein.
+
+    Loggt ALLES was an den Robot gesendet wird in eine
+    menschenlesbare Datei mit Timestamp.
+
+    Log-Format:
+        2026-07-12 07:27:03.142 | SEND | {"T":122,"b":10.0,"s":5.0,"e":85.0,"h":180.0,"spd":20,"acc":10}
+        2026-07-12 07:27:03.158 | RECV | {"T":1051,"b":0.17,"s":0.08,"e":1.57,"t":3.14}
+        2026-07-12 07:27:03.200 | SEND_FAST | {"T":122,"b":10.5,...}
+        2026-07-12 07:27:05.000 | NOTE | Torque ON (all servos)
+    """
+    from pathlib import Path
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = Path(log_dir) / f"robot_commands_{timestamp}.log"
+
+    logger = logging.getLogger("roarm.commands")
+    logger.setLevel(logging.DEBUG)
+
+    # Keine doppelten Handler
+    if logger.handlers:
+        return logger
+
+    # Datei-Handler: Alles loggen
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+
+    # Menschenlesbares Format mit Millisekunden
+    fmt = logging.Formatter(
+        '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    # Optional: Auch auf Console (nur Warnungen+)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    logger.info(f"=== SESSION START === Port wird gleich verbunden")
+    logger.info(f"Python: {sys.version}")
+    logger.info(f"Log-Datei: {log_file}")
+
+    print(f"  📝 Command-Log: {log_file}")
+
+    return logger
+
+
+# Globaler Logger (wird beim ersten Import initialisiert)
+_cmd_logger = setup_command_logger()
 
 # ============================================================
 # GEMEINSAME KONSTANTEN
@@ -127,24 +190,24 @@ class RoArmConnection:
         time.sleep(init_delay)
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
+        
+        # Logger referenzieren
+        self._log = logging.getLogger("roarm.commands")
+        self._log.info(f"=== CONNECTED === port={port} baud={baudrate}")
 
     # ----------------------------------------------------------
     # LOW-LEVEL KOMMUNIKATION
     # ----------------------------------------------------------
 
     def send_cmd(self, cmd: dict, timeout: float = 0.2) -> str:
-        """Sendet einen JSON-Befehl und wartet auf Antwort.
-        
-        Args:
-            cmd: Dictionary das als JSON gesendet wird
-            timeout: Max. Wartezeit auf Antwort in Sekunden
-            
-        Returns:
-            Antwort-String oder "" wenn keine Antwort
-        """
+        """Sendet einen JSON-Befehl und wartet auf Antwort."""
         with self._lock:
             self._ser.reset_input_buffer()
             msg = json.dumps(cmd, separators=(',', ':'))
+            
+            # >>> LOGGING: Was gesendet wird
+            self._log.info(f"SEND     | {msg}")
+            
             self._ser.write(msg.encode() + b'\n')
             self._ser.flush()
             time.sleep(0.01)
@@ -156,20 +219,28 @@ class RoArmConnection:
                     line = self._ser.readline().decode('utf-8', errors='ignore').strip()
                     if line:
                         response = line
+                        
+                        # >>> LOGGING: Was empfangen wird
+                        self._log.info(f"RECV     | {line}")
+                        
                         if '"T":1051' in line or '"b"' in line:
                             return line
                 else:
                     time.sleep(0.005)
+            
+            if not response:
+                self._log.warning(f"TIMEOUT  | Keine Antwort auf: {msg}")
+            
             return response
 
     def send_cmd_fast(self, cmd: dict):
-        """Sendet Befehl OHNE auf Antwort zu warten (für Streaming).
-        
-        Achtung: Kein Feedback ob Befehl angekommen ist!
-        Nur für High-Frequency-Streaming verwenden.
-        """
+        """Sendet Befehl OHNE auf Antwort zu warten (für Streaming)."""
         with self._lock:
             msg = json.dumps(cmd, separators=(',', ':'))
+            
+            # >>> LOGGING: Fast-Send
+            self._log.debug(f"SEND_FAST| {msg}")
+            
             self._ser.write(msg.encode() + b'\n')
             self._ser.flush()
 
@@ -336,7 +407,8 @@ class RoArmConnection:
     # ----------------------------------------------------------
 
     def torque_on(self):
-        """Schaltet Torque für alle Servos ein (Arm hält Position)."""
+        """Schaltet Torque für alle Servos ein."""
+        self._log.info("NOTE     | >>> TORQUE ON (all servos)")
         self.send_cmd({"T": 210, "cmd": 1})
         time.sleep(0.03)
         for sid in range(1, 5):
@@ -344,7 +416,8 @@ class RoArmConnection:
             time.sleep(0.02)
 
     def torque_off(self):
-        """Schaltet Torque für alle Servos aus (Arm wird schlaff)."""
+        """Schaltet Torque für alle Servos aus."""
+        self._log.info("NOTE     | >>> TORQUE OFF (all servos)")
         self.send_cmd({"T": 210, "cmd": 0})
         time.sleep(0.03)
         for sid in range(1, 5):
@@ -367,13 +440,13 @@ class RoArmConnection:
     # GRIPPER
     # ----------------------------------------------------------
 
-    def gripper_open(self):
-        """Öffnet den Gripper."""
-        self.send_cmd({"T": 106, "cmd": 1.08, "spd": 50, "acc": 20})
+        def gripper_open(self):
+            self._log.info("NOTE     | >>> GRIPPER OPEN")
+            self.send_cmd({"T": 106, "cmd": 1.08, "spd": 50, "acc": 20})
 
-    def gripper_close(self):
-        """Schließt den Gripper."""
-        self.send_cmd({"T": 106, "cmd": 3.14, "spd": 50, "acc": 20})
+        def gripper_close(self):
+            self._log.info("NOTE     | >>> GRIPPER CLOSE")
+            self.send_cmd({"T": 106, "cmd": 3.14, "spd": 50, "acc": 20})
 
     # ----------------------------------------------------------
     # WARTEN / SETTLING
@@ -450,6 +523,7 @@ class RoArmConnection:
 
     def close(self):
         """Schließt die serielle Verbindung."""
+        self._log.info("=== DISCONNECTED ===")
         if self._ser and self._ser.is_open:
             self._ser.close()
 
