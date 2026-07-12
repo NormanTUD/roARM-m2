@@ -463,3 +463,28 @@ class RoArmConnection:
     def serial(self) -> serial.Serial:
         """Zugriff auf das Serial-Objekt (für Safety-Layer Buffer-Flush)."""
         return self._ser
+
+# ============================================================
+# OPTIONAL: 3D-VISUALISIERUNG
+# ============================================================
+
+def create_visualized_arm(port: str = None, **kwargs) -> "VisualizingArm":
+    """
+    Erstellt eine RoArmConnection MIT 3D-Visualisierung.
+
+    Jede Bewegung wird automatisch im 3D-Plot angezeigt.
+
+    Usage:
+        from robot import create_visualized_arm
+        arm = create_visualized_arm()
+        arm.move_to(30, 10, 60, 180)  # Wird live im 3D-Plot gezeigt!
+        arm.close()
+    """
+    from visualize import VisualizingArm
+
+    port = port or find_arm_port()
+    if port is None:
+        raise RuntimeError("Kein serieller Port gefunden!")
+
+    raw_arm = RoArmConnection(port, **kwargs)
+    return VisualizingArm(raw_arm)

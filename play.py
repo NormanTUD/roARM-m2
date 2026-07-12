@@ -10,6 +10,7 @@ und mit hoher Frequenz an den Arm gestreamt, sodass der Arm nie "anhält".
 #     "numpy",
 #     "scipy",
 #     "rich",
+#     "matplotlib",
 # ]
 # ///
 
@@ -335,7 +336,7 @@ class SmoothPlayer:
 
     def __init__(self, filepath: str, port: str = None, speed: float = 1.0,
                  loop: bool = False, verify: bool = True, manual_offset: dict = None,
-                 stream_hz: int = STREAM_HZ):
+                 stream_hz: int = STREAM_HZ, visualize: bool = False):
         self._filepath = filepath
         self._port = port
         self._speed = speed
@@ -351,6 +352,7 @@ class SmoothPlayer:
         self._current_monitor: CurrentMonitor = None
         self._thermal: ThermalEstimator = None
         self._rate_limiter: RateLimiter = None
+        self._visualize = visualize
 
         # Kalibrierungsmodell laden
         self._cal_model = None
@@ -397,6 +399,13 @@ class SmoothPlayer:
             return False
         try:
             self._arm_raw = RoArmConnection(port)
+
+            if self._visualize:
+                from visualize import VisualizingArm
+                self._viz_arm = VisualizingArm(self._arm_raw, show_target=True, trail=True)
+                print("   🖥️  3D-Visualisierung aktiv")
+            else:
+                self._viz_arm = None
 
             print_connection_status(port, success=True, safety_features=[
                 "SafeArm (Positions-/Speed-Validierung)",
@@ -707,6 +716,12 @@ class SmoothPlayer:
                         except Exception:
                             pass  # Read-Fehler während Streaming sind OK, nicht kritisch
 
+                    if self._viz_arm:
+                        self._viz_arm.visualizer.update_pose(
+                            corrected["b"], corrected["s"],
+                            corrected["e"], corrected["h"]
+                        )
+
                     # Live-Ausgabe
                     speed_now = traj.get_speed_at(elapsed)
                     bar_len = int((speed_now / MAX_SPEED_FACTOR) * 20)
@@ -926,6 +941,9 @@ class SmoothPlayer:
         if self._rate_limiter and self._rate_limiter.violations > 0:
             print(f"   Rate-Limiter Eingriffe gesamt: {self._rate_limiter.violations}")
 
+        if self._viz_arm:
+            self._viz_arm.visualizer.stop()
+
         print("✅ Fertig!\n")
 
 
@@ -948,6 +966,8 @@ def main():
                    help=f"Stream-Frequenz in Hz (default: {STREAM_HZ})")
     p.add_argument("--offset", type=str, default=None,
                    help="Manueller Offset: 'b=0.5,s=-0.3,e=0.1,h=0.0'")
+    p.add_argument("-V", "--visualize", action="store_true",
+                   help="3D-Visualisierung des Arms während der Wiedergabe")
     args = p.parse_args()
 
     # Manuellen Offset parsen
@@ -966,6 +986,7 @@ def main():
         verify=not args.no_verify,
         manual_offset=manual_offset,
         stream_hz=args.hz,
+        visualize=args.visualize,
     )
     player.run()
 
