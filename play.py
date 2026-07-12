@@ -268,13 +268,27 @@ class SmoothTrajectory:
         """Erstellt Cubic Splines für jedes Gelenk."""
         times = np.array([wp["t"] for wp in self._waypoints])
         
+        # FIX: Wenn erstes Sample nicht bei t=0 ist, 
+        # füge einen Punkt bei t=0 ein (= gleiche Position wie erster Punkt)
+        if times[0] > 0.01:
+            # Stillstand am Anfang: Position bei t=0 = Position bei erstem Wegpunkt
+            t_pad = np.array([0.0, times[0] * 0.5])  # Zwei Punkte für stabilen Start
+            times = np.concatenate([t_pad, times])
+            
         for joint in ["b", "s", "e", "h"]:
             values = np.array([wp[joint] for wp in self._waypoints])
-            # bc_type='natural' → Beschleunigung = 0 an den Enden (sanfter Start/Stopp)
-            self._splines[joint] = CubicSpline(times, values, bc_type='natural')
+            
+            # FIX: Padding-Werte = erster Wegpunkt (Stillstand)
+            if len(times) > len(values):
+                first_val = values[0]
+                pad = np.array([first_val, first_val])
+                values = np.concatenate([pad, values])
+            
+            # bc_type='clamped' statt 'natural' → Geschwindigkeit = 0 an den Enden
+            self._splines[joint] = CubicSpline(times, values, bc_type='clamped')
         
         self._original_duration = times[-1]
-    
+      
     def _compute_adaptive_timing(self):
         """
         Berechnet eine Zeitumparametrisierung:
