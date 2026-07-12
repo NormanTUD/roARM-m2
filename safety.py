@@ -13,8 +13,6 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from play import SmoothTrajectory
-
 # ============================================================
 # SICHERHEITS-GRENZEN (anpassen an deinen Arm!)
 # ============================================================
@@ -500,7 +498,7 @@ class TrajectoryValidator:
     def __init__(self, limits: SafetyLimits):
         self.limits = limits
 
-    def validate_full_trajectory(self, trajectory: SmoothTrajectory,
+    def validate_full_trajectory(self, trajectory,
                                   hz: int = 100) -> tuple[bool, list]:
         """
         Samplet die gesamte Trajektorie mit hoher Rate und prüft:
