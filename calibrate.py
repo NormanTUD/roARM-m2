@@ -21,6 +21,7 @@ Flags:
 # dependencies = [
 #     "pyserial",
 #     "numpy",
+#     "rich",
 # ]
 # ///
 
@@ -51,6 +52,13 @@ import math
 import serial
 import serial.tools.list_ports
 import threading
+
+from ui import (
+    console, print_banner, print_section, print_step,
+    calibration_progress, calibration_pose_table, calibration_summary,
+    print_connection_status, print_success, print_warning,
+    joint_table, print_position,
+)
 
 # ============================================================
 # KONFIGURATION
@@ -638,14 +646,7 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
 
     total_measurements = len(poses) * repeats
 
-    print(f"\n{'='*60}")
-    print(f"  KALIBRIERUNG - {len(poses)} Posen × {repeats} Wiederholungen = {total_measurements} Messungen")
-    print(f"  Kalibriert: b (Base), s (Shoulder), e (Elbow)")
-    print(f"  Modus: {'AUTO (Servo-Werte)' if auto_accept else 'MANUELL (User misst)'}")
-    print(f"  Posen-Set: {pose_set_name}")
-    print(f"  Safe-UP Position: b={SAFE_UP_POSITION['b']:.0f}° s={SAFE_UP_POSITION['s']:.0f}° "
-          f"e={SAFE_UP_POSITION['e']:.0f}°")
-    print(f"{'='*60}")
+    print_banner("calibrate", f"{len(poses)} Posen × {repeats} Wiederholungen = {total_measurements} Messungen")
 
     if not auto_accept:
         print(f"\n  Ablauf pro Messung:")
