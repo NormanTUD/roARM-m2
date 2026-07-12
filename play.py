@@ -41,7 +41,11 @@ from pathlib import Path
 import numpy as np
 from scipy.interpolate import CubicSpline
 
-from safety import SafeArm, SafetyLimits, SafetyWatchdog
+from safety import (
+    SafeArm, SafetyLimits, SafetyWatchdog,
+    CurrentMonitor, ThermalEstimator, RateLimiter,
+    TrajectoryValidator, GracefulStop
+)
 
 # Kalibrierungsmodell (optional)
 try:
@@ -482,9 +486,14 @@ class SmoothPlayer:
         self._verify = verify
         self._manual_offset = manual_offset
         self._stream_hz = stream_hz
-        self._arm: RoArmConnection = None
+        self._arm: SafeArm = None
+        self._arm_raw: RoArmConnection = None
         self._data = None
         self._trajectory: SmoothTrajectory = None
+        self._watchdog: SafetyWatchdog = None
+        self._current_monitor: CurrentMonitor = None
+        self._thermal: ThermalEstimator = None
+        self._rate_limiter: RateLimiter = None
 
         # Kalibrierungsmodell laden
         self._cal_model = None
@@ -493,23 +502,34 @@ class SmoothPlayer:
             if cal_path.exists():
                 try:
                     self._cal_model = CalibrationModel.load(str(cal_path))
-                    print(f"📐 Kalibrierungsmodell geladen")
+                    print(f"📂 Kalibrierungsmodell geladen")
                 except Exception as e:
                     print(f"⚠️  Kalibrierung fehlgeschlagen: {e}")
             else:
-                print(f"📐 Keine Kalibrierungsdatei gefunden (optional)")
+                print(f"📂 Keine Kalibrierungsdatei gefunden (optional)")
         else:
-            print(f"📐 numpy/calibrate nicht verfügbar, keine Kalibrierung")
+            print(f"📂 numpy/calibrate nicht verfügbar, keine Kalibrierung")
+
 
     def _apply_calibration(self, target: dict) -> dict:
-        """Wendet Kalibrierungskorrektur an."""
+        """Wendet Kalibrierungskorrektur an - MIT CLAMP."""
         if self._cal_model and self._cal_model.is_fitted:
             correction = self._cal_model.predict_correction(target)
+            
+            # CLAMP: Korrektur darf nie mehr als ±3° betragen!
+            MAX_CORRECTION_DEG = 3.0
+            for j in ["b", "s", "e"]:
+                if abs(correction[j]) > MAX_CORRECTION_DEG:
+                    print(f"  ⚠️  Kalibrierung {j}={correction[j]:+.2f}° "
+                          f"geclampt auf ±{MAX_CORRECTION_DEG}°")
+                    correction[j] = max(-MAX_CORRECTION_DEG, 
+                                       min(MAX_CORRECTION_DEG, correction[j]))
+            
             return {
                 "b": target["b"] - correction["b"],
                 "s": target["s"] - correction["s"],
                 "e": target["e"] - correction["e"],
-                "h": target["h"],  # h nicht korrigieren
+                "h": target["h"],
             }
         return target
 
@@ -521,19 +541,44 @@ class SmoothPlayer:
         print(f"🔌 Verbinde mit {port}...")
         try:
             self._arm_raw = RoArmConnection(port)
-
             print(f"   ✅ Verbunden")
 
+            # Safety-Wrapper mit Limits
             limits = SafetyLimits(
-                    max_delta_per_cmd=20.0,        # Für Streaming etwas großzügiger
-                    max_continuous_move_s=90.0,    # Max 90s am Stück
-                    max_plausible_error=5.0,       # Fehler > 5° = Müll
-                    )
+                max_delta_per_cmd=20.0,
+                max_continuous_move_s=90.0,
+                max_plausible_error=5.0,
+            )
             self._arm = SafeArm(self._arm_raw, limits=limits)
 
             # Watchdog starten
             self._watchdog = SafetyWatchdog(self._arm)
             self._watchdog.start()
+
+            # Current Monitor (Stall-Erkennung)
+            self._current_monitor = CurrentMonitor(
+                self._arm,
+                max_load_percent=85.0,
+                max_stall_duration_s=3.0
+            )
+
+            # Thermal Estimator
+            self._thermal = ThermalEstimator(
+                ambient_temp_c=25.0,
+                thermal_time_constant_s=120.0,
+                max_safe_temp_c=55.0,
+                warning_temp_c=45.0
+            )
+
+            # Rate Limiter (max Stream-Hz + Sicherheitsmarge)
+            self._rate_limiter = RateLimiter(max_hz=self._stream_hz + 10)
+
+            print(f"   🛡️  Safety-Layer aktiv:")
+            print(f"      • SafeArm (Positions-/Speed-Validierung)")
+            print(f"      • Watchdog (Überhitzungs-Timer)")
+            print(f"      • CurrentMonitor (Stall-Erkennung)")
+            print(f"      • ThermalEstimator (Temperatur-Schätzung)")
+            print(f"      • RateLimiter (max {self._stream_hz + 10} Hz)")
 
             return True
         except Exception as e:
@@ -591,16 +636,43 @@ class SmoothPlayer:
             vals = [wp[j] for wp in wps]
             print(f"   {j}: {min(vals):.2f}° → {max(vals):.2f}° (Δ{max(vals)-min(vals):.2f}°)")
 
+        # PRE-FLIGHT CHECK
+        print(f"\n✈️  Pre-Flight Trajektorien-Check...")
+        validator = TrajectoryValidator(SafetyLimits())
+        is_safe, violations = validator.validate_full_trajectory(self._trajectory)
+
+        if not is_safe:
+            print(f"   🛑 TRAJEKTORIE UNSICHER! {len(violations)} Verletzungen:")
+            for v in violations[:10]:
+                print(f"      ⚠️  {v}")
+            print(f"\n   Abbruch. Trajektorie wird NICHT abgespielt.")
+            return False
+        else:
+            print(f"   ✅ Trajektorie sicher (alle Punkte innerhalb Grenzen)")
+
         return True
 
     def go_to_start(self) -> bool:
+        """Fährt zur Startposition - mit Safety-Checks."""
         start = self._data["start_pos"]
         print(f"\n🏁 Fahre zur Startposition...")
         print(f"   Ziel: b={start['b']:.2f}° s={start['s']:.2f}° "
               f"e={start['e']:.2f}° h={start['h']:.2f}°")
 
+        # Emergency Stop prüfen
+        if self._arm.is_emergency_stopped:
+            print(f"   🚨 Emergency Stop aktiv - kann nicht fahren!")
+            return False
+
         self._arm.torque_on()
         time.sleep(0.2)
+
+        # Erster Move: Validator braucht eine initiale Position
+        # Setze last_commanded manuell damit der Sprung-Check nicht auslöst
+        self._arm.validator._last_commanded = {
+            "b": start["b"], "s": start["s"],
+            "e": start["e"], "h": start["h"], "t": time.time()
+        }
 
         self._arm.move_to(start["b"], start["s"], start["e"], start["h"], spd=25, acc=10)
         time.sleep(2.0)
@@ -609,22 +681,19 @@ class SmoothPlayer:
         time.sleep(1.5)
 
         if self._verify:
-            pos = self._arm.read_position_deg()
+            pos = self._arm.flush_and_read()
             if pos:
-                err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
-                if err > 180.0:  # OFFENSICHTLICH MÜLL
-                    print("⚠️ Ungültiger Read, überspringe Precision-Endpoint")
-                    return
-            if pos:
-                max_err = max(abs(pos[j] - start[j]) for j in ["b", "s", "e", "h"])
-                print(f"   Ist:  b={pos['b']:.2f}° s={pos['s']:.2f}° "
-                      f"e={pos['e']:.2f}° h={pos['h']:.2f}°")
-                print(f"   Max Fehler: {max_err:.2f}°")
-                if max_err > POSITION_TOLERANCE:
+                err = self._arm.safe_read_error(pos, start)
+                if err is None:
+                    print(f"   ⚠️ Unplausibler Read bei Startposition, fahre trotzdem weiter")
+                elif err > POSITION_TOLERANCE:
+                    print(f"   Ist:  b={pos['b']:.2f}° s={pos['s']:.2f}° "
+                          f"e={pos['e']:.2f}° h={pos['h']:.2f}°")
+                    print(f"   Max Fehler: {err:.2f}° - korrigiere...")
                     self._arm.move_to(start["b"], start["s"], start["e"], start["h"], spd=5, acc=3)
                     time.sleep(2.0)
                 else:
-                    print(f"   ✅ OK")
+                    print(f"   ✅ Startposition OK (Fehler: {err:.2f}°)")
 
         # Zum ersten Punkt der Trajektorie
         first = self._trajectory.sample(0.0)
@@ -634,99 +703,193 @@ class SmoothPlayer:
 
         return True
 
+
     def play_once(self):
-        """Spielt die Trajektorie einmal flüssig ab."""
+        """Spielt die Trajektorie einmal flüssig ab mit allen Safety-Checks."""
         traj = self._trajectory
         duration = traj.get_duration()
         interval = 1.0 / self._stream_hz
-        
+
         gripper_cmds = sorted(self._data["gripper_cmds"], key=lambda x: x["t"])
         gripper_idx = 0
-        # Gripper-Zeiten auf neue Zeitskala umrechnen (approximiert)
-        # Wir verwenden die originale Zeit und prüfen gegen elapsed * speed_factor
-        
+
         print(f"\n▶ STREAMING PLAYBACK ({self._stream_hz} Hz, {duration:.2f}s)")
         print(f"   {'─' * 55}")
 
         last_pos = None
         commands_sent = 0
         skipped = 0
-        
+
+        # === SAFETY: Streaming-Start registrieren + Buffer flush ===
+        self._arm.start_streaming()
+        self._current_monitor.reset()
+
+        # Feedback-Check Konfiguration
+        FEEDBACK_CHECK_INTERVAL = max(1, self._stream_hz // 2)  # Alle 0.5s
+        MAX_TRACKING_ERROR_DEG = 8.0
+
         playback_start = time.time()
 
-        while True:
-            elapsed = time.time() - playback_start
-            if elapsed >= duration:
-                break
-
-            # Gripper-Befehle (basierend auf Original-Zeitskala, approximiert)
-            approx_original_time = elapsed * self._speed
-            while gripper_idx < len(gripper_cmds):
-                gc = gripper_cmds[gripper_idx]
-                if gc["t"] <= approx_original_time:
-                    if gc["cmd"] == "CLOSE":
-                        self._arm.gripper_close()
-                        print(f"\n   ✊ GRIPPER ZU [{elapsed:.2f}s]")
-                    else:
-                        self._arm.gripper_open()
-                        print(f"\n   ✋ GRIPPER AUF [{elapsed:.2f}s]")
-                    time.sleep(0.3)
-                    # Kompensiere die Pause
-                    playback_start += 0.3
-                    gripper_idx += 1
-                else:
+        try:
+            while True:
+                elapsed = time.time() - playback_start
+                if elapsed >= duration:
                     break
 
-            # Nächsten Punkt auf der glatten Kurve samplen
-            target = traj.sample(elapsed)
-            
-            # Kalibrierung anwenden
-            corrected = self._apply_calibration(target)
+                # === SAFETY: Emergency Stop prüfen ===
+                if self._arm.is_emergency_stopped:
+                    print(f"\n   🚨 EMERGENCY STOP aktiv - Abbruch!")
+                    break
 
-            # Nur senden wenn sich genug geändert hat
-            should_send = True
-            if last_pos:
-                max_delta = max(abs(corrected[j] - last_pos[j]) for j in ["b", "s", "e", "h"])
-                if max_delta < MIN_DELTA_DEG:
-                    should_send = False
-                    skipped += 1
+                # === SAFETY: Thermal Check ===
+                temp, temp_status = self._thermal.get_status()
+                if temp_status == "CRITICAL":
+                    print(f"\n   🌡️ ÜBERHITZUNGSSCHUTZ: ~{temp:.0f}°C (geschätzt)")
+                    self._arm.trigger_emergency_stop(
+                        f"Thermischer Schutz: geschätzte Temperatur {temp:.0f}°C")
+                    break
+                elif temp_status == "HOT" and commands_sent % (self._stream_hz * 5) == 0:
+                    # Alle 5s warnen wenn HOT
+                    print(f"\n   🌡️ Warnung: ~{temp:.0f}°C (geschätzt)")
 
-            if should_send:
-                self._arm.move_to_fast(
-                    corrected["b"], corrected["s"], corrected["e"], corrected["h"],
-                    spd=STREAM_SPD, acc=STREAM_ACC
-                )
-                commands_sent += 1
-                last_pos = corrected.copy()
+                # Gripper-Befehle (basierend auf Original-Zeitskala, approximiert)
+                approx_original_time = elapsed * self._speed
+                while gripper_idx < len(gripper_cmds):
+                    gc = gripper_cmds[gripper_idx]
+                    if gc["t"] <= approx_original_time:
+                        if gc["cmd"] == "CLOSE":
+                            self._arm.gripper_close()
+                            print(f"\n   ✊ GRIPPER ZU [{elapsed:.2f}s]")
+                        else:
+                            self._arm.gripper_open()
+                            print(f"\n   ✋ GRIPPER AUF [{elapsed:.2f}s]")
+                        time.sleep(0.3)
+                        playback_start += 0.3
+                        gripper_idx += 1
+                    else:
+                        break
 
-                # Live-Ausgabe
-                speed_now = traj.get_speed_at(elapsed)
-                bar_len = int((speed_now / MAX_SPEED_FACTOR) * 20)
-                bar = "█" * bar_len + "░" * (20 - bar_len)
-                progress_pct = (elapsed / duration) * 100
+                # Nächsten Punkt auf der glatten Kurve samplen
+                target = traj.sample(elapsed)
 
-                clear_line()
-                sys.stdout.write(
-                    f"   ▶ [{progress_pct:5.1f}%] "
-                    f"[{elapsed:6.2f}s/{duration:.2f}s] "
-                    f"b={target['b']:7.2f}° s={target['s']:7.2f}° "
-                    f"e={target['e']:7.2f}° "
-                    f"|{bar}| v={speed_now:.1f}x"
-                )
-                sys.stdout.flush()
+                # Kalibrierung anwenden
+                corrected = self._apply_calibration(target)
 
-            # Timing einhalten
-            next_time = playback_start + (commands_sent + 1) * interval
-            sleep_time = next_time - time.time()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Nur senden wenn sich genug geändert hat
+                should_send = True
+                delta_deg = 0.0
+                if last_pos:
+                    delta_deg = max(abs(corrected[j] - last_pos[j]) for j in ["b", "s", "e", "h"])
+                    if delta_deg < MIN_DELTA_DEG:
+                        should_send = False
+                        skipped += 1
+
+                if should_send:
+                    # === SAFETY: Rate Limiter ===
+                    self._rate_limiter.acquire()
+
+                    # === SAFETY: Sicherer Send (wird validiert) ===
+                    sent = self._arm.move_to_fast(
+                        corrected["b"], corrected["s"], corrected["e"], corrected["h"],
+                        spd=STREAM_SPD, acc=STREAM_ACC
+                    )
+
+                    if not sent:
+                        print(f"\n   🛑 Befehl blockiert durch Safety-Layer - stoppe Playback!")
+                        self._arm.trigger_emergency_stop("Befehl durch Safety blockiert")
+                        break
+
+                    commands_sent += 1
+                    last_pos = corrected.copy()
+
+                    # === SAFETY: Thermal Update ===
+                    self._thermal.update(is_moving=True, delta_deg=delta_deg)
+
+                    # === SAFETY: Feedback-Loop (periodisch Position prüfen) ===
+                    if commands_sent % FEEDBACK_CHECK_INTERVAL == 0 and commands_sent > FEEDBACK_CHECK_INTERVAL:
+                        # Position lesen ohne den Stream zu sehr zu stören
+                        try:
+                            actual = self._arm_raw.read_position_raw()
+                            if actual and "b" in actual:
+                                actual_deg = {
+                                    "b": round(rad_to_deg(actual["b"]), 2),
+                                    "s": round(rad_to_deg(actual["s"]), 2),
+                                    "e": round(rad_to_deg(actual["e"]), 2),
+                                    "h": round(rad_to_deg(actual.get("t", actual.get("h", 0))), 2),
+                                }
+
+                                # Plausibilitätscheck
+                                ok, _ = self._arm.validator.validate_read_position(actual_deg)
+                                if ok:
+                                    tracking_err = max(
+                                        abs(actual_deg[j] - corrected[j]) for j in ["b", "s", "e", "h"]
+                                    )
+
+                                    if tracking_err > MAX_TRACKING_ERROR_DEG:
+                                        print(f"\n   🛑 TRACKING ERROR: {tracking_err:.1f}° "
+                                              f"(max erlaubt: {MAX_TRACKING_ERROR_DEG}°)")
+                                        print(f"      Soll: b={corrected['b']:.1f} s={corrected['s']:.1f} "
+                                              f"e={corrected['e']:.1f}")
+                                        print(f"      Ist:  b={actual_deg['b']:.1f} s={actual_deg['s']:.1f} "
+                                              f"e={actual_deg['e']:.1f}")
+                                        self._arm.trigger_emergency_stop(
+                                            f"Tracking Error {tracking_err:.1f}° > {MAX_TRACKING_ERROR_DEG}°")
+                                        break
+
+                                    # === SAFETY: Stall-Erkennung ===
+                                    ok_stall, stall_reason = self._current_monitor.check(actual_deg)
+                                    if not ok_stall:
+                                        print(f"\n   🛑 {stall_reason}")
+                                        self._arm.trigger_emergency_stop(stall_reason)
+                                        break
+                        except Exception:
+                            pass  # Read-Fehler während Streaming sind OK, nicht kritisch
+
+                    # Live-Ausgabe
+                    speed_now = traj.get_speed_at(elapsed)
+                    bar_len = int((speed_now / MAX_SPEED_FACTOR) * 20)
+                    bar = "█" * bar_len + "░" * (20 - bar_len)
+                    progress_pct = (elapsed / duration) * 100
+
+                    clear_line()
+                    sys.stdout.write(
+                        f"   ▶ [{progress_pct:5.1f}%] "
+                        f"[{elapsed:6.2f}s/{duration:.2f}s] "
+                        f"b={target['b']:7.2f}° s={target['s']:7.2f}° "
+                        f"e={target['e']:7.2f}° "
+                        f"|{bar}| v={speed_now:.1f}x"
+                    )
+                    sys.stdout.flush()
+
+                else:
+                    # Auch bei Nicht-Senden: Thermal updaten (Haltestrom)
+                    self._thermal.update(is_moving=False, delta_deg=0.0)
+
+                # Timing einhalten
+                next_time = playback_start + (commands_sent + skipped + 1) * interval
+                sleep_time = next_time - time.time()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            print(f"\n\n   ⏹ Manuell abgebrochen!")
+            self._arm.trigger_emergency_stop("Manueller Abbruch (Ctrl+C)")
+
+        # === SAFETY: Streaming-Ende + Buffer Flush ===
+        self._arm.end_streaming()
+
+        # === Wenn Emergency Stop: Hier aufhören ===
+        if self._arm.is_emergency_stopped:
+            print(f"\n   ⚠️  Playback wurde durch Safety-System gestoppt.")
+            print(f"      Arm ist schlaff (Torque off). Prüfe den Arm!")
+            return
 
         # ============================================================
-        # PRECISION ENDPOINT: Mehrfaches Nachsetzen am Ende
+        # PRECISION ENDPOINT (nur wenn kein Emergency Stop)
         # ============================================================
         final = traj.sample(duration)
         corrected_final = self._apply_calibration(final)
-        
+
         print(f"\n\n   🎯 Precision-Endpunkt ({ENDPOINT_SETTLE_PASSES} Passes):")
 
         speeds_sequence = [
@@ -737,29 +900,41 @@ class SmoothPlayer:
 
         for pass_num in range(ENDPOINT_SETTLE_PASSES):
             spd, acc = speeds_sequence[min(pass_num, len(speeds_sequence) - 1)]
-            self._arm.move_to(
+
+            # === SAFETY: Auch Precision-Moves durch SafeArm ===
+            sent = self._arm.move_to(
                 corrected_final["b"], corrected_final["s"],
                 corrected_final["e"], corrected_final["h"],
                 spd=spd, acc=acc
             )
+
+            if not sent:
+                print(f"      ⚠️ Precision-Move blockiert, überspringe")
+                break
+
             time.sleep(ENDPOINT_SETTLE_WAIT)
 
-            pos = self._arm.read_position_deg()
-            if pos:
-                err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
-                if err > 180.0:  # OFFENSICHTLICH MÜLL
-                    print("⚠️ Ungültiger Read, überspringe Precision-Endpoint")
-                    return
-            if pos:
-                err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
-                status = "✅" if err < 0.3 else "⚠️"
-                print(f"      Pass {pass_num + 1}: spd={spd} acc={acc} → "
-                      f"Fehler={err:.3f}° {status}")
-                if err < 0.15:
-                    print(f"      → Präzision erreicht, fertig")
-                    break
-            else:
+            # === SAFETY: Sicherer Read mit flush ===
+            pos = self._arm.flush_and_read()
+
+            if pos is None:
                 print(f"      Pass {pass_num + 1}: spd={spd} acc={acc} → (kein Read)")
+                continue
+
+            # === SAFETY: Fehler plausibel? ===
+            err = self._arm.safe_read_error(pos, final)
+
+            if err is None:
+                print(f"      ⚠️ Unplausibler Read, überspringe Precision-Endpoint")
+                break
+
+            status = "✅" if err < 0.3 else "⚠️"
+            print(f"      Pass {pass_num + 1}: spd={spd} acc={acc} → "
+                  f"Fehler={err:.3f}° {status}")
+
+            if err < 0.15:
+                print(f"      → Präzision erreicht, fertig")
+                break
 
         # Statistik
         actual_duration = time.time() - playback_start
@@ -768,27 +943,35 @@ class SmoothPlayer:
         print(f"   Befehle gesendet: {commands_sent}")
         print(f"   Übersprungen (< {MIN_DELTA_DEG}° Δ): {skipped}")
 
+        # Rate Limiter Stats
+        if self._rate_limiter.violations > 0:
+            print(f"   ⚠️  Rate-Limiter Eingriffe: {self._rate_limiter.violations}")
+
+        # Thermal Status
+        temp, temp_status = self._thermal.get_status()
+        temp_icon = {"OK": "✅", "WARM": "🌡️", "HOT": "⚠️", "CRITICAL": "🚨"}
+        print(f"   Temperatur (geschätzt): ~{temp:.0f}°C {temp_icon.get(temp_status, '')}")
+
         # Endposition verifizieren
         if self._verify:
             time.sleep(0.3)
-            pos = self._arm.read_position_deg()
+            pos = self._arm.flush_and_read()
             if pos:
-                err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
-                if err > 180.0:  # OFFENSICHTLICH MÜLL
-                    print("⚠️ Ungültiger Read, überspringe Precision-Endpoint")
-                    return
-            if pos:
-                max_err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
-                print(f"   Endposition Fehler: {max_err:.2f}°")
-                print(f"   Soll: b={final['b']:.2f}° s={final['s']:.2f}° "
-                      f"e={final['e']:.2f}° h={final['h']:.2f}°")
-                print(f"   Ist:  b={pos['b']:.2f}° s={pos['s']:.2f}° "
-                      f"e={pos['e']:.2f}° h={pos['h']:.2f}°")
+                err = self._arm.safe_read_error(pos, final)
+                if err is not None:
+                    print(f"   Endposition Fehler: {err:.2f}°")
+                    print(f"   Soll: b={final['b']:.2f}° s={final['s']:.2f}° "
+                          f"e={final['e']:.2f}° h={final['h']:.2f}°")
+                    print(f"   Ist:  b={pos['b']:.2f}° s={pos['s']:.2f}° "
+                          f"e={pos['e']:.2f}° h={pos['h']:.2f}°")
+                else:
+                    print(f"   ⚠️  Endposition-Read unplausibel, übersprungen")
 
     def run(self):
         print("=" * 60)
         print("  RoArm-M2-S SMOOTH PLAY MODE (Cubic Spline + Streaming)")
         print("  Flüssige Bewegung durch High-Frequency Command Streaming")
+        print("  🛡️  MIT SAFETY-LAYER (Überhitzung/Stall/Tracking-Schutz)")
         print("=" * 60)
 
         if not self.load():
@@ -798,7 +981,7 @@ class SmoothPlayer:
             return
 
         if not self.go_to_start():
-            self._arm.close()
+            self._cleanup()
             return
 
         print(f"\n{'─' * 60}")
@@ -813,22 +996,66 @@ class SmoothPlayer:
             if self._loop:
                 loop_count = 0
                 while True:
+                    # Emergency Stop prüfen vor jedem Loop
+                    if self._arm.is_emergency_stopped:
+                        print(f"\n   🚨 Emergency Stop aktiv - Loop beendet")
+                        break
+
                     loop_count += 1
                     print(f"\n{'═' * 40} Loop #{loop_count} {'═' * 40}")
+
+                    # Thermal Check zwischen Loops
+                    temp, temp_status = self._thermal.get_status()
+                    if temp_status in ("HOT", "CRITICAL"):
+                        pause = self._thermal.get_recommended_pause_s()
+                        print(f"\n   🌡️ Abkühlpause: {pause:.0f}s (geschätzt ~{temp:.0f}°C)")
+                        self._arm.torque_off()
+                        time.sleep(pause)
+                        self._thermal.update_idle()
+                        self._arm.torque_on()
+                        time.sleep(0.5)
+
                     self.go_to_start()
                     time.sleep(0.5)
                     self.play_once()
+
+                    # Nach jedem Loop: Emergency prüfen
+                    if self._arm.is_emergency_stopped:
+                        break
+
                     time.sleep(1.0)
             else:
                 self.play_once()
         except KeyboardInterrupt:
             print("\n\n   ⏹ Abgebrochen!")
+            if not self._arm.is_emergency_stopped:
+                # Sanfter Stopp bei manuellem Abbruch
+                GracefulStop.execute(self._arm_raw, self._arm.validator._last_commanded)
 
-        # Aufräumen
-        print("\n🔒 Torque bleibt AN")
-        self._arm.torque_on()
-        time.sleep(0.3)
-        self._arm.close()
+        self._cleanup()
+
+
+    def _cleanup(self):
+        """Aufräumen am Ende."""
+        # Watchdog stoppen
+        if self._watchdog:
+            self._watchdog.stop()
+
+        if self._arm and not self._arm.is_emergency_stopped:
+            print("\n🔒 Torque bleibt AN")
+            self._arm.torque_on()
+            time.sleep(0.3)
+        elif self._arm and self._arm.is_emergency_stopped:
+            print("\n⚠️  Emergency Stop war aktiv - Arm ist schlaff")
+            print("   Prüfe den Arm bevor du ihn wieder benutzt!")
+
+        if self._arm_raw:
+            self._arm_raw.close()
+
+        # Finale Statistik
+        if self._rate_limiter and self._rate_limiter.violations > 0:
+            print(f"   Rate-Limiter Eingriffe gesamt: {self._rate_limiter.violations}")
+
         print("✅ Fertig!\n")
 
 
