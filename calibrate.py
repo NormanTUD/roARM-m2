@@ -59,7 +59,7 @@ from ui import (
     console, print_banner, print_section, print_step,
     calibration_progress, calibration_pose_table, calibration_summary,
     print_connection_status, print_success, print_warning,
-    joint_table, print_position,
+    joint_table, print_position, print_info
 )
 
 # ============================================================
