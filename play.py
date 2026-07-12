@@ -535,8 +535,6 @@ class SmoothPlayer:
             self._watchdog = SafetyWatchdog(self._arm)
             self._watchdog.start()
 
-            print(f"   ✅ Safety Watchguard started")
-
             return True
         except Exception as e:
             print(f"   ❌ Fehler: {e}")

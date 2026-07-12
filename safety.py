@@ -404,7 +404,7 @@ class SafetyWatchdog:
         self._running = True
         self._thread = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._thread.start()
-        print("  🐕 Safety Watchdog gestartet")
+        print("   🐕 Safety Watchdog gestartet")
     
     def stop(self):
         self._running = False
