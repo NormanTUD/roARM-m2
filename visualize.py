@@ -58,25 +58,47 @@ HAND_LENGTH = 80.0       # Gripper-Länge
 # ============================================================
 
 def forward_kinematics(b_deg: float, s_deg: float, e_deg: float, h_deg: float) -> dict:
+    """
+    Korrigierte Kinematik für RoArm-M2-S.
+    
+    Konvention (aus realer Arm-Beobachtung):
+    - b: Base-Rotation um Z-Achse. b=0 → +X (nach vorne)
+    - s: Shoulder. s=0 → Oberarm HORIZONTAL nach vorne.
+         s>0 → nach oben, s<0 → nach unten.
+         Winkel von der Horizontalen gemessen!
+    - e: Elbow. Innenwinkel zwischen Ober- und Unterarm.
+         e=180° → gestreckt (Unterarm = Verlängerung Oberarm)
+         e=90° → Unterarm steht 90° zum Oberarm (hängt nach unten in Neutralstellung)
+         Der Unterarm knickt NACH UNTEN/INNEN relativ zum Oberarm.
+    - h: Hand/Gripper-Rotation (beeinflusst nicht die Position)
+    """
     b_rad = math.radians(b_deg)
-    s_rad = math.radians(s_deg)  # NICHT negieren!
+    s_rad = math.radians(s_deg)  # s=0 → horizontal, positiv = nach oben
 
     base = np.array([0.0, 0.0, 0.0])
     shoulder = np.array([0.0, 0.0, BASE_HEIGHT])
 
-    # Shoulder: s=0 → horizontal nach vorne, s>0 → nach oben, s<0 → nach unten
-    # Winkel von der Horizontalen gemessen (nicht von der Vertikalen!)
-    elbow_local_x = UPPER_ARM * math.cos(math.radians(s_deg))
-    elbow_local_z = BASE_HEIGHT + UPPER_ARM * math.sin(math.radians(s_deg))
+    # Oberarm: Winkel von der HORIZONTALEN (+X) gemessen
+    # s=0 → cos(0)=1 → volle Länge in X, sin(0)=0 → kein Z-Offset
+    # s>0 → Arm geht nach oben (Z steigt)
+    # s<0 → Arm geht nach unten (Z sinkt)
+    elbow_local_x = UPPER_ARM * math.cos(s_rad)
+    elbow_local_z = BASE_HEIGHT + UPPER_ARM * math.sin(s_rad)
 
-    # Elbow: e ist der Innenwinkel zwischen Ober- und Unterarm
-    # e=180° → gestreckt, e=90° → rechter Winkel
-    # Der Unterarm knickt NACH UNTEN relativ zum Oberarm ab
-    forearm_abs_angle = math.radians(s_deg) - math.radians(180.0 - e_deg)
-    
+    # Unterarm: Der Elbow-Winkel ist der INNENWINKEL zwischen Ober- und Unterarm.
+    # Bei e=180° ist der Arm gestreckt → Unterarm geht in gleicher Richtung weiter.
+    # Bei e=90° knickt der Unterarm 90° NACH UNTEN ab.
+    # 
+    # Absoluter Winkel des Unterarms von der Horizontalen:
+    #   = Shoulder-Winkel - (180° - e)
+    # Begründung: (180° - e) ist die Abknickung von "gestreckt",
+    # und sie geht NACH UNTEN (daher Subtraktion).
+    forearm_abs_angle = s_rad - math.radians(180.0 - e_deg)
+
     wrist_local_x = elbow_local_x + FOREARM * math.cos(forearm_abs_angle)
     wrist_local_z = elbow_local_z + FOREARM * math.sin(forearm_abs_angle)
 
+    # Hand: gleiche Richtung wie Unterarm
     hand_local_x = wrist_local_x + HAND_LENGTH * math.cos(forearm_abs_angle)
     hand_local_z = wrist_local_z + HAND_LENGTH * math.sin(forearm_abs_angle)
 
