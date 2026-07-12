@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""teach.py - RoArm-M2-S Teach & Record (Precision Edition)
+"""teach.py - RoArm-M2-S Teach & Record (Precision Edition + Live-Visualisierung)
 - Gravity Compensation: Liest Position kurz mit Torque AN
 - Offset-Kalibrierung: Nach Aufnahme wird Endpunkt mit Torque präzise kalibriert
+- 3D-Visualisierung: Zeigt live die Arm-Position während der Aufnahme
 """
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
 #     "pyserial",
 #     "rich",
+#     "matplotlib",
+#     "numpy",
 # ]
 # ///
 
@@ -35,6 +38,7 @@ from ui import (
     console, print_banner, print_connection_status, print_success,
     print_warning, print_info, print_position_inline, TeachDisplay,
 )
+from visualize import RobotVisualizer
 
 # ============================================================
 # KONFIGURATION
@@ -58,19 +62,20 @@ GRAVITY_COMP_SETTLE_MS = 30  # ms warten nach Torque-an bevor Position gelesen w
 
 
 # ============================================================
-# TEACH RECORDER (mit Gravity Compensation + Offset-Kalibrierung)
+# TEACH RECORDER (mit Gravity Compensation + Offset-Kalibrierung + Visualisierung)
 # ============================================================
 
 class TeachRecorder:
     def __init__(self, port: str = None, output_dir: str = "recordings",
                  hz: int = RECORD_HZ, threshold: float = MOVE_THRESHOLD_DEG,
-                 gravity_comp: bool = True):
+                 gravity_comp: bool = True, visualize: bool = True):
         self._port = port
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._hz = hz
         self._threshold = threshold
         self._gravity_comp = gravity_comp
+        self._visualize = visualize
         self._arm: RoArmConnection = None
         self._recording = False
         self._waypoints = []
@@ -80,6 +85,8 @@ class TeachRecorder:
         self._sample_counter = 0
         # Offset-Kalibrierung
         self._endpoint_offset = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
+        # 3D-Visualisierung
+        self._viz: RobotVisualizer = None
 
     def connect(self) -> bool:
         port = self._port or find_arm_port()
@@ -89,14 +96,28 @@ class TeachRecorder:
         print(f"🔌 Verbinde mit {port}...")
         try:
             self._arm = RoArmConnection(port)
-            print(f"   ✅ Verbunden")
+            print(f"   ✔ Verbunden")
+            
+            # Visualisierung starten
+            if self._visualize:
+                print(f"   🖥️  Starte 3D-Visualisierung...")
+                self._viz = RobotVisualizer(live=True, update_interval=0.05)
+                self._viz.start()
+                time.sleep(0.5)
+                # Initiale Position anzeigen
+                self._viz.update_pose(
+                    START_POSITION_DEG["b"], START_POSITION_DEG["s"],
+                    START_POSITION_DEG["e"], START_POSITION_DEG["h"]
+                )
+                print(f"   ✔ Visualisierung aktiv")
+            
             return True
         except Exception as e:
             print(f"   ❌ Fehler: {e}")
             return False
 
     def go_to_start(self) -> bool:
-        print(f"\n📍 Fahre zur Startposition...")
+        print(f"\n🏠 Fahre zur Startposition...")
         print(f"   Ziel: b={START_POSITION_DEG['b']:.1f}° "
               f"s={START_POSITION_DEG['s']:.1f}° "
               f"e={START_POSITION_DEG['e']:.1f}° "
@@ -110,6 +131,15 @@ class TeachRecorder:
             START_POSITION_DEG["e"], START_POSITION_DEG["h"],
             spd=30, acc=15
         )
+        
+        # Visualisierung updaten während der Arm zur Startposition fährt
+        if self._viz:
+            self._viz.update_pose(
+                START_POSITION_DEG["b"], START_POSITION_DEG["s"],
+                START_POSITION_DEG["e"], START_POSITION_DEG["h"],
+                target=START_POSITION_DEG
+            )
+        
         time.sleep(2.0)
 
         self._arm.move_to(
@@ -124,11 +154,15 @@ class TeachRecorder:
             print("   ⚠️ Kann Position nicht lesen!")
             return False
 
+        # Visualisierung mit tatsächlicher Position updaten
+        if self._viz and pos:
+            self._viz.update_pose(pos["b"], pos["s"], pos["e"], pos["h"])
+
         print(f"   Ist:  b={pos['b']:.2f}° s={pos['s']:.2f}° e={pos['e']:.2f}° h={pos['h']:.2f}°")
         max_error = max(abs(pos[j] - START_POSITION_DEG[j]) for j in ["b", "s", "e", "h"])
 
         if max_error <= POSITION_TOLERANCE:
-            print(f"   ✅ Startposition OK (max Fehler: {max_error:.2f}°)")
+            print(f"   ✔ Startposition OK (max Fehler: {max_error:.2f}°)")
             return True
         else:
             print(f"   ⚠️ Abweichung: {max_error:.2f}° - nochmal...")
@@ -146,16 +180,10 @@ class TeachRecorder:
         Schaltet kurz Torque an, wartet bis Servo sich stabilisiert,
         liest die Position (= die Position die der Servo wirklich anfährt),
         schaltet Torque wieder aus.
-        
-        Das eliminiert den Fehler durch Schwerkraft-Durchhängen bei Torque-off.
         """
-        # Torque an
         self._arm.torque_on_fast()
-        # Kurz warten bis Servo sich auf die aktuelle Position "einlockt"
         time.sleep(GRAVITY_COMP_SETTLE_MS / 1000.0)
-        # Position lesen - DAS ist die Position die der Servo wirklich hält
         pos = self._arm.read_position_deg_single()
-        # Torque wieder aus damit User weiter bewegen kann
         self._arm.torque_off_fast()
         return pos
 
@@ -171,6 +199,10 @@ class TeachRecorder:
         self._arm.torque_off()
         time.sleep(0.3)
 
+        # Trail löschen für neue Aufnahme
+        if self._viz:
+            self._viz.clear_trail()
+
         # Erste Position mit Gravity Comp lesen
         if self._gravity_comp:
             pos = self._read_with_gravity_comp()
@@ -179,12 +211,16 @@ class TeachRecorder:
 
         if pos:
             self._record_point(pos, force=True)
+            # Visualisierung updaten
+            if self._viz:
+                self._viz.update_pose(pos["b"], pos["s"], pos["e"], pos["h"])
 
         comp_str = " + Gravity Comp" if self._gravity_comp else ""
-        print(f"\n🔴 AUFNAHME LÄUFT ({self._hz} Hz, Schwelle: {self._threshold}°{comp_str})")
+        viz_str = " + 3D-Viz" if self._viz else ""
+        print(f"\n🔴 AUFNAHME LÄUFT ({self._hz} Hz, Schwelle: {self._threshold}°{comp_str}{viz_str})")
         print(f"   Bewege den Arm jetzt!")
         print(f"   [ENTER] = Stopp | [g] = Gripper toggle")
-        print(f"   ─" * 24)
+        print(f"   {'─' * 24}")
 
     def _record_point(self, pos: dict, force: bool = False) -> bool:
         if not force and self._last_recorded_pos is not None:
@@ -255,13 +291,16 @@ class TeachRecorder:
                             self._waypoints.append({"t": round(elapsed, 4), "cmd": "GRIPPER_OPEN"})
                             print(f"\n   ✋ Gripper AUF [{elapsed:.2f}s]")
 
-                # Position lesen - mit oder ohne Gravity Compensation
+                # Position lesen
                 self._sample_counter += 1
-
                 pos = self._arm.read_position_deg_single()
 
                 if pos:
                     self._record_point(pos)
+                    
+                    # === VISUALISIERUNG UPDATEN ===
+                    if self._viz:
+                        self._viz.update_pose(pos["b"], pos["s"], pos["e"], pos["h"])
 
                 # Timing einhalten
                 elapsed_loop = time.time() - loop_start
@@ -285,13 +324,9 @@ class TeachRecorder:
 
     def calibrate_endpoint(self):
         """
-        OFFSET-KALIBRIERUNG (Feature 1):
+        OFFSET-KALIBRIERUNG:
         Nach der Aufnahme fährt der Arm den letzten aufgezeichneten Punkt
-        mit Torque an. Der User kann dann sehen wo der Arm wirklich landet
-        und manuell (per Tastendruck) den Offset korrigieren.
-        
-        Alternativ: Automatische Messung des Unterschieds zwischen
-        "Torque-off Position" und "Torque-on Position" am Endpunkt.
+        mit Torque an. Der User kann dann sehen wo der Arm wirklich landet.
         """
         move_wps = [wp for wp in self._waypoints if "cmd" not in wp]
         if len(move_wps) < 2:
@@ -310,6 +345,14 @@ class TeachRecorder:
 
         # Langsam und präzise hinfahren
         self._arm.move_to(last_wp["b"], last_wp["s"], last_wp["e"], last_wp["h"], spd=10, acc=5)
+        
+        # Visualisierung: Target anzeigen
+        if self._viz:
+            self._viz.update_pose(
+                last_wp["b"], last_wp["s"], last_wp["e"], last_wp["h"],
+                target={"b": last_wp["b"], "s": last_wp["s"], "e": last_wp["e"], "h": last_wp["h"]}
+            )
+        
         time.sleep(1.5)
         self._arm.move_to(last_wp["b"], last_wp["s"], last_wp["e"], last_wp["h"], spd=5, acc=3)
         time.sleep(1.0)
@@ -319,6 +362,13 @@ class TeachRecorder:
         if actual_pos is None:
             print("   ⚠️ Kann Position nicht lesen, überspringe Kalibrierung")
             return
+
+        # Visualisierung mit tatsächlicher Position
+        if self._viz and actual_pos:
+            self._viz.update_pose(
+                actual_pos["b"], actual_pos["s"], actual_pos["e"], actual_pos["h"],
+                target={"b": last_wp["b"], "s": last_wp["s"], "e": last_wp["e"], "h": last_wp["h"]}
+            )
 
         print(f"   Tatsächliche Position (Torque on):")
         print(f"   b={actual_pos['b']:.2f}° s={actual_pos['s']:.2f}° "
@@ -335,7 +385,6 @@ class TeachRecorder:
         print(f"   Δb={auto_offset['b']:+.3f}° Δs={auto_offset['s']:+.3f}° "
               f"Δe={auto_offset['e']:+.3f}° Δh={auto_offset['h']:+.3f}°")
 
-        # Fragen ob der User manuell korrigieren will
         print(f"\n   Optionen:")
         print(f"   [ENTER] = Automatischen Offset verwenden (empfohlen)")
         print(f"   [m]     = Manuell korrigieren (Arm wird freigegeben)")
@@ -344,7 +393,6 @@ class TeachRecorder:
         choice = input("   > ").strip().lower()
 
         if choice == 'm':
-            # Manueller Modus: User positioniert den Arm exakt
             print(f"\n   🔓 Arm wird freigegeben. Positioniere den Endeffektor EXAKT")
             print(f"   an der Stelle wo er aufsetzen soll.")
             print(f"   Drücke ENTER wenn fertig.")
@@ -352,7 +400,6 @@ class TeachRecorder:
             time.sleep(0.3)
             input()
 
-            # Jetzt mit Gravity Comp die echte Position lesen
             manual_pos = self._read_with_gravity_comp()
             if manual_pos:
                 self._endpoint_offset = {
@@ -361,6 +408,10 @@ class TeachRecorder:
                     "e": round(manual_pos["e"] - last_wp["e"], 3),
                     "h": round(manual_pos["h"] - last_wp["h"], 3),
                 }
+                # Visualisierung updaten
+                if self._viz:
+                    self._viz.update_pose(manual_pos["b"], manual_pos["s"], manual_pos["e"], manual_pos["h"])
+                    
                 print(f"   Manueller Offset:")
                 print(f"   Δb={self._endpoint_offset['b']:+.3f}° "
                       f"Δs={self._endpoint_offset['s']:+.3f}° "
@@ -374,9 +425,8 @@ class TeachRecorder:
             self._endpoint_offset = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
 
         else:
-            # Automatischen Offset verwenden
             self._endpoint_offset = auto_offset
-            print(f"   ✅ Automatischer Offset wird verwendet")
+            print(f"   ✔ Automatischer Offset wird verwendet")
 
     def save(self) -> str:
         if not self._waypoints:
@@ -391,7 +441,6 @@ class TeachRecorder:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = self._output_dir / f"recording_{ts}.roarm"
 
-        # Offset-Info für die Datei
         has_offset = any(abs(v) > 0.001 for v in self._endpoint_offset.values())
 
         lines = [
@@ -402,6 +451,7 @@ class TeachRecorder:
             f"# Schwelle: {self._threshold}°",
             f"# Dauer: {move_wps[-1]['t']:.2f}s",
             f"# Gravity Compensation: {'ja' if self._gravity_comp else 'nein'}",
+            f"# Visualisierung: {'ja' if self._visualize else 'nein'}",
             f"#",
             f"#CONFIG hz={self._hz}",
             f"#CONFIG threshold={self._threshold}",
@@ -452,18 +502,22 @@ class TeachRecorder:
         return str(filename)
 
     def run(self):
-        print_banner("teach", "Gravity Compensation + Endpoint Offset-Kalibrierung")
+        print_banner("teach", "Gravity Compensation + Endpoint Offset-Kalibrierung + 3D-Visualisierung")
 
         if not self.connect():
             return
 
         if not self.go_to_start():
             self._arm.close()
+            if self._viz:
+                self._viz.stop()
             return
 
         print(f"\n{'─' * 60}")
         print(f"  Bereit! Drücke ENTER um die Aufnahme zu starten.")
         print(f"  (Der Arm wird dann freigegeben)")
+        if self._viz:
+            print(f"  🖥️  3D-Visualisierung läuft im separaten Fenster")
         print(f"{'─' * 60}")
         input()
 
@@ -482,8 +536,13 @@ class TeachRecorder:
         self._arm.torque_on()
         time.sleep(0.3)
 
+        # Visualisierung stoppen
+        if self._viz:
+            print("   🖥️  Visualisierung wird geschlossen...")
+            self._viz.stop()
+
         self._arm.close()
-        print("✅ Fertig!\n")
+        print("✔ Fertig!\n")
 
         if filepath:
             print(f"  Zum Abspielen:")
@@ -496,7 +555,7 @@ class TeachRecorder:
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="RoArm-M2-S Teach Mode (Precision Edition)")
+    p = argparse.ArgumentParser(description="RoArm-M2-S Teach Mode (Precision + Visualisierung)")
     p.add_argument("--port", type=str, default=None, help="Serieller Port (auto-detect)")
     p.add_argument("--hz", type=int, default=RECORD_HZ,
                    help=f"Aufnahme-Frequenz (default: {RECORD_HZ})")
@@ -506,6 +565,8 @@ def main():
                    help="Ausgabe-Verzeichnis")
     p.add_argument("--no-gravity-comp", action="store_true",
                    help="Gravity Compensation deaktivieren")
+    p.add_argument("--no-viz", action="store_true",
+                   help="3D-Visualisierung deaktivieren")
     args = p.parse_args()
 
     recorder = TeachRecorder(
@@ -514,9 +575,11 @@ def main():
         hz=args.hz,
         threshold=args.threshold,
         gravity_comp=not args.no_gravity_comp,
+        visualize=not args.no_viz,
     )
     recorder.run()
 
 
 if __name__ == "__main__":
     main()
+
