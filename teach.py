@@ -39,6 +39,11 @@ from pathlib import Path
 from datetime import datetime
 import select
 
+from ui import (
+    console, print_banner, print_connection_status, print_success,
+    print_warning, print_info, print_position_inline, TeachDisplay,
+)
+
 # ============================================================
 # KONFIGURATION
 # ============================================================
@@ -393,6 +398,9 @@ class TeachRecorder:
         try:
             tty.setcbreak(sys.stdin.fileno())
 
+            teach_display = TeachDisplay(hz=self._hz, threshold=self._threshold, gravity_comp=self._gravity_comp)
+            teach_display.start()
+
             while self._recording:
                 loop_start = time.time()
 
@@ -429,6 +437,15 @@ class TeachRecorder:
                 sleep_time = interval - elapsed_loop
                 if sleep_time > 0:
                     time.sleep(sleep_time)
+
+                teach_display.update(
+                    elapsed=time.time() - self._rec_start_time,
+                    waypoint_count=self._total_waypoints,
+                    current_pos=pos,
+                    last_recorded=self._last_recorded_pos,
+                )
+
+            teach_display.stop()
 
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
@@ -604,12 +621,7 @@ class TeachRecorder:
         return str(filename)
 
     def run(self):
-        print("=" * 60)
-        print("  RoArm-M2-S TEACH MODE (Precision Edition)")
-        print("  Features:")
-        print("  • Gravity Compensation (Torque-on Reads)")
-        print("  • Endpoint Offset-Kalibrierung")
-        print("=" * 60)
+        print_banner("teach", "Gravity Compensation + Endpoint Offset-Kalibrierung")
 
         if not self.connect():
             return
