@@ -70,7 +70,7 @@ def forward_kinematics(b_deg: float, s_deg: float, e_deg: float, h_deg: float) -
     - h: Hand/Gripper-Rotation
     """
     b_rad = math.radians(b_deg)
-    s_rad = math.radians(s_deg)
+    s_rad = math.radians(-s_deg)
 
     base = np.array([0.0, 0.0, 0.0])
     shoulder = np.array([0.0, 0.0, BASE_HEIGHT])
