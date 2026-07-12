@@ -756,6 +756,8 @@ class SmoothPlayer:
             display = PlaybackDisplay(total_duration=duration, stream_hz=self._stream_hz)
             display.start()
 
+            tracking_err = None
+
             while True:
                 elapsed = time.time() - playback_start
                 if elapsed >= duration:
@@ -876,23 +878,24 @@ class SmoothPlayer:
                     bar = "█" * bar_len + "░" * (20 - bar_len)
                     progress_pct = (elapsed / duration) * 100
 
-                    display.update(
-                        elapsed=elapsed,
-                        target=target,
-                        speed_factor=traj.get_speed_at(elapsed),
-                        commands_sent=commands_sent,
-                        skipped=skipped,
-                        thermal_temp=temp,
-                        thermal_status=temp_status,
-                        tracking_error=tracking_err if 'tracking_err' in dir() else None,
-                    )
-
                 else:
                     # Auch bei Nicht-Senden: Thermal updaten (Haltestrom)
                     self._thermal.update(is_moving=False, delta_deg=0.0)
                     # FIX: last_pos trotzdem aktualisieren damit delta_deg beim
                     # nächsten Send korrekt berechnet wird
                     last_pos = corrected.copy()
+
+
+                display.update(
+                    elapsed=elapsed,
+                    target=target,
+                    speed_factor=traj.get_speed_at(elapsed),
+                    commands_sent=commands_sent,
+                    skipped=skipped,
+                    thermal_temp=temp,
+                    thermal_status=temp_status,
+                    tracking_error=tracking_err if 'tracking_err' in dir() else None,
+                )
 
                 # Timing einhalten
                 next_time = playback_start + (commands_sent + skipped + 1) * interval
