@@ -21,6 +21,7 @@ Ausführen:
 #     "numpy",
 #     "scipy",
 #     "pytest",
+#     "serial",
 # ]
 # ///
 
