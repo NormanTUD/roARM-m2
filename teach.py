@@ -123,6 +123,7 @@ class TeachRecorder:
               f"e={START_POSITION_DEG['e']:.1f}° "
               f"h={START_POSITION_DEG['h']:.1f}°")
 
+        # Torque on - Timeouts sind OK (kaputter Servo antwortet nicht)
         self._arm.torque_on()
         time.sleep(0.2)
 
@@ -131,15 +132,14 @@ class TeachRecorder:
             START_POSITION_DEG["e"], START_POSITION_DEG["h"],
             spd=30, acc=15
         )
-        
-        # Visualisierung updaten während der Arm zur Startposition fährt
+
         if self._viz:
             self._viz.update_pose(
                 START_POSITION_DEG["b"], START_POSITION_DEG["s"],
                 START_POSITION_DEG["e"], START_POSITION_DEG["h"],
                 target=START_POSITION_DEG
             )
-        
+
         time.sleep(2.0)
 
         self._arm.move_to(
@@ -151,10 +151,10 @@ class TeachRecorder:
 
         pos = self._arm.read_position_deg()
         if pos is None:
-            print("   ⚠️ Kann Position nicht lesen!")
-            return False
+            print("   ⚠️  Kann Position nicht lesen - fahre trotzdem fort (Servo fehlt?)")
+            print("   ℹ️  Arbeite mit den verfügbaren Servos weiter.")
+            return True  # <-- NICHT MEHR ABBRECHEN!
 
-        # Visualisierung mit tatsächlicher Position updaten
         if self._viz and pos:
             self._viz.update_pose(pos["b"], pos["s"], pos["e"], pos["h"])
 
@@ -163,16 +163,10 @@ class TeachRecorder:
 
         if max_error <= POSITION_TOLERANCE:
             print(f"   ✔ Startposition OK (max Fehler: {max_error:.2f}°)")
-            return True
         else:
-            print(f"   ⚠️ Abweichung: {max_error:.2f}° - nochmal...")
-            self._arm.move_to(
-                START_POSITION_DEG["b"], START_POSITION_DEG["s"],
-                START_POSITION_DEG["e"], START_POSITION_DEG["h"],
-                spd=5, acc=3
-            )
-            time.sleep(2.0)
-            return True
+            print(f"   ⚠️  Abweichung: {max_error:.2f}° - akzeptiere trotzdem")
+
+        return True
 
     def _read_with_gravity_comp(self) -> dict:
         """
