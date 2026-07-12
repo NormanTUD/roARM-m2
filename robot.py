@@ -100,6 +100,231 @@ START_POSITION_DEG = {
 
 POSITION_TOLERANCE = 1.0
 
+# ============================================================
+# MENSCHENLESBARE COMMAND-ABSTRAKTION
+# ============================================================
+
+from enum import IntEnum
+from dataclasses import dataclass
+from typing import Optional
+
+
+class CommandType(IntEnum):
+    """Alle RoArm-M2-S Befehls-IDs mit lesbaren Namen."""
+    READ_POSITION = 105
+    GRIPPER_CONTROL = 106
+    MOVE_JOINTS = 122
+    TORQUE_ALL = 210
+    TORQUE_SINGLE = 212
+
+
+class TorqueState(IntEnum):
+    """Torque ein/aus."""
+    OFF = 0
+    ON = 1
+
+
+class GripperState:
+    """Gripper-Positionen als benannte Konstanten."""
+    OPEN = 1.08
+    CLOSED = 3.14
+
+
+@dataclass
+class JointAngles:
+    """Gelenkwinkel in Grad – menschenlesbar."""
+    base: float = 0.0
+    shoulder: float = 0.0
+    elbow: float = 90.0
+    hand: float = 180.0
+
+    def to_cmd(self, speed: int = 20, acceleration: int = 10) -> dict:
+        """Konvertiert zu RoArm JSON-Befehl."""
+        return {
+            "T": CommandType.MOVE_JOINTS,
+            "b": round(self.base, 2),
+            "s": round(self.shoulder, 2),
+            "e": round(self.elbow, 2),
+            "h": round(self.hand, 2),
+            "spd": speed,
+            "acc": acceleration,
+        }
+
+    @classmethod
+    def from_raw(cls, data: dict) -> "JointAngles":
+        """Erstellt JointAngles aus Raw-Response."""
+        return cls(
+            base=round(rad_to_deg(data["b"]), 2),
+            shoulder=round(rad_to_deg(data["s"]), 2),
+            elbow=round(rad_to_deg(data["e"]), 2),
+            hand=round(rad_to_deg(data.get("t", data.get("h", 0))), 2),
+        )
+
+    def __str__(self):
+        return (f"Base={self.base:.1f}° | Shoulder={self.shoulder:.1f}° | "
+                f"Elbow={self.elbow:.1f}° | Hand={self.hand:.1f}°")
+
+
+class RoArmHumanAPI:
+    """Menschenlesbare High-Level API für den RoArm-M2-S.
+    
+    Statt:
+        arm.send_cmd({"T": 210, "cmd": 0})
+        arm.send_cmd({"T": 122, "b": 10.0, "s": 5.0, "e": 85.0, "h": 180.0, "spd": 20, "acc": 10})
+    
+    Jetzt:
+        arm.torque(TorqueState.OFF)
+        arm.move(JointAngles(base=10, shoulder=5, elbow=85, hand=180))
+    
+    Oder noch einfacher:
+        arm.gripper_open()
+        arm.move_to(base=10, shoulder=5, elbow=85)
+        arm.torque_off()
+    """
+
+    def __init__(self, connection):
+        self._conn = connection
+        self._log = logging.getLogger("roarm.commands")
+
+    # --- Torque ---
+
+    def torque(self, state: TorqueState):
+        """Setzt Torque für alle Servos.
+        
+        Args:
+            state: TorqueState.ON oder TorqueState.OFF
+        """
+        action = "ON" if state == TorqueState.ON else "OFF"
+        self._log.info(f"NOTE     | >>> TORQUE {action} (all servos)")
+        self._conn.send_cmd({"T": CommandType.TORQUE_ALL, "cmd": int(state)})
+        time.sleep(0.03)
+        for servo_id in range(1, 5):
+            self._conn.send_cmd({"T": CommandType.TORQUE_SINGLE, "id": servo_id, "cmd": int(state)})
+            time.sleep(0.02)
+
+    def torque_on(self):
+        """Schaltet Torque für alle Servos ein.
+        
+        Sendet zuerst den globalen Torque-Befehl, dann einzeln
+        an jeden Servo (1-4) für zuverlässiges Aktivieren.
+        """
+        self._log.info("NOTE     | >>> TORQUE ON (all servos)")
+        self.send_cmd({"T": CommandType.TORQUE_ALL, "cmd": TorqueState.ON})
+        time.sleep(0.03)
+        for sid in range(1, 5):
+            self.send_cmd({"T": CommandType.TORQUE_SINGLE, "id": sid, "cmd": TorqueState.ON})
+            time.sleep(0.02)
+
+    def torque_off(self):
+        """Schaltet Torque für alle Servos aus.
+        
+        Sendet zuerst den globalen Torque-Befehl, dann einzeln
+        an jeden Servo (1-4) für zuverlässiges Deaktivieren.
+        Arm ist danach frei bewegbar.
+        """
+        self._log.info("NOTE     | >>> TORQUE OFF (all servos)")
+        self.send_cmd({"T": CommandType.TORQUE_ALL, "cmd": TorqueState.OFF})
+        time.sleep(0.03)
+        for sid in range(1, 5):
+            self.send_cmd({"T": CommandType.TORQUE_SINGLE, "id": sid, "cmd": TorqueState.OFF})
+            time.sleep(0.02)
+
+    # --- Gripper ---
+
+    def gripper(self, position: float, speed: int = 50, acceleration: int = 20):
+        """Gripper auf beliebige Position fahren.
+        
+        Args:
+            position: GripperState.OPEN (1.08) oder GripperState.CLOSED (3.14)
+                      oder beliebiger Wert dazwischen
+            speed: Geschwindigkeit (1-50)
+            acceleration: Beschleunigung (1-30)
+        """
+        state_name = "OPEN" if position <= 2.0 else "CLOSE"
+        self._log.info(f"NOTE     | >>> GRIPPER {state_name} (pos={position})")
+        self._conn.send_cmd({
+            "T": CommandType.GRIPPER_CONTROL,
+            "cmd": position,
+            "spd": speed,
+            "acc": acceleration,
+        })
+
+    def gripper_open(self):
+        """Gripper öffnen."""
+        self.gripper(GripperState.OPEN)
+
+    def gripper_close(self):
+        """Gripper schließen."""
+        self.gripper(GripperState.CLOSED)
+
+    # --- Bewegung ---
+
+    def move(self, angles: JointAngles, speed: int = 20, acceleration: int = 10):
+        """Fährt zur angegebenen Gelenkposition.
+        
+        Args:
+            angles: JointAngles-Objekt mit base/shoulder/elbow/hand
+            speed: Geschwindigkeit (1-50)
+            acceleration: Beschleunigung (1-30)
+        """
+        self._conn.send_cmd(angles.to_cmd(speed, acceleration))
+
+    def move_to(self, base: float = 0, shoulder: float = 0, 
+                elbow: float = 90, hand: float = 180,
+                speed: int = 20, acceleration: int = 10):
+        """Fährt zur Position mit benannten Parametern.
+        
+        Beispiel:
+            arm.move_to(base=30, shoulder=10, elbow=60, hand=180)
+            arm.move_to(base=45)  # Nur Base drehen, Rest Default
+        """
+        angles = JointAngles(base=base, shoulder=shoulder, 
+                            elbow=elbow, hand=hand)
+        self.move(angles, speed, acceleration)
+
+    def move_fast(self, base: float = 0, shoulder: float = 0,
+                  elbow: float = 90, hand: float = 180,
+                  speed: int = 50, acceleration: int = 30):
+        """Schnelle Bewegung ohne Antwort-Warten (für Streaming)."""
+        angles = JointAngles(base=base, shoulder=shoulder,
+                            elbow=elbow, hand=hand)
+        self._conn.send_cmd_fast(angles.to_cmd(speed, acceleration))
+
+    # --- Position lesen ---
+
+    def read_position(self) -> Optional[JointAngles]:
+        """Liest aktuelle Gelenkwinkel als JointAngles-Objekt."""
+        raw = self._conn.read_position_raw()
+        if raw is None:
+            return None
+        return JointAngles.from_raw(raw)
+
+    def where_am_i(self) -> str:
+        """Gibt aktuelle Position als lesbaren String zurück."""
+        pos = self.read_position()
+        if pos is None:
+            return "⚠️  Position nicht lesbar!"
+        return f"📍 {pos}"
+
+    # --- Warten ---
+
+    def wait_until_stopped(self, tolerance_deg: float = 0.3,
+                           timeout: float = 15.0) -> dict:
+        """Wartet bis der Arm stillsteht."""
+        return self._conn.wait_until_settled(
+            tolerance_deg=tolerance_deg, timeout=timeout
+        )
+
+    # --- Kontext-Manager ---
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 # ============================================================
 # HILFSFUNKTIONEN
@@ -252,11 +477,13 @@ class RoArmConnection:
     def read_position_raw(self) -> Optional[dict]:
         """Liest die aktuelle Position als Radiant-Dictionary.
         
+        Sendet den READ_POSITION-Befehl und parst die JSON-Antwort.
+        
         Returns:
             Dict mit Keys "b", "s", "e", "t"/"h" in Radiant,
-            oder None bei Fehler.
+            oder None bei Fehler/Timeout.
         """
-        resp = self.send_cmd({"T": 105})
+        resp = self.send_cmd({"T": CommandType.READ_POSITION})
         if not resp:
             return None
         try:
@@ -366,6 +593,9 @@ class RoArmConnection:
                 spd: int = 20, acc: int = 10):
         """Fährt zur angegebenen Position (mit Antwort-Warten).
         
+        Sendet einen MOVE_JOINTS-Befehl mit den angegebenen Gelenkwinkeln.
+        Wartet auf Bestätigung vom Controller.
+        
         Args:
             b_deg: Base-Winkel in Grad
             s_deg: Shoulder-Winkel in Grad
@@ -375,7 +605,7 @@ class RoArmConnection:
             acc: Beschleunigung (1-30)
         """
         cmd = {
-            "T": 122,
+            "T": CommandType.MOVE_JOINTS,
             "b": round(b_deg, 2),
             "s": round(s_deg, 2),
             "e": round(e_deg, 2),
@@ -390,10 +620,11 @@ class RoArmConnection:
         """Schneller Move ohne auf Antwort zu warten (für Streaming).
         
         Identisch zu move_to() aber verwendet send_cmd_fast().
-        Nur für High-Frequency-Streaming verwenden!
+        Nur für High-Frequency-Streaming verwenden wo Latenz
+        wichtiger ist als Bestätigung!
         """
         cmd = {
-            "T": 122,
+            "T": CommandType.MOVE_JOINTS,
             "b": round(b_deg, 2),
             "s": round(s_deg, 2),
             "e": round(e_deg, 2),
@@ -430,24 +661,49 @@ class RoArmConnection:
         
         Für Recording-Loop wo Geschwindigkeit wichtig ist.
         Weniger zuverlässig als torque_on() aber schneller.
+        Sendet nur den globalen Befehl, nicht pro Servo.
         """
-        self.send_cmd({"T": 210, "cmd": 1})
+        self.send_cmd({"T": CommandType.TORQUE_ALL, "cmd": TorqueState.ON})
 
     def torque_off_fast(self):
-        """Schnelles Torque-aus ohne individuelle Servo-Befehle."""
-        self.send_cmd({"T": 210, "cmd": 0})
+        """Schnelles Torque-aus ohne individuelle Servo-Befehle.
+        
+        Für Recording-Loop wo Geschwindigkeit wichtig ist.
+        Sendet nur den globalen Befehl, nicht pro Servo.
+        """
+        self.send_cmd({"T": CommandType.TORQUE_ALL, "cmd": TorqueState.OFF})
 
     # ----------------------------------------------------------
     # GRIPPER
     # ----------------------------------------------------------
 
-        def gripper_open(self):
-            self._log.info("NOTE     | >>> GRIPPER OPEN")
-            self.send_cmd({"T": 106, "cmd": 1.08, "spd": 50, "acc": 20})
+    def gripper_open(self):
+        """Öffnet den Gripper vollständig.
+        
+        Fährt den Gripper-Servo auf die OPEN-Position (1.08 rad).
+        Geschwindigkeit: 50, Beschleunigung: 20.
+        """
+        self._log.info("NOTE     | >>> GRIPPER OPEN")
+        self.send_cmd({
+            "T": CommandType.GRIPPER_CONTROL,
+            "cmd": GripperState.OPEN,
+            "spd": 50,
+            "acc": 20,
+        })
 
-        def gripper_close(self):
-            self._log.info("NOTE     | >>> GRIPPER CLOSE")
-            self.send_cmd({"T": 106, "cmd": 3.14, "spd": 50, "acc": 20})
+    def gripper_close(self):
+        """Schließt den Gripper vollständig.
+        
+        Fährt den Gripper-Servo auf die CLOSED-Position (3.14 rad).
+        Geschwindigkeit: 50, Beschleunigung: 20.
+        """
+        self._log.info("NOTE     | >>> GRIPPER CLOSE")
+        self.send_cmd({
+            "T": CommandType.GRIPPER_CONTROL,
+            "cmd": GripperState.CLOSED,
+            "spd": 50,
+            "acc": 20,
+        })
 
     # ----------------------------------------------------------
     # WARTEN / SETTLING
