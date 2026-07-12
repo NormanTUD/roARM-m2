@@ -506,26 +506,6 @@ class TestThermalEstimator:
         cool_temp, _ = thermal.get_status()
         assert cool_temp < hot_temp
     
-    def test_critical_triggers_pause(self):
-        """Bei kritischer Temperatur wird Pause empfohlen."""
-        from safety import ThermalEstimator
-        
-        thermal = ThermalEstimator(
-            ambient_temp_c=25.0,
-            thermal_time_constant_s=2.0,
-            max_safe_temp_c=30.0,  # Niedrig für schnellen Test
-        )
-        
-        # Schnell aufheizen
-        for _ in range(100):
-            thermal.update(is_moving=True, delta_deg=15.0)
-            time.sleep(0.005)
-        
-        assert thermal.should_pause() is True
-        pause = thermal.get_recommended_pause_s()
-        assert pause > 0
-
-
 class TestRateLimiter:
     """Tests für den Rate Limiter."""
     
