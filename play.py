@@ -658,9 +658,10 @@ class SmoothPlayer:
         )
 
         # PRE-FLIGHT CHECK
-        print(f"\n✈️  Pre-Flight Trajektorien-Check...")
         validator = TrajectoryValidator(SafetyLimits())
         is_safe, violations = validator.validate_full_trajectory(self._trajectory)
+
+        print_preflight_check(is_safe, violations)
 
         if not is_safe:
             print(f"   🛑 TRAJEKTORIE UNSICHER! {len(violations)} Verletzungen:")
@@ -752,6 +753,9 @@ class SmoothPlayer:
         playback_start = time.time()
 
         try:
+            display = PlaybackDisplay(total_duration=duration, stream_hz=self._stream_hz)
+            display.start()
+
             while True:
                 elapsed = time.time() - playback_start
                 if elapsed >= duration:
@@ -872,15 +876,16 @@ class SmoothPlayer:
                     bar = "█" * bar_len + "░" * (20 - bar_len)
                     progress_pct = (elapsed / duration) * 100
 
-                    clear_line()
-                    sys.stdout.write(
-                        f"   ▶ [{progress_pct:5.1f}%] "
-                        f"[{elapsed:6.2f}s/{duration:.2f}s] "
-                        f"b={target['b']:7.2f}° s={target['s']:7.2f}° "
-                        f"e={target['e']:7.2f}° "
-                        f"|{bar}| v={speed_now:.1f}x"
+                    display.update(
+                        elapsed=elapsed,
+                        target=target,
+                        speed_factor=traj.get_speed_at(elapsed),
+                        commands_sent=commands_sent,
+                        skipped=skipped,
+                        thermal_temp=temp,
+                        thermal_status=temp_status,
+                        tracking_error=tracking_err if 'tracking_err' in dir() else None,
                     )
-                    sys.stdout.flush()
 
                 else:
                     # Auch bei Nicht-Senden: Thermal updaten (Haltestrom)
@@ -894,6 +899,8 @@ class SmoothPlayer:
                 sleep_time = next_time - time.time()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
+
+            display.stop()
 
         except KeyboardInterrupt:
             print(f"\n\n   ⏹ Manuell abgebrochen!")
@@ -962,10 +969,15 @@ class SmoothPlayer:
 
         # Statistik
         actual_duration = time.time() - playback_start
-        print(f"\n   ⏱ Fertig!")
-        print(f"   Dauer: {actual_duration:.2f}s (Soll: {duration:.2f}s)")
-        print(f"   Befehle gesendet: {commands_sent}")
-        print(f"   Übersprungen (< {MIN_DELTA_DEG}° Δ): {skipped}")
+        playback_summary(
+            duration_actual=actual_duration,
+            duration_planned=duration,
+            commands_sent=commands_sent,
+            skipped=skipped,
+            final_error=err if err is not None else None,
+            thermal_temp=temp,
+            rate_limiter_violations=self._rate_limiter.violations,
+        )
 
         # Rate Limiter Stats
         if self._rate_limiter.violations > 0:
