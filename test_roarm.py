@@ -21,7 +21,8 @@ Ausführen:
 #     "numpy",
 #     "scipy",
 #     "pytest",
-#     "serial",
+#     "pyserial",
+#     "rich",
 # ]
 # ///
 
