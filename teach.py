@@ -14,21 +14,8 @@
 import os
 import sys
 
-def _ensure_uv():
-    if os.environ.get("_UV_SAFE_ENV") == "1":
-        return
-    os.environ["_UV_SAFE_ENV"] = "1"
-    from datetime import datetime, timedelta, timezone
-    if not os.environ.get("UV_EXCLUDE_NEWER"):
-        past = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        os.environ["UV_EXCLUDE_NEWER"] = past
-    try:
-        os.execvpe("uv", ["uv", "run", "--quiet", sys.argv[0]] + sys.argv[1:], os.environ)
-    except FileNotFoundError:
-        print("uv nicht installiert. Install: curl -LsSf https://astral.sh/uv/install.sh | sh")
-        sys.exit(1)
-
-_ensure_uv()
+from bootstrap import ensure_uv
+ensure_uv()
 
 import json
 import time
@@ -40,6 +27,10 @@ from pathlib import Path
 from datetime import datetime
 import select
 
+from robot import (
+    RoArmConnection, find_arm_port, rad_to_deg, deg_to_rad,
+    clear_line, START_POSITION_DEG, POSITION_TOLERANCE, BAUDRATE,
+)
 from ui import (
     console, print_banner, print_connection_status, print_success,
     print_warning, print_info, print_position_inline, TeachDisplay,
@@ -64,167 +55,6 @@ SERIAL_TIMEOUT = 0.1
 
 # Gravity Compensation: Alle N Samples kurz Torque an, Position lesen, Torque aus
 GRAVITY_COMP_SETTLE_MS = 30  # ms warten nach Torque-an bevor Position gelesen wird
-
-
-# ============================================================
-# HILFSFUNKTIONEN
-# ============================================================
-
-def find_arm_port() -> str:
-    ports = list(serial.tools.list_ports.comports())
-    for p in ports:
-        desc = (p.description or "").lower()
-        if any(x in desc for x in ["usb", "ch340", "cp210", "ftdi"]):
-            return p.device
-    for p in ports:
-        if "ttyUSB" in p.device or "ttyACM" in p.device:
-            return p.device
-    if ports:
-        return ports[0].device
-    return None
-
-
-def rad_to_deg(rad: float) -> float:
-    return rad * (180.0 / math.pi)
-
-
-def deg_to_rad(deg: float) -> float:
-    return deg * (math.pi / 180.0)
-
-
-def clear_line():
-    sys.stdout.write("\r\033[K")
-    sys.stdout.flush()
-
-
-# ============================================================
-# ARM-KOMMUNIKATION
-# ============================================================
-
-class RoArmConnection:
-    def __init__(self, port: str, baudrate: int = BAUDRATE):
-        self.port = port
-        self._ser = serial.Serial(port, baudrate=baudrate, timeout=SERIAL_TIMEOUT)
-        self._ser.setRTS(False)
-        self._ser.setDTR(False)
-        self._lock = threading.Lock()
-        time.sleep(0.3)
-        self._ser.reset_input_buffer()
-        self._ser.reset_output_buffer()
-
-    def send_cmd(self, cmd: dict) -> str:
-        with self._lock:
-            self._ser.reset_input_buffer()
-            msg = json.dumps(cmd, separators=(',', ':'))
-            self._ser.write(msg.encode() + b'\n')
-            self._ser.flush()
-            time.sleep(0.01)
-
-            response = ""
-            deadline = time.time() + 0.2
-            while time.time() < deadline:
-                if self._ser.in_waiting:
-                    line = self._ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        response = line
-                        if '"T":1051' in line or '"b"' in line:
-                            return line
-                else:
-                    time.sleep(0.005)
-            return response
-
-    def read_position_raw(self) -> dict:
-        resp = self.send_cmd({"T": 105})
-        if not resp:
-            return None
-        try:
-            start = resp.find('{')
-            end = resp.rfind('}')
-            if start >= 0 and end > start:
-                data = json.loads(resp[start:end+1])
-                if "b" in data:
-                    return data
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return None
-
-    def read_position_stable(self, num_reads: int = 3) -> dict:
-        last_valid = None
-        for i in range(num_reads):
-            raw = self.read_position_raw()
-            if raw and "b" in raw:
-                last_valid = raw
-            if i < num_reads - 1:
-                time.sleep(0.015)
-        return last_valid
-
-    def read_position_deg(self) -> dict:
-        raw = self.read_position_stable(num_reads=3)
-        if raw is None:
-            return None
-        return {
-            "b": round(rad_to_deg(raw["b"]), 2),
-            "s": round(rad_to_deg(raw["s"]), 2),
-            "e": round(rad_to_deg(raw["e"]), 2),
-            "h": round(rad_to_deg(raw.get("t", raw.get("h", 0))), 2),
-        }
-
-    def read_position_deg_single(self) -> dict:
-        """Schneller einzelner Read ohne Stabilisierung (für Recording-Loop)."""
-        raw = self.read_position_raw()
-        if raw is None:
-            return None
-        return {
-            "b": round(rad_to_deg(raw["b"]), 2),
-            "s": round(rad_to_deg(raw["s"]), 2),
-            "e": round(rad_to_deg(raw["e"]), 2),
-            "h": round(rad_to_deg(raw.get("t", raw.get("h", 0))), 2),
-        }
-
-    def move_to(self, b_deg: float, s_deg: float, e_deg: float, h_deg: float,
-                spd: int = 20, acc: int = 10):
-        cmd = {
-            "T": 122,
-            "b": round(b_deg, 2),
-            "s": round(s_deg, 2),
-            "e": round(e_deg, 2),
-            "h": round(h_deg, 2),
-            "spd": spd,
-            "acc": acc,
-        }
-        self.send_cmd(cmd)
-
-    def torque_off(self):
-        self.send_cmd({"T": 210, "cmd": 0})
-        time.sleep(0.03)
-        for sid in range(1, 5):
-            self.send_cmd({"T": 212, "id": sid, "cmd": 0})
-            time.sleep(0.02)
-
-    def torque_on(self):
-        self.send_cmd({"T": 210, "cmd": 1})
-        time.sleep(0.03)
-        for sid in range(1, 5):
-            self.send_cmd({"T": 212, "id": sid, "cmd": 1})
-            time.sleep(0.02)
-
-    def torque_on_fast(self):
-        """Schnelles Torque-an ohne individuelle Servo-Befehle."""
-        self.send_cmd({"T": 210, "cmd": 1})
-
-    def torque_off_fast(self):
-        """Schnelles Torque-aus ohne individuelle Servo-Befehle."""
-        self.send_cmd({"T": 210, "cmd": 0})
-
-    def gripper_open(self):
-        self.send_cmd({"T": 106, "cmd": 1.08, "spd": 50, "acc": 20})
-
-    def gripper_close(self):
-        self.send_cmd({"T": 106, "cmd": 3.14, "spd": 50, "acc": 20})
-
-    def close(self):
-        if self._ser and self._ser.is_open:
-            self._ser.close()
 
 
 # ============================================================

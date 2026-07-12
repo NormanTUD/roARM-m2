@@ -28,21 +28,8 @@ Flags:
 import os
 import sys
 
-def _ensure_uv():
-    if os.environ.get("_UV_SAFE_ENV") == "1":
-        return
-    os.environ["_UV_SAFE_ENV"] = "1"
-    from datetime import datetime, timedelta, timezone
-    if not os.environ.get("UV_EXCLUDE_NEWER"):
-        past = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        os.environ["UV_EXCLUDE_NEWER"] = past
-    try:
-        os.execvpe("uv", ["uv", "run", "--quiet", sys.argv[0]] + sys.argv[1:], os.environ)
-    except FileNotFoundError:
-        print("uv nicht installiert.")
-        sys.exit(1)
-
-_ensure_uv()
+from bootstrap import ensure_uv
+ensure_uv()
 
 import numpy as np
 from pathlib import Path
@@ -55,6 +42,11 @@ import threading
 from rich.panel import Panel
 from rich import box
 
+from robot import (
+    RoArmConnection, find_arm_port, rad_to_deg,
+    BAUDRATE,
+)
+
 from ui import (
     console, print_banner, print_section, print_step,
     calibration_progress, calibration_pose_table, calibration_summary,
@@ -66,7 +58,6 @@ from ui import (
 # KONFIGURATION
 # ============================================================
 
-BAUDRATE = 115200
 JOINTS = ["b", "s", "e"]
 
 # --- SAFE UP POSITION ---
@@ -268,187 +259,6 @@ class CalibrationModel:
         model.residuals = data.get("residuals", {})
         model.is_fitted = True
         return model
-
-
-# ============================================================
-# ARM-VERBINDUNG
-# ============================================================
-
-def find_arm_port() -> str:
-    ports = list(serial.tools.list_ports.comports())
-    for p in ports:
-        desc = (p.description or "").lower()
-        if any(x in desc for x in ["usb", "ch340", "cp210", "ftdi"]):
-            return p.device
-    for p in ports:
-        if "ttyUSB" in p.device or "ttyACM" in p.device:
-            return p.device
-    if ports:
-        return ports[0].device
-    return None
-
-
-def rad_to_deg(rad: float) -> float:
-    return rad * (180.0 / math.pi)
-
-
-class RoArmConnection:
-    def __init__(self, port: str, baudrate: int = BAUDRATE):
-        self.port = port
-        self._ser = serial.Serial(port, baudrate=baudrate, timeout=0.1)
-        self._ser.setRTS(False)
-        self._ser.setDTR(False)
-        self._lock = threading.Lock()
-        time.sleep(0.3)
-        self._ser.reset_input_buffer()
-        self._ser.reset_output_buffer()
-
-    def send_cmd(self, cmd: dict) -> str:
-        with self._lock:
-            self._ser.reset_input_buffer()
-            msg = json.dumps(cmd, separators=(',', ':'))
-            self._ser.write(msg.encode() + b'\n')
-            self._ser.flush()
-            time.sleep(0.01)
-            response = ""
-            deadline = time.time() + 0.2
-            while time.time() < deadline:
-                if self._ser.in_waiting:
-                    line = self._ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        response = line
-                        if '"T":1051' in line or '"b"' in line:
-                            return line
-                else:
-                    time.sleep(0.005)
-            return response
-
-    def read_position_raw(self) -> dict:
-        resp = self.send_cmd({"T": 105})
-        if not resp:
-            return None
-        try:
-            start = resp.find('{')
-            end = resp.rfind('}')
-            if start >= 0 and end > start:
-                data = json.loads(resp[start:end+1])
-                if "b" in data:
-                    return data
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return None
-
-    def read_position_deg(self) -> dict:
-        raw = self.read_position_raw()
-        if raw is None:
-            return None
-        return {
-            "b": round(rad_to_deg(raw["b"]), 2),
-            "s": round(rad_to_deg(raw["s"]), 2),
-            "e": round(rad_to_deg(raw["e"]), 2),
-            "h": round(rad_to_deg(raw.get("t", raw.get("h", 0))), 2),
-        }
-
-    def move_to(self, b_deg: float, s_deg: float, e_deg: float, h_deg: float,
-                spd: int = 20, acc: int = 10):
-        cmd = {
-            "T": 122,
-            "b": round(b_deg, 2),
-            "s": round(s_deg, 2),
-            "e": round(e_deg, 2),
-            "h": round(h_deg, 2),
-            "spd": spd,
-            "acc": acc,
-        }
-        self.send_cmd(cmd)
-
-    def wait_until_settled(self, tolerance_deg: float = 0.3, stable_count: int = 5,
-                           poll_interval: float = 0.15, timeout: float = 15.0) -> dict:
-        """
-        Wartet bis der Arm stillsteht.
-        Gibt dict zurück: {"pos": final_pos, "settle_time_s": float, "readings": list}
-        """
-        stable = 0
-        last_pos = None
-        start = time.time()
-        all_readings = []
-
-        while time.time() - start < timeout:
-            pos = self.read_position_deg()
-            if pos is None:
-                time.sleep(poll_interval)
-                continue
-
-            all_readings.append({"t": time.time() - start, **pos})
-
-            if last_pos is not None:
-                max_delta = max(
-                    abs(pos["b"] - last_pos["b"]),
-                    abs(pos["s"] - last_pos["s"]),
-                    abs(pos["e"] - last_pos["e"]),
-                )
-                if max_delta < tolerance_deg:
-                    stable += 1
-                    if stable >= stable_count:
-                        settle_time = time.time() - start
-                        return {
-                            "pos": pos,
-                            "settle_time_s": settle_time,
-                            "readings": all_readings,
-                        }
-                else:
-                    stable = 0
-
-            last_pos = pos
-            time.sleep(poll_interval)
-
-        # Timeout
-        settle_time = time.time() - start
-        return {
-            "pos": last_pos,
-            "settle_time_s": settle_time,
-            "readings": all_readings,
-            "timeout": True,
-        }
-
-    def read_position_averaged(self, n: int = 8, interval: float = 0.04) -> dict:
-        """Liest n Positionen und gibt den Mittelwert zurück."""
-        readings = []
-        for _ in range(n):
-            pos = self.read_position_deg()
-            if pos:
-                readings.append(pos)
-            time.sleep(interval)
-
-        if not readings:
-            return None
-
-        avg = {}
-        for joint in ["b", "s", "e", "h"]:
-            values = [r[joint] for r in readings]
-            avg[joint] = round(np.mean(values), 3)
-            avg[f"{joint}_std"] = round(np.std(values), 4)
-        avg["n_samples"] = len(readings)
-        return avg
-
-    def torque_off(self):
-        self.send_cmd({"T": 210, "cmd": 0})
-        time.sleep(0.03)
-        for sid in range(1, 5):
-            self.send_cmd({"T": 212, "id": sid, "cmd": 0})
-            time.sleep(0.02)
-
-    def torque_on(self):
-        self.send_cmd({"T": 210, "cmd": 1})
-        time.sleep(0.03)
-        for sid in range(1, 5):
-            self.send_cmd({"T": 212, "id": sid, "cmd": 1})
-            time.sleep(0.02)
-
-    def close(self):
-        if self._ser and self._ser.is_open:
-            self._ser.close()
-
 
 # ============================================================
 # SAFE-UP BEWEGUNG (Kollisionsvermeidung)
