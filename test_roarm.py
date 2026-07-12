@@ -27,6 +27,10 @@ Ausführen:
 
 import sys
 import os
+
+from bootstrap import ensure_uv
+ensure_uv()
+
 import time
 import math
 import json
