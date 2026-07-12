@@ -86,17 +86,26 @@ class PositionValidator:
         if not (L.h_min <= h <= L.h_max):
             return False, f"h={h:.2f}° außerhalb [{L.h_min}, {L.h_max}]"
         
-        # 2. Sprung-Erkennung (zu große Änderung auf einmal)
+        # 2. Sprung-Erkennung - NUR gegen letzten GESENDETEN Befehl
+        #    UND nur wenn der letzte Befehl kürzlich war (< 1s)
         if self._last_commanded is not None:
+            time_since_last = time.time() - self._last_commanded["t"]
+            
             delta_b = abs(b - self._last_commanded["b"])
             delta_s = abs(s - self._last_commanded["s"])
             delta_e = abs(e - self._last_commanded["e"])
             delta_h = abs(h - self._last_commanded["h"])
             max_delta = max(delta_b, delta_s, delta_e, delta_h)
             
-            if max_delta > L.max_delta_per_cmd:
+            # Dynamisches Limit: Je mehr Zeit vergangen, desto mehr Sprung erlaubt
+            # Bei 40Hz Streaming: 25ms zwischen Befehlen → max 20°
+            # Bei 500ms Pause (wegen Skips): max 20° + 500ms * 80°/s = 60°
+            max_allowed = L.max_delta_per_cmd + time_since_last * 80.0  # 80°/s max Geschwindigkeit
+            max_allowed = min(max_allowed, 90.0)  # Absolutes Maximum: 90°
+            
+            if max_delta > max_allowed:
                 return False, (f"Sprung zu groß: {max_delta:.2f}° "
-                             f"(max erlaubt: {L.max_delta_per_cmd}°)")
+                             f"(max erlaubt: {max_allowed:.1f}° bei {time_since_last*1000:.0f}ms seit letztem Cmd)")
         
         # 3. Überhitzungsschutz
         if self._continuous_move_start is not None:
@@ -106,7 +115,7 @@ class PositionValidator:
                              f"Bewegung (max: {L.max_continuous_move_s}s)")
         
         return True, "OK"
-    
+
     def validate_speed(self, spd: int, acc: int) -> tuple[bool, str]:
         """Prüft ob Geschwindigkeit/Beschleunigung sicher sind."""
         L = self.limits

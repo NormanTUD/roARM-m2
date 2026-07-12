@@ -878,6 +878,9 @@ class SmoothPlayer:
                 else:
                     # Auch bei Nicht-Senden: Thermal updaten (Haltestrom)
                     self._thermal.update(is_moving=False, delta_deg=0.0)
+                    # FIX: last_pos trotzdem aktualisieren damit delta_deg beim
+                    # nächsten Send korrekt berechnet wird
+                    last_pos = corrected.copy()
 
                 # Timing einhalten
                 next_time = playback_start + (commands_sent + skipped + 1) * interval
