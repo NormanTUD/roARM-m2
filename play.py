@@ -64,13 +64,13 @@ SERIAL_TIMEOUT = 0.1
 
 # Streaming-Parameter
 STREAM_HZ = 40             # Befehle pro Sekunde (30-50 Hz ideal)
-STREAM_SPD = 50            # Hoher SPD damit Servo nie "fertig" wird
-STREAM_ACC = 30            # Hohe ACC für schnelle Reaktion
+STREAM_SPD = 30        # statt 50
+STREAM_ACC = 15        # statt 30
 MIN_DELTA_DEG = 0.05       # Minimale Änderung zum Senden
 
 # Adaptive Timing Parameter
 MIN_SPEED_FACTOR = 0.3     # Nie langsamer als 30% der Normalgeschwindigkeit
-MAX_SPEED_FACTOR = 2.5     # Nie schneller als 250%
+MAX_SPEED_FACTOR = 1.3 # statt 2.5
 END_RAMP_PERCENT = 0.10    # Letzte 10% abbremsen
 START_RAMP_PERCENT = 0.05  # Erste 5% sanft anfahren
 

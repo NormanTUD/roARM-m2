@@ -1,3 +1,0 @@
-https://github.com/waveshareteam/waveshare_roarm_sdk.git
-
-also requirements.txt serial pyserial
