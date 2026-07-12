@@ -41,6 +41,8 @@ from pathlib import Path
 import numpy as np
 from scipy.interpolate import CubicSpline
 
+from safety import SafeArm, SafetyLimits, SafetyWatchdog
+
 # Kalibrierungsmodell (optional)
 try:
     from calibrate import CalibrationModel, JOINTS
@@ -518,8 +520,23 @@ class SmoothPlayer:
             return False
         print(f"🔌 Verbinde mit {port}...")
         try:
-            self._arm = RoArmConnection(port)
+            self._arm_raw = RoArmConnection(port)
+
             print(f"   ✅ Verbunden")
+
+            limits = SafetyLimits(
+                    max_delta_per_cmd=20.0,        # Für Streaming etwas großzügiger
+                    max_continuous_move_s=90.0,    # Max 90s am Stück
+                    max_plausible_error=5.0,       # Fehler > 5° = Müll
+                    )
+            self._arm = SafeArm(self._arm_raw, limits=limits)
+
+            # Watchdog starten
+            self._watchdog = SafetyWatchdog(self._arm)
+            self._watchdog.start()
+
+            print(f"   ✅ Safety Watchguard started")
+
             return True
         except Exception as e:
             print(f"   ❌ Fehler: {e}")
