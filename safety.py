@@ -13,6 +13,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+from play import SmoothTrajectory
+
 # ============================================================
 # SICHERHEITS-GRENZEN (anpassen an deinen Arm!)
 # ============================================================
