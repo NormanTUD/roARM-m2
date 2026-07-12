@@ -423,7 +423,10 @@ class SafetyWatchdog:
     def stop(self):
         self._running = False
         if self._thread:
-            self._thread.join(timeout=3.0)
+            try:
+                self._thread.join(timeout=3.0)
+            except KeyboardInterrupt:
+                pass
     
     def _watchdog_loop(self):
         while self._running:
