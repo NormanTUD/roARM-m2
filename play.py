@@ -9,6 +9,7 @@ und mit hoher Frequenz an den Arm gestreamt, sodass der Arm nie "anhält".
 #     "pyserial",
 #     "numpy",
 #     "scipy",
+#     "rich",
 # ]
 # ///
 
@@ -45,6 +46,13 @@ from safety import (
     SafeArm, SafetyLimits, SafetyWatchdog,
     CurrentMonitor, ThermalEstimator, RateLimiter,
     TrajectoryValidator, GracefulStop
+)
+
+from ui import (
+    console, print_banner, print_section, print_position,
+    print_connection_status, print_trajectory_info, print_preflight_check,
+    print_safety_violation, print_emergency_stop, playback_summary,
+    PlaybackDisplay, print_success, print_warning, print_error
 )
 
 # Kalibrierungsmodell (optional)
@@ -552,10 +560,16 @@ class SmoothPlayer:
         if port is None:
             print("❌ FEHLER: Kein serieller Port gefunden!")
             return False
-        print(f"🔌 Verbinde mit {port}...")
         try:
             self._arm_raw = RoArmConnection(port)
-            print(f"   ✅ Verbunden")
+
+            print_connection_status(port, success=True, safety_features=[
+                "SafeArm (Positions-/Speed-Validierung)",
+                "Watchdog (Überhitzungs-Timer)",
+                "CurrentMonitor (Stall-Erkennung)",
+                "ThermalEstimator (Temperatur-Schätzung)",
+                f"RateLimiter (max {self._stream_hz + 10} Hz)",
+            ])
 
             # Safety-Wrapper mit Limits
             limits = SafetyLimits(
@@ -587,17 +601,11 @@ class SmoothPlayer:
             # Rate Limiter (max Stream-Hz + Sicherheitsmarge)
             self._rate_limiter = RateLimiter(max_hz=self._stream_hz + 10)
 
-            print(f"   🛡️  Safety-Layer aktiv:")
-            print(f"      • SafeArm (Positions-/Speed-Validierung)")
-            print(f"      • Watchdog (Überhitzungs-Timer)")
-            print(f"      • CurrentMonitor (Stall-Erkennung)")
-            print(f"      • ThermalEstimator (Temperatur-Schätzung)")
-            print(f"      • RateLimiter (max {self._stream_hz + 10} Hz)")
-
             return True
         except Exception as e:
             print(f"   ❌ Fehler: {e}")
             return False
+
 
     def load(self) -> bool:
         path = Path(self._filepath)
@@ -985,11 +993,7 @@ class SmoothPlayer:
                     print(f"   ⚠️  Endposition-Read unplausibel, übersprungen")
 
     def run(self):
-        print("=" * 60)
-        print("  RoArm-M2-S SMOOTH PLAY MODE (Cubic Spline + Streaming)")
-        print("  Flüssige Bewegung durch High-Frequency Command Streaming")
-        print("  🛡️  MIT SAFETY-LAYER (Überhitzung/Stall/Tracking-Schutz)")
-        print("=" * 60)
+        print_banner("play", "Cubic Spline + High-Frequency Streaming\n🛡️ MIT SAFETY-LAYER")
 
         if not self.load():
             return
