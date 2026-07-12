@@ -119,12 +119,13 @@ class RoArmConnection:
         self._ser.setRTS(False)
         self._ser.setDTR(False)
         self._lock = threading.Lock()
-        time.sleep(0.3)
+        time.sleep(0.5)
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
 
     def send_cmd(self, cmd: dict) -> str:
         with self._lock:
+            time.sleep(0.5)
             self._ser.reset_input_buffer()
             msg = json.dumps(cmd, separators=(',', ':'))
             self._ser.write(msg.encode() + b'\n')
@@ -595,6 +596,11 @@ class SmoothPlayer:
         if self._verify:
             pos = self._arm.read_position_deg()
             if pos:
+                err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
+                if err > 180.0:  # OFFENSICHTLICH MÜLL
+                    print("⚠️ Ungültiger Read, überspringe Precision-Endpoint")
+                    return
+            if pos:
                 max_err = max(abs(pos[j] - start[j]) for j in ["b", "s", "e", "h"])
                 print(f"   Ist:  b={pos['b']:.2f}° s={pos['s']:.2f}° "
                       f"e={pos['e']:.2f}° h={pos['h']:.2f}°")
@@ -726,6 +732,11 @@ class SmoothPlayer:
             pos = self._arm.read_position_deg()
             if pos:
                 err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
+                if err > 180.0:  # OFFENSICHTLICH MÜLL
+                    print("⚠️ Ungültiger Read, überspringe Precision-Endpoint")
+                    return
+            if pos:
+                err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
                 status = "✅" if err < 0.3 else "⚠️"
                 print(f"      Pass {pass_num + 1}: spd={spd} acc={acc} → "
                       f"Fehler={err:.3f}° {status}")
@@ -746,6 +757,11 @@ class SmoothPlayer:
         if self._verify:
             time.sleep(0.3)
             pos = self._arm.read_position_deg()
+            if pos:
+                err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
+                if err > 180.0:  # OFFENSICHTLICH MÜLL
+                    print("⚠️ Ungültiger Read, überspringe Precision-Endpoint")
+                    return
             if pos:
                 max_err = max(abs(pos[j] - final[j]) for j in ["b", "s", "e", "h"])
                 print(f"   Endposition Fehler: {max_err:.2f}°")
