@@ -109,6 +109,7 @@ def _visualizer_process_main(pose_queue: multiprocessing.Queue,
                               update_interval: float = 0.05):
     """
     Hauptfunktion des Visualizer-Prozesses.
+    5 Ansichten: Vorne, Hinten, Links, Rechts, Oben
     """
     import matplotlib
     matplotlib.use('TkAgg')
@@ -121,132 +122,137 @@ def _visualizer_process_main(pose_queue: multiprocessing.Queue,
     max_trail = 200
 
     plt.ion()
-    fig = plt.figure(figsize=(10, 8))
-    fig.canvas.manager.set_window_title("RoArm-M2-S 3D Visualisierung")
-    ax = fig.add_subplot(111, projection='3d')
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.95)
+    fig = plt.figure(figsize=(16, 10))
+    fig.canvas.manager.set_window_title("RoArm-M2-S - 5-Ansichten Visualisierung")
+
+    # 5 Subplots: 2 Reihen x 3 Spalten (letzter Platz leer oder für Info)
+    # Layout:
+    #   [Vorne]  [Rechts]  [Hinten]
+    #   [Links]  [Oben]    [Info/leer]
+    axes = {}
+    view_configs = {
+        "Vorne (Front)":   {"pos": (2, 3, 1), "elev": 0,  "azim": 0},
+        "Rechts (Right)":  {"pos": (2, 3, 2), "elev": 0,  "azim": -90},
+        "Hinten (Back)":   {"pos": (2, 3, 3), "elev": 0,  "azim": 180},
+        "Links (Left)":    {"pos": (2, 3, 4), "elev": 0,  "azim": 90},
+        "Oben (Top)":      {"pos": (2, 3, 5), "elev": 90, "azim": 0},
+    }
+
+    for name, cfg in view_configs.items():
+        ax = fig.add_subplot(*cfg["pos"], projection='3d')
+        ax.view_init(elev=cfg["elev"], azim=cfg["azim"])
+        ax.set_title(name, fontsize=10, fontweight='bold')
+        axes[name] = ax
+
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.95,
+                        wspace=0.05, hspace=0.15)
 
     JOINT_NAMES = ['Base', 'Shoulder', 'Elbow', 'Gripper']
 
-    def configure_axes():
+    def configure_ax(ax, show_labels=True):
         limit = 500.0
         ax.set_xlim([-limit, limit])
         ax.set_ylim([-limit, limit])
         ax.set_zlim([-50, limit])
-        ax.set_xlabel("X [mm] (vorne)", fontsize=9)
-        ax.set_ylabel("Y [mm] (links)", fontsize=9)
-        ax.set_zlabel("Z [mm] (oben)", fontsize=9)
-        ax.set_title("RoArm-M2-S", fontsize=14, fontweight='bold')
+        if show_labels:
+            ax.set_xlabel("X", fontsize=7)
+            ax.set_ylabel("Y", fontsize=7)
+            ax.set_zlabel("Z", fontsize=7)
         ax.set_box_aspect([1, 1, 1])
-        ax.view_init(elev=20, azim=-60)
         ax.set_proj_type('persp', focal_length=0.5)
+        # Tick-Labels kleiner machen für bessere Übersicht
+        ax.tick_params(labelsize=6)
 
-    def draw_arm():
-        ax.cla()
-        configure_axes()
-
-        positions = forward_kinematics(
-            current_pose["b"], current_pose["s"], current_pose["e"]
-        )
-
+    def draw_arm_on_ax(ax, positions, show_labels=True):
+        """Zeichnet den Arm auf einem einzelnen Axes-Objekt."""
         pts = [positions["base"], positions["shoulder"],
                positions["elbow"], positions["gripper"]]
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         zs = [p[2] for p in pts]
 
-        # === ARM SEGMENTE ===
         # Basis (Drehsäule)
         ax.plot([0, 0], [0, 0], [0, BASE_HEIGHT],
-                color='#424242', linewidth=10, solid_capstyle='round', alpha=0.8)
-        
-        # Oberarm (Shoulder → Elbow) - blau
-        ax.plot([xs[1], xs[2]], [ys[1], ys[2]], [zs[1], zs[2]],
-                color='#1565C0', linewidth=7, solid_capstyle='round', label='Oberarm')
-        
-        # Unterarm + Gripper (Elbow → Gripper) - grün/orange
-        ax.plot([xs[2], xs[3]], [ys[2], ys[3]], [zs[2], zs[3]],
-                color='#2E7D32', linewidth=6, solid_capstyle='round', label='Unterarm + Gripper')
+                color='#424242', linewidth=8, solid_capstyle='round', alpha=0.8)
 
-        # === GELENKE mit Beschriftung ===
+        # Oberarm (Shoulder → Elbow)
+        ax.plot([xs[1], xs[2]], [ys[1], ys[2]], [zs[1], zs[2]],
+                color='#1565C0', linewidth=5, solid_capstyle='round')
+
+        # Unterarm + Gripper (Elbow → Gripper)
+        ax.plot([xs[2], xs[3]], [ys[2], ys[3]], [zs[2], zs[3]],
+                color='#2E7D32', linewidth=4, solid_capstyle='round')
+
+        # Gelenke
         joint_colors = ['#212121', '#D32F2F', '#1565C0', '#E65100']
-        joint_sizes = [100, 80, 70, 60]
-        
+        joint_sizes = [60, 50, 45, 40]
         for i, (x, y, z) in enumerate(pts):
             ax.scatter([x], [y], [z], c=joint_colors[i], s=joint_sizes[i],
                       zorder=5, depthshade=False, edgecolors='white', linewidths=0.5)
-            offset_z = 20 if i < 3 else -25
-            ax.text(x, y, z + offset_z, JOINT_NAMES[i],
-                    fontsize=8, ha='center', va='bottom' if offset_z > 0 else 'top',
-                    color=joint_colors[i], fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
-                             alpha=0.7, edgecolor=joint_colors[i], linewidth=0.5))
 
-        # === BODEN-PROJEKTION (Schatten) ===
-        ax.plot(xs, ys, [0]*len(xs), color='gray', linewidth=1,
+        # Boden-Projektion (Schatten)
+        ax.plot(xs, ys, [0]*len(xs), color='gray', linewidth=0.8,
                 linestyle=':', alpha=0.3)
-        ax.plot([xs[-1], xs[-1]], [ys[-1], ys[-1]], [0, zs[-1]],
-                color='gray', linewidth=0.5, linestyle=':', alpha=0.2)
 
-        # === ENDEFFEKTOR-TRAIL ===
+        # Trail
         if trail:
             trail_x = [p[0] for p in trail]
             trail_y = [p[1] for p in trail]
             trail_z = [p[2] for p in trail]
             ax.plot(trail_x, trail_y, trail_z,
-                    color='red', linewidth=1.5, alpha=0.5)
+                    color='red', linewidth=1.2, alpha=0.5)
 
-        # === TARGET ===
+        # Target
         if target_pose:
             tp = forward_kinematics(
                 target_pose["b"], target_pose["s"], target_pose["e"]
             )["gripper"]
             ax.scatter([tp[0]], [tp[1]], [tp[2]],
-                      c='red', s=120, marker='x', linewidths=3, zorder=6)
+                      c='red', s=80, marker='x', linewidths=2, zorder=6)
 
-        # === KOORDINATENACHSEN am Ursprung ===
-        axis_len = 60.0
-        ax.quiver(0, 0, 0, axis_len, 0, 0, color='red', arrow_length_ratio=0.15, 
-                  alpha=0.6, linewidth=1.5)
-        ax.quiver(0, 0, 0, 0, axis_len, 0, color='green', arrow_length_ratio=0.15, 
-                  alpha=0.6, linewidth=1.5)
-        ax.quiver(0, 0, 0, 0, 0, axis_len, color='blue', arrow_length_ratio=0.15, 
-                  alpha=0.6, linewidth=1.5)
-        ax.text(axis_len + 10, 0, 0, "X", color='red', fontsize=8)
-        ax.text(0, axis_len + 10, 0, "Y", color='green', fontsize=8)
-        ax.text(0, 0, axis_len + 10, "Z", color='blue', fontsize=8)
+        # Koordinatenachsen am Ursprung
+        axis_len = 50.0
+        ax.quiver(0, 0, 0, axis_len, 0, 0, color='red', arrow_length_ratio=0.15, alpha=0.5, linewidth=1)
+        ax.quiver(0, 0, 0, 0, axis_len, 0, color='green', arrow_length_ratio=0.15, alpha=0.5, linewidth=1)
+        ax.quiver(0, 0, 0, 0, 0, axis_len, color='blue', arrow_length_ratio=0.15, alpha=0.5, linewidth=1)
 
-        # === ARBEITSRAUM-KREIS (Boden) ===
+        # Arbeitsraum-Kreis
         theta = np.linspace(0, 2*np.pi, 80)
         reach = UPPER_ARM + FOREARM + GRIPPER_LENGTH
         ax.plot(reach * np.cos(theta), reach * np.sin(theta),
-                np.zeros(80), color='gray', linewidth=0.5, alpha=0.15)
-        half_reach = UPPER_ARM
-        ax.plot(half_reach * np.cos(theta), half_reach * np.sin(theta),
-                np.zeros(80), color='gray', linewidth=0.3, alpha=0.1, linestyle='--')
+                np.zeros(80), color='gray', linewidth=0.4, alpha=0.15)
 
-        # === BODEN-PLATTE ===
-        plate_size = 80
-        plate_x = [-plate_size, plate_size, plate_size, -plate_size, -plate_size]
-        plate_y = [-plate_size, -plate_size, plate_size, plate_size, -plate_size]
-        ax.plot(plate_x, plate_y, [0]*5, color='#616161', linewidth=1.5, alpha=0.4)
+    def draw_all():
+        positions = forward_kinematics(
+            current_pose["b"], current_pose["s"], current_pose["e"]
+        )
 
-        # === INFO-TEXT ===
+        for name, ax in axes.items():
+            cfg = view_configs[name]
+            ax.cla()
+            ax.set_title(name, fontsize=10, fontweight='bold')
+            configure_ax(ax)
+            # View-Winkel erneut setzen nach cla()
+            ax.view_init(elev=cfg["elev"], azim=cfg["azim"])
+            draw_arm_on_ax(ax, positions)
+
+        # Info-Text im Figure-Bereich (unten rechts)
+        # Vorherigen Text entfernen
+        for txt in fig.texts:
+            txt.remove()
+
         info_text = (
-            f"b={current_pose['b']:+6.1f}\u00b0  s={current_pose['s']:+6.1f}\u00b0  "
-            f"e={current_pose['e']:+6.1f}\u00b0\n"
+            f"b={current_pose['b']:+6.1f}°  s={current_pose['s']:+6.1f}°  "
+            f"e={current_pose['e']:+6.1f}°\n"
             f"Gripper: ({positions['gripper'][0]:.0f}, "
             f"{positions['gripper'][1]:.0f}, {positions['gripper'][2]:.0f}) mm"
         )
-        ax.text2D(0.02, 0.95, info_text, transform=ax.transAxes,
-                  fontsize=9, fontfamily='monospace',
-                  verticalalignment='top',
-                  bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
-
-        ax.legend(loc='upper right', fontsize=8, framealpha=0.8)
+        fig.text(0.82, 0.25, info_text, fontsize=10, fontfamily='monospace',
+                 verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
 
     # Initial zeichnen
-    draw_arm()
+    draw_all()
     fig.canvas.draw_idle()
     plt.pause(0.01)
 
@@ -290,7 +296,7 @@ def _visualizer_process_main(pose_queue: multiprocessing.Queue,
             pass
 
         if dirty:
-            draw_arm()
+            draw_all()
             fig.canvas.draw_idle()
             dirty = False
 
@@ -306,7 +312,6 @@ def _visualizer_process_main(pose_queue: multiprocessing.Queue,
         plt.close(fig)
     except Exception:
         pass
-
 
 # ============================================================
 # ROBOT VISUALIZER (API)
