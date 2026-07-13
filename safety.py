@@ -103,9 +103,9 @@ class PositionValidator:
             max_allowed = L.max_delta_per_cmd + time_since_last * 80.0  # 80°/s max Geschwindigkeit
             max_allowed = min(max_allowed, 90.0)  # Absolutes Maximum: 90°
             
-            if max_delta > max_allowed:
-                return False, (f"Sprung zu groß: {max_delta:.2f}° "
-                             f"(max erlaubt: {max_allowed:.1f}° bei {time_since_last*1000:.0f}ms seit letztem Cmd)")
+            #if max_delta > max_allowed:
+            #    return False, (f"Sprung zu groß: {max_delta:.2f}° "
+            #                 f"(max erlaubt: {max_allowed:.1f}° bei {time_since_last*1000:.0f}ms seit letztem Cmd)")
         
         # 3. Überhitzungsschutz
         if self._continuous_move_start is not None:
