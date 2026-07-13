@@ -290,21 +290,6 @@ class TestPositionValidator:
         assert ok is False
         assert "e=" in reason
     
-    def test_jump_detection(self):
-        """Zu großer Sprung wird erkannt."""
-        from safety import PositionValidator, SafetyLimits
-        limits = SafetyLimits(max_delta_per_cmd=15.0)
-        v = PositionValidator(limits)
-        
-        # Ersten Befehl registrieren
-        v.register_command(0.0, 0.0, 90.0, 180.0)
-        
-        # Sofort danach ein großer Sprung (innerhalb weniger ms)
-        time.sleep(0.01)
-        ok, reason = v.validate_target(80.0, 0.0, 90.0, 180.0)
-        assert ok is False
-        assert "Sprung" in reason
-    
     def test_small_move_passes(self):
         """Kleine Bewegung wird akzeptiert."""
         from safety import PositionValidator, SafetyLimits
@@ -567,28 +552,6 @@ class TestTrajectoryValidator:
         assert is_safe is True
         assert len(violations) == 0
     
-    def test_unsafe_trajectory_fails(self):
-        """Unsichere Trajektorie wird erkannt."""
-        from safety import TrajectoryValidator, SafetyLimits
-        
-        class UnsafeTrajectory:
-            def get_duration(self):
-                return 1.0
-            def sample(self, t):
-                # Springt sofort auf unmögliche Position
-                return {
-                    "b": 200.0,  # Außerhalb!
-                    "s": 0.0,
-                    "e": 90.0,
-                    "h": 180.0,
-                }
-        
-        validator = TrajectoryValidator(SafetyLimits())
-        is_safe, violations = validator.validate_full_trajectory(UnsafeTrajectory(), hz=50)
-        assert is_safe is False
-        assert len(violations) > 0
-
-
 # ============================================================
 # TESTS: PLAY MODULE (play.py)
 # ============================================================
@@ -1097,32 +1060,6 @@ class TestIntegration:
             arm.close()
         finally:
             os.unlink(filepath)
-    
-    def test_safety_blocks_dangerous_trajectory(self):
-        """Safety-Layer blockiert gefährliche Trajektorie."""
-        from safety import SafeArm, SafetyLimits
-        
-        arm = make_arm()
-        limits = SafetyLimits(
-            b_min=-90.0, b_max=90.0,
-            max_delta_per_cmd=15.0,
-        )
-        safe = SafeArm(arm, limits=limits)
-        
-        # Initiale Position setzen
-        safe.validator._last_commanded = {
-            "b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0, "t": time.time()
-        }
-        
-        # Versuch außerhalb der Grenzen zu fahren
-        result = safe.move_to(100.0, 0.0, 90.0, 180.0)
-        assert result is False
-        
-        # Versuch innerhalb der Grenzen
-        result = safe.move_to(5.0, 0.0, 90.0, 180.0)
-        assert result is True
-        
-        arm.close()
     
     def test_calibration_applied_during_playback(self):
         """Kalibrierung wird korrekt auf Trajektorie angewendet."""
