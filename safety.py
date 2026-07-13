@@ -12,6 +12,7 @@ import time
 import math
 from dataclasses import dataclass, field
 from typing import Optional
+import numpy as np
 
 # ============================================================
 # SICHERHEITS-GRENZEN (anpassen an deinen Arm!)
@@ -744,3 +745,147 @@ class RateLimiter:
     @property
     def violations(self) -> int:
         return self._violations
+
+class TrajectorySmoother:
+    """Repariert unsichere Trajektorien durch lokales Zeit-Stretching.
+
+    Statt die Trajektorie abzulehnen, werden nur die problematischen
+    Segmente verlangsamt bis die Beschleunigung unter dem Limit liegt.
+    """
+
+    def __init__(self, limits: SafetyLimits = None):
+        self.limits = limits or SafetyLimits()
+        self.max_accel = 500.0  # °/s²
+        self.max_velocity = 180.0  # °/s
+
+    def find_violations(self, trajectory, hz: int = 100) -> list:
+        """Findet alle Zeitpunkte mit Beschleunigungs-Verletzungen."""
+        duration = trajectory.get_duration()
+        n_samples = int(duration * hz)
+        dt = 1.0 / hz
+        violations = []
+
+        prev_pos = None
+        prev_vel = None
+
+        for i in range(n_samples):
+            t = i * dt
+            pos = trajectory.sample(t)
+
+            if prev_pos is not None:
+                vel = {j: (pos[j] - prev_pos[j]) / dt for j in ["b", "s", "e", "h"]}
+
+                if prev_vel is not None:
+                    for j in ["b", "s", "e", "h"]:
+                        accel = (vel[j] - prev_vel[j]) / dt
+                        if abs(accel) > self.max_accel:
+                            violations.append({
+                                "t": t,
+                                "joint": j,
+                                "accel": accel,
+                                "ratio": abs(accel) / self.max_accel,
+                            })
+
+                prev_vel = vel
+            prev_pos = pos
+
+        return violations
+
+    def compute_stretch_profile(self, violations: list, duration: float,
+                                 hz: int = 100, margin: float = 0.2) -> np.ndarray:
+        """Berechnet einen Stretch-Faktor pro Zeitschritt.
+
+        An Stellen mit Verletzungen wird der Faktor > 1.0 (= langsamer).
+        margin: Wie viel Sekunden um die Verletzung herum mitgestretcht werden.
+        """
+        import numpy as np
+
+        n_samples = int(duration * hz)
+        stretch = np.ones(n_samples)
+
+        for v in violations:
+            center_idx = int(v["t"] * hz)
+            margin_samples = int(margin * hz)
+            needed_stretch = v["ratio"]  # z.B. 2.0 = doppelt so langsam
+
+            start = max(0, center_idx - margin_samples)
+            end = min(n_samples, center_idx + margin_samples)
+
+            for i in range(start, end):
+                # Glockenförmig: Maximum in der Mitte
+                dist = abs(i - center_idx) / max(margin_samples, 1)
+                local_stretch = 1.0 + (needed_stretch - 1.0) * (1.0 - dist)
+                stretch[i] = max(stretch[i], local_stretch)
+
+        return stretch
+
+    def build_retimed_waypoints(self, trajectory, stretch_profile: np.ndarray,
+                                 hz: int = 100) -> list:
+        """Baut neue Waypoints mit gestretchten Zeitstempeln."""
+        import numpy as np
+
+        duration = trajectory.get_duration()
+        n_samples = int(duration * hz)
+        dt = 1.0 / hz
+
+        new_waypoints = []
+        t_new = 0.0
+
+        for i in range(n_samples):
+            t_orig = i * dt
+            pos = trajectory.sample(t_orig)
+            new_waypoints.append({
+                "t": t_new,
+                "b": pos["b"],
+                "s": pos["s"],
+                "e": pos["e"],
+                "h": pos["h"],
+            })
+            t_new += dt * stretch_profile[i]
+
+        return new_waypoints
+
+    def smooth_trajectory(self, trajectory, hz: int = 100) -> tuple:
+        """Hauptmethode: Findet Violations und gibt reparierte Waypoints zurück.
+
+        Returns:
+            (new_waypoints, n_violations, added_duration_s)
+        """
+        import numpy as np
+
+        violations = self.find_violations(trajectory, hz)
+
+        if not violations:
+            return None, 0, 0.0
+
+        duration = trajectory.get_duration()
+        stretch = self.compute_stretch_profile(violations, duration, hz)
+        new_waypoints = self.build_retimed_waypoints(trajectory, stretch, hz)
+
+        # Auf sinnvolle Dichte reduzieren (nicht 100Hz Waypoints behalten)
+        reduced = self._reduce_waypoints(new_waypoints, tolerance_deg=0.05)
+
+        old_duration = duration
+        new_duration = new_waypoints[-1]["t"] if new_waypoints else duration
+        added = new_duration - old_duration
+
+        return reduced, len(violations), added
+
+    def _reduce_waypoints(self, waypoints: list, tolerance_deg: float = 0.05) -> list:
+        """Reduziert Waypoint-Dichte: Behält nur Punkte mit genug Änderung."""
+        if len(waypoints) < 3:
+            return waypoints
+
+        reduced = [waypoints[0]]
+
+        for wp in waypoints[1:-1]:
+            last = reduced[-1]
+            delta = max(abs(wp[j] - last[j]) for j in ["b", "s", "e", "h"])
+            time_gap = wp["t"] - last["t"]
+
+            # Behalte wenn genug Bewegung ODER genug Zeit vergangen
+            if delta >= tolerance_deg or time_gap > 0.1:
+                reduced.append(wp)
+
+        reduced.append(waypoints[-1])
+        return reduced

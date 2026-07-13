@@ -508,14 +508,53 @@ class SmoothPlayer:
         print_preflight_check(is_safe, violations)
 
         if not is_safe:
-            print(f"   🛑 TRAJEKTORIE UNSICHER! {len(violations)} Verletzungen:")
-            for v in violations[:10]:
-                print(f"      ⚠️  {v}")
-            print(f"\n   Abbruch. Trajektorie wird NICHT abgespielt.")
-            return False
+            # === NEU: Reparieren statt Ablehnen ===
+            repaired = self._attempt_repair(violations)
+            if not repaired:
+                return False
         else:
             print(f"   ✅ Trajektorie sicher (alle Punkte innerhalb Grenzen)")
 
+        return True
+
+    def _attempt_repair(self, violations: list) -> bool:
+        """Versucht die Trajektorie durch Zeit-Stretching zu reparieren."""
+        from safety import TrajectorySmoother
+
+        print_warning(
+            f"⚠️  {len(violations)} Beschleunigungs-Verletzungen gefunden. "
+            f"Versuche automatische Reparatur..."
+        )
+
+        smoother = TrajectorySmoother(SafetyLimits())
+        new_wps, n_violations, added_time = smoother.smooth_trajectory(self._trajectory)
+
+        if new_wps is None:
+            print_error("Reparatur fehlgeschlagen - keine Waypoints erzeugt.")
+            return False
+
+        # Neue Trajektorie aus reparierten Waypoints bauen
+        self._trajectory = SmoothTrajectory(new_wps, self._speed)
+
+        # Nochmal validieren
+        recheck_safe, recheck_violations = TrajectoryValidator(
+            SafetyLimits()
+        ).validate_full_trajectory(self._trajectory)
+
+        if not recheck_safe:
+            print_error(
+                f"Reparatur nicht ausreichend: noch {len(recheck_violations)} Verletzungen. "
+                f"Trajektorie wird NICHT abgespielt."
+            )
+            return False
+
+        new_duration = self._trajectory.get_duration()
+        print_warning(
+            f"✅ Reparatur erfolgreich!\n"
+            f"   {n_violations} Verletzungen behoben durch lokales Verlangsamen.\n"
+            f"   Neue Dauer: {new_duration:.2f}s (+{added_time:.2f}s)\n"
+            f"   Trajektorie ist jetzt sicher."
+        )
         return True
 
     def go_to_start(self) -> bool:
