@@ -679,30 +679,36 @@ class RoArmConnection:
 
     def gripper_open(self):
         """Öffnet den Gripper vollständig.
-        
-        Fährt den Gripper-Servo auf die OPEN-Position (1.08 rad).
-        Geschwindigkeit: 50, Beschleunigung: 20.
+
+        Schaltet zuerst Torque für den Gripper-Servo (ID 4) explizit ein,
+        dann fährt den Gripper-Servo auf die OPEN-Position (1.08 rad).
         """
         self._log.info("NOTE     | >>> GRIPPER OPEN")
+        # Gripper-Servo (ID 4) Torque explizit einschalten
+        self.send_cmd({"T": 212, "id": 4, "cmd": 1})
+        time.sleep(0.02)
         self.send_cmd({
             "T": CommandType.GRIPPER_CONTROL,
             "cmd": GripperState.OPEN,
-            "spd": 50,
-            "acc": 20,
+            "spd": 0,
+            "acc": 0,
         })
 
     def gripper_close(self):
         """Schließt den Gripper vollständig.
-        
-        Fährt den Gripper-Servo auf die CLOSED-Position (3.14 rad).
-        Geschwindigkeit: 50, Beschleunigung: 20.
+
+        Schaltet zuerst Torque für den Gripper-Servo (ID 4) explizit ein,
+        dann fährt den Gripper-Servo auf die CLOSED-Position (3.14 rad).
         """
         self._log.info("NOTE     | >>> GRIPPER CLOSE")
+        # Gripper-Servo (ID 4) Torque explizit einschalten
+        self.send_cmd({"T": 212, "id": 4, "cmd": 1})
+        time.sleep(0.02)
         self.send_cmd({
             "T": CommandType.GRIPPER_CONTROL,
             "cmd": GripperState.CLOSED,
-            "spd": 50,
-            "acc": 20,
+            "spd": 0,
+            "acc": 0,
         })
 
     # ----------------------------------------------------------
