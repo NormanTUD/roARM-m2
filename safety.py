@@ -77,16 +77,6 @@ class PositionValidator:
         
         L = self.limits
         
-        # 1. Absolute Grenzen
-        if not (L.b_min <= b <= L.b_max):
-            return False, f"b={b:.2f}° außerhalb [{L.b_min}, {L.b_max}]"
-        if not (L.s_min <= s <= L.s_max):
-            return False, f"s={s:.2f}° außerhalb [{L.s_min}, {L.s_max}]"
-        if not (L.e_min <= e <= L.e_max):
-            return False, f"e={e:.2f}° außerhalb [{L.e_min}, {L.e_max}]"
-        if not (L.h_min <= h <= L.h_max):
-            return False, f"h={h:.2f}° außerhalb [{L.h_min}, {L.h_max}]"
-        
         # 2. Sprung-Erkennung - NUR gegen letzten GESENDETEN Befehl
         #    UND nur wenn der letzte Befehl kürzlich war (< 1s)
         if self._last_commanded is not None:
