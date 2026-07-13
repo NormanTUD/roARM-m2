@@ -93,7 +93,7 @@ def forward_kinematics(b_deg: float, s_deg: float, e_deg: float, h_deg: float) -
     #   = Shoulder-Winkel - (180° - e)
     # Begründung: (180° - e) ist die Abknickung von "gestreckt",
     # und sie geht NACH UNTEN (daher Subtraktion).
-    forearm_abs_angle = s_rad - math.radians(180.0 - e_deg)
+    forearm_abs_angle = math.radians(s_deg) - math.radians(180.0 - e_deg)
 
     wrist_local_x = elbow_local_x + FOREARM * math.cos(forearm_abs_angle)
     wrist_local_z = elbow_local_z + FOREARM * math.sin(forearm_abs_angle)
