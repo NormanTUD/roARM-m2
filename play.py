@@ -822,15 +822,16 @@ class SmoothPlayer:
 
             # Statistik
             actual_duration = time.time() - playback_start
-            playback_summary(
-                duration_actual=actual_duration,
-                duration_planned=duration,
-                commands_sent=commands_sent,
-                skipped=skipped,
-                final_error=err if err is not None else None,
-                thermal_temp=temp,
-                rate_limiter_violations=self._rate_limiter.violations,
-            )
+
+        playback_summary(
+            duration_actual=actual_duration,
+            duration_planned=duration,
+            commands_sent=commands_sent,
+            skipped=skipped,
+            final_error=err if err is not None else None,
+            thermal_temp=temp,
+            rate_limiter_violations=self._rate_limiter.violations,
+        )
 
         # Rate Limiter Stats
         if self._rate_limiter.violations > 0:
