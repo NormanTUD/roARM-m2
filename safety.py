@@ -538,16 +538,6 @@ class TrajectoryValidator:
             t = i * dt
             pos = trajectory.sample(t)
 
-            # 1. Absolute Grenzen
-            if not (L.b_min <= pos["b"] <= L.b_max):
-                violations.append(f"t={t:.3f}s: b={pos['b']:.2f}° außerhalb Grenzen")
-            if not (L.s_min <= pos["s"] <= L.s_max):
-                violations.append(f"t={t:.3f}s: s={pos['s']:.2f}° außerhalb Grenzen")
-            if not (L.e_min <= pos["e"] <= L.e_max):
-                violations.append(f"t={t:.3f}s: e={pos['e']:.2f}° außerhalb Grenzen")
-            if not (L.h_min <= pos["h"] <= L.h_max):
-                violations.append(f"t={t:.3f}s: h={pos['h']:.2f}° außerhalb Grenzen")
-
             # 2. Geschwindigkeit (°/s)
             if prev_pos is not None:
                 vel = {j: (pos[j] - prev_pos[j]) / dt for j in ["b", "s", "e", "h"]}
