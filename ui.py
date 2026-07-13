@@ -710,6 +710,5 @@ def print_preflight_check(is_safe: bool, violations: list = None):
                 content.append(f"  ⚠️  {v}\n", style="yellow")
             if len(violations) > 10:
                 content.append(f"\n  ... und {len(violations)-10} weitere", style="dim")
-        content.append("\n\n[dim]Trajektorie wird NICHT abgespielt.[/]")
         
         console.print(Panel(content, border_style="red", box=box.HEAVY))
