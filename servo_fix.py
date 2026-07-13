@@ -23,6 +23,7 @@ ensure_uv()
 
 import json
 import time
+import re
 import argparse
 
 from robot import RoArmConnection, find_arm_port, BAUDRATE
@@ -37,17 +38,27 @@ KNOWN_SERVOS = {
     15: "Gripper",
 }
 
+# Regex für die Debug-Ausgabe der Firmware
+FOUND_SERVO_RE = re.compile(r"Found servo ID:\s*(\d+),\s*pos:\s*(-?\d+)")
+SCAN_COMPLETE_RE = re.compile(r"Scan complete\.\s*Found\s*(\d+)\s*servo")
+NO_SERVOS_RE = re.compile(r"No servos found")
+CHANGE_SUCCEED_RE = re.compile(r"change:\s*(\d+)\s*succeed")
+CHANGE_FAILED_RE = re.compile(r"change:\s*(\d+)\s*failed")
 
-def scan_servos(arm: RoArmConnection) -> dict | None:
+
+def scan_servos(arm: RoArmConnection) -> list[dict]:
     """
-    Sendet CMD_SCAN_SERVOS (T:504).
+    Sendet CMD_SCAN_SERVOS (T:504) und parst die Debug-Ausgabe.
     
-    Die Firmware iteriert über IDs 0–30, liest die Position jedes Servos,
-    und gibt ein JSON mit allen gefundenen Servos zurück.
+    Die Firmware gibt für jeden gefundenen Servo eine Zeile aus:
+        Found servo ID: <id>, pos: <pos>
+    Und am Ende:
+        Scan complete. Found <n> servo(s).
     
-    Timeout ist großzügig weil der Scan ~155ms+ dauert (5ms × 31 IDs).
+    Das JSON geht nur an jsonInfoHttp (für den Webserver),
+    NICHT an Serial. Daher parsen wir die Debug-Zeilen.
     """
-    # Vor dem Scan: Buffer leeren
+    # Buffer leeren
     arm._ser.reset_input_buffer()
     time.sleep(0.1)
     
@@ -56,69 +67,54 @@ def scan_servos(arm: RoArmConnection) -> dict | None:
     arm._ser.write(msg.encode() + b'\n')
     arm._ser.flush()
     
-    # Antwort sammeln (Firmware gibt auch Debug-Prints aus)
     print("  ⏳ Warte auf Scan-Ergebnis...")
     
-    all_lines = []
-    deadline = time.time() + 8.0  # 8s Timeout (großzügig)
-    json_result = None
+    found_servos = []
+    deadline = time.time() + 10.0  # 10s Timeout (31 IDs × 5ms + Overhead)
+    scan_done = False
     
-    while time.time() < deadline:
+    while time.time() < deadline and not scan_done:
         if arm._ser.in_waiting:
             line = arm._ser.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                all_lines.append(line)
-                # Debug-Output anzeigen
-                if line.startswith("Found servo") or line.startswith("No servos") or line.startswith("Scan complete"):
-                    print(f"  📡 {line}")
-                
-                # JSON-Antwort erkennen (enthält "T":504 und "count")
-                if '"T":504' in line or ('"count"' in line and '"servo_' in line):
-                    try:
-                        start = line.find('{')
-                        end = line.rfind('}')
-                        if start >= 0 and end > start:
-                            json_result = json.loads(line[start:end + 1])
-                            # Kurz weiter lesen für restliche Debug-Ausgaben
-                            time.sleep(0.3)
-                            while arm._ser.in_waiting:
-                                extra = arm._ser.readline().decode('utf-8', errors='ignore').strip()
-                                if extra:
-                                    all_lines.append(extra)
-                                    if extra.startswith("Found") or extra.startswith("Scan"):
-                                        print(f"  📡 {extra}")
-                            break
-                    except json.JSONDecodeError:
-                        pass
+            if not line:
+                continue
+            
+            # Debug: Zeige alles was reinkommt
+            print(f"  📡 {line}")
+            
+            # "Found servo ID: X, pos: Y" parsen
+            match = FOUND_SERVO_RE.search(line)
+            if match:
+                servo_id = int(match.group(1))
+                servo_pos = int(match.group(2))
+                found_servos.append({"id": servo_id, "pos": servo_pos})
+                continue
+            
+            # "Scan complete. Found N servo(s)." → fertig
+            if SCAN_COMPLETE_RE.search(line):
+                scan_done = True
+                continue
+            
+            # "No servos found" → fertig
+            if NO_SERVOS_RE.search(line):
+                scan_done = True
+                continue
         else:
             time.sleep(0.02)
     
-    # Falls kein sauberes JSON gefunden: Versuche aus allen Zeilen zu parsen
-    if json_result is None:
-        for line in reversed(all_lines):
-            try:
-                start = line.find('{')
-                end = line.rfind('}')
-                if start >= 0 and end > start:
-                    candidate = json.loads(line[start:end + 1])
-                    if "count" in candidate:
-                        json_result = candidate
-                        break
-            except json.JSONDecodeError:
-                continue
+    if not scan_done:
+        # Timeout — aber vielleicht haben wir trotzdem Servos gefunden
+        print("  ⚠️  Scan-Timeout (kein 'Scan complete' empfangen)")
     
-    return json_result
+    return found_servos
 
 
 def change_servo_id(arm: RoArmConnection, old_id: int, new_id: int) -> bool:
     """
     Sendet CMD_SET_SERVO_ID (T:501) um eine Servo-ID zu ändern.
     
-    Die Firmware:
-    1. Prüft ob der Servo mit old_id antwortet (getFeedback)
-    2. Entsperrt das EEPROM (st.unLockEprom)
-    3. Schreibt die neue ID (st.writeByte)
-    4. Sperrt das EEPROM wieder (st.LockEprom)
+    Die Firmware gibt aus:
+        "change: <old_id> succeed" oder "change: <old_id> failed"
     
     WICHTIG: Nur EIN Servo darf angeschlossen sein!
     """
@@ -135,23 +131,26 @@ def change_servo_id(arm: RoArmConnection, old_id: int, new_id: int) -> bool:
     while time.time() < deadline:
         if arm._ser.in_waiting:
             line = arm._ser.readline().decode('utf-8', errors='ignore').strip()
-            if line:
-                print(f"  📡 {line}")
-                if "succeed" in line.lower():
-                    return True
-                if "failed" in line.lower():
-                    return False
+            if not line:
+                continue
+            
+            print(f"  📡 {line}")
+            
+            if CHANGE_SUCCEED_RE.search(line):
+                return True
+            if CHANGE_FAILED_RE.search(line):
+                return False
         else:
             time.sleep(0.02)
     
-    return False
+    # Kein klares Ergebnis — prüfen wir per Rescan
+    print("  ⚠️  Keine eindeutige Antwort, versuche Verifizierung...")
+    return None  # Unbekannt
 
 
-def print_scan_results(result: dict):
+def print_scan_results(found_servos: list[dict]) -> list[int]:
     """Zeigt die Scan-Ergebnisse als Tabelle."""
-    count = result.get("count", 0)
-    
-    if count == 0:
+    if not found_servos:
         print("\n  ⚠️  Keine Servos gefunden!")
         print("     Prüfe:")
         print("     - Ist 12V Strom angeschlossen?")
@@ -159,26 +158,21 @@ def print_scan_results(result: dict):
         print("     - Ist der Servo-Bus (UART2TTL) OK?")
         return []
     
-    print(f"\n  ✅ {count} Servo(s) gefunden:\n")
+    print(f"\n  ✅ {len(found_servos)} Servo(s) gefunden:\n")
     print(f"  {'ID':>4}  {'Position':>10}  {'Rolle':<25}")
     print(f"  {'─' * 4}  {'─' * 10}  {'─' * 25}")
     
-    found_servos = []
-    for i in range(count):
-        key = f"servo_{i}"
-        servo = result.get(key)
-        if servo is None:
-            continue
-        
-        servo_id = servo.get("id", "?")
-        servo_pos = servo.get("pos", "?")
+    ids = []
+    for servo in found_servos:
+        servo_id = servo["id"]
+        servo_pos = servo["pos"]
         role = KNOWN_SERVOS.get(servo_id, "(unbekannt)")
+        ids.append(servo_id)
         
         print(f"  {servo_id:>4}  {servo_pos:>10}  {role:<25}")
-        found_servos.append(servo_id)
     
     print()
-    return found_servos
+    return ids
 
 
 def main():
@@ -215,22 +209,17 @@ def main():
     # Kurz warten damit die Firmware bereit ist
     time.sleep(0.5)
     
+    # Erstmal den Input-Buffer leeren (Boot-Meldungen etc.)
+    arm._ser.reset_input_buffer()
+    time.sleep(0.2)
+    
     try:
         # === SCAN ===
         print("🔍 Scanne Servo-Bus (ID 0–30)...")
         print("   Das dauert ein paar Sekunden...\n")
         
-        result = scan_servos(arm)
-        
-        if result is None:
-            print("  ❌ Keine Antwort von der Firmware.")
-            print("     Mögliche Ursachen:")
-            print("     - Firmware unterstützt CMD_SCAN_SERVOS (T:504) nicht")
-            print("     - Gerät ist beschäftigt")
-            print("     - Falscher Port")
-            sys.exit(1)
-        
-        found_servos = print_scan_results(result)
+        found_servos = scan_servos(arm)
+        found_ids = print_scan_results(found_servos)
         
         # === ID ÄNDERN ===
         if args.set_id is not None:
@@ -240,26 +229,26 @@ def main():
                 print(f"  ❌ Ungültige ID: {new_id}. Muss 0–253 sein.")
                 sys.exit(1)
             
-            if not found_servos:
+            if not found_ids:
                 print("  ❌ Kein Servo gefunden zum Ändern!")
                 sys.exit(1)
             
-            if len(found_servos) > 1:
-                print(f"  ⚠️  WARNUNG: {len(found_servos)} Servos gefunden!")
+            if len(found_ids) > 1:
+                print(f"  ⚠️  WARNUNG: {len(found_ids)} Servos gefunden!")
                 print(f"     Beim ID-Ändern sollte nur EIN Servo angeschlossen sein!")
-                print(f"     Gefundene IDs: {found_servos}")
+                print(f"     Gefundene IDs: {found_ids}")
                 print()
                 choice = input("     Trotzdem fortfahren? Welche ID ändern? > ").strip()
                 try:
                     old_id = int(choice)
-                    if old_id not in found_servos:
+                    if old_id not in found_ids:
                         print(f"     ID {old_id} nicht in gefundenen Servos!")
                         sys.exit(1)
                 except ValueError:
                     print("     Abgebrochen.")
                     sys.exit(0)
             else:
-                old_id = found_servos[0]
+                old_id = found_ids[0]
             
             if old_id == new_id:
                 print(f"  ✅ Servo hat bereits ID {new_id}. Nichts zu tun!")
@@ -277,9 +266,9 @@ def main():
             print()
             success = change_servo_id(arm, old_id, new_id)
             
-            if success:
+            if success is True:
                 print(f"\n  ✅ ID erfolgreich geändert: {old_id} → {new_id}")
-            else:
+            elif success is False:
                 print(f"\n  ❌ ID-Änderung fehlgeschlagen!")
                 print(f"     Der Servo mit ID {old_id} antwortet möglicherweise nicht.")
                 sys.exit(1)
@@ -288,26 +277,27 @@ def main():
             print(f"\n  🔍 Verifiziere... (Rescan)")
             time.sleep(1.5)
             
-            verify_result = scan_servos(arm)
-            if verify_result:
-                verify_servos = print_scan_results(verify_result)
-                if new_id in verify_servos:
-                    print(f"  ✅ Verifiziert! Servo antwortet jetzt auf ID {new_id}")
-                else:
-                    print(f"  ⚠️  Servo mit ID {new_id} nicht im Rescan gefunden.")
-                    print(f"     Möglicherweise muss der Servo neu gestartet werden.")
+            verify_servos = scan_servos(arm)
+            verify_ids = print_scan_results(verify_servos)
+            
+            if new_id in verify_ids:
+                print(f"  ✅ Verifiziert! Servo antwortet jetzt auf ID {new_id}")
+            elif old_id not in verify_ids and not verify_ids:
+                print(f"  ⚠️  Kein Servo im Rescan gefunden.")
+                print(f"     Möglicherweise muss der Servo neu gestartet werden.")
+            else:
+                print(f"  ⚠️  ID {new_id} nicht im Rescan. Gefunden: {verify_ids}")
         
         else:
             # Nur Scan-Modus: Hinweis geben
-            if found_servos:
-                print("  ℹ️  Um die ID zu ändern:")
-                print(f"     python3 servo_fix.py --set-id 15")
-                print()
-                if 15 not in found_servos:
+            if found_ids:
+                if 15 not in found_ids:
                     print("  💡 Tipp: Dein Gripper-Servo sollte ID 15 haben.")
-                    print(f"     Aktuell gefunden: {found_servos}")
-                    if len(found_servos) == 1:
+                    print(f"     Aktuell gefunden: {found_ids}")
+                    if len(found_ids) == 1:
                         print(f"     → python3 servo_fix.py --set-id 15")
+                else:
+                    print("  ✅ Gripper-Servo (ID 15) ist vorhanden!")
     
     finally:
         arm.close()
