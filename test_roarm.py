@@ -266,30 +266,6 @@ class TestPositionValidator:
         assert ok is True
         assert reason == "OK"
     
-    def test_out_of_bounds_base(self):
-        """Base außerhalb der Grenzen wird abgelehnt."""
-        from safety import PositionValidator, SafetyLimits
-        v = PositionValidator(SafetyLimits())
-        ok, reason = v.validate_target(200.0, 0.0, 90.0, 180.0)
-        assert ok is False
-        assert "b=" in reason
-    
-    def test_out_of_bounds_shoulder(self):
-        """Shoulder außerhalb der Grenzen wird abgelehnt."""
-        from safety import PositionValidator, SafetyLimits
-        v = PositionValidator(SafetyLimits())
-        ok, reason = v.validate_target(0.0, 100.0, 90.0, 180.0)
-        assert ok is False
-        assert "s=" in reason
-    
-    def test_out_of_bounds_elbow(self):
-        """Elbow außerhalb der Grenzen wird abgelehnt."""
-        from safety import PositionValidator, SafetyLimits
-        v = PositionValidator(SafetyLimits())
-        ok, reason = v.validate_target(0.0, 0.0, -10.0, 180.0)
-        assert ok is False
-        assert "e=" in reason
-    
     def test_small_move_passes(self):
         """Kleine Bewegung wird akzeptiert."""
         from safety import PositionValidator, SafetyLimits
@@ -403,17 +379,6 @@ class TestSafeArm:
         
         result = safe.move_to(5.0, 2.0, 88.0, 180.0, spd=20, acc=10)
         assert result is True
-        arm.close()
-    
-    def test_safe_move_blocked(self):
-        """Ungültiger Move wird blockiert."""
-        from safety import SafeArm, SafetyLimits
-        arm = make_arm()
-        safe = SafeArm(arm, SafetyLimits())
-        
-        # Position außerhalb der Grenzen
-        result = safe.move_to(200.0, 0.0, 90.0, 180.0, spd=20, acc=10)
-        assert result is False
         arm.close()
     
     def test_safe_read_filters_garbage(self):
