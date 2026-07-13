@@ -579,3 +579,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+    except OSError:
+        print(f"   ⚠️  It looks like the arm may have been disconnected")
