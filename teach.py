@@ -379,49 +379,6 @@ class TeachRecorder:
         print(f"   Δb={auto_offset['b']:+.3f}° Δs={auto_offset['s']:+.3f}° "
               f"Δe={auto_offset['e']:+.3f}° Δh={auto_offset['h']:+.3f}°")
 
-        print(f"\n   Optionen:")
-        print(f"   [ENTER] = Automatischen Offset verwenden (empfohlen)")
-        print(f"   [m]     = Manuell korrigieren (Arm wird freigegeben)")
-        print(f"   [n]     = Kein Offset (ignorieren)")
-
-        choice = input("   > ").strip().lower()
-
-        if choice == 'm':
-            print(f"\n   🔓 Arm wird freigegeben. Positioniere den Endeffektor EXAKT")
-            print(f"   an der Stelle wo er aufsetzen soll.")
-            print(f"   Drücke ENTER wenn fertig.")
-            self._arm.torque_off()
-            time.sleep(0.3)
-            input()
-
-            manual_pos = self._read_with_gravity_comp()
-            if manual_pos:
-                self._endpoint_offset = {
-                    "b": round(manual_pos["b"] - last_wp["b"], 3),
-                    "s": round(manual_pos["s"] - last_wp["s"], 3),
-                    "e": round(manual_pos["e"] - last_wp["e"], 3),
-                    "h": round(manual_pos["h"] - last_wp["h"], 3),
-                }
-                # Visualisierung updaten
-                if self._viz:
-                    self._viz.update_pose(manual_pos["b"], manual_pos["s"], manual_pos["e"], manual_pos["h"])
-                    
-                print(f"   Manueller Offset:")
-                print(f"   Δb={self._endpoint_offset['b']:+.3f}° "
-                      f"Δs={self._endpoint_offset['s']:+.3f}° "
-                      f"Δe={self._endpoint_offset['e']:+.3f}° "
-                      f"Δh={self._endpoint_offset['h']:+.3f}°")
-            self._arm.torque_on()
-            time.sleep(0.3)
-
-        elif choice == 'n':
-            print(f"   → Kein Offset wird angewendet")
-            self._endpoint_offset = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
-
-        else:
-            self._endpoint_offset = auto_offset
-            print(f"   ✔ Automatischer Offset wird verwendet")
-
     def save(self) -> str:
         if not self._waypoints:
             print("   Nichts zum Speichern!")
