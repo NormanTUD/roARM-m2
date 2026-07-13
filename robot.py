@@ -656,22 +656,20 @@ class RoArmConnection:
             self.send_cmd({"T": 212, "id": sid, "cmd": 0})
             time.sleep(0.02)
 
-    def torque_on_fast(self):
-        """Schnelles Torque-an ohne individuelle Servo-Befehle.
-        
-        Für Recording-Loop wo Geschwindigkeit wichtig ist.
-        Weniger zuverlässig als torque_on() aber schneller.
-        Sendet nur den globalen Befehl, nicht pro Servo.
-        """
-        self.send_cmd({"T": CommandType.TORQUE_ALL, "cmd": TorqueState.ON})
+    def torque_on_fast(self, exclude_gripper=False):
+        if exclude_gripper:
+            # Nur Servos 1-3
+            for sid in range(1, 4):
+                self.send_cmd({"T": 212, "id": sid, "cmd": 1})
+        else:
+            self.send_cmd({"T": 210, "cmd": 1})
 
-    def torque_off_fast(self):
-        """Schnelles Torque-aus ohne individuelle Servo-Befehle.
-        
-        Für Recording-Loop wo Geschwindigkeit wichtig ist.
-        Sendet nur den globalen Befehl, nicht pro Servo.
-        """
-        self.send_cmd({"T": CommandType.TORQUE_ALL, "cmd": TorqueState.OFF})
+    def torque_off_fast(self, exclude_gripper=False):
+        if exclude_gripper:
+            for sid in range(1, 4):
+                self.send_cmd({"T": 212, "id": sid, "cmd": 0})
+        else:
+            self.send_cmd({"T": 210, "cmd": 0})
 
     # ----------------------------------------------------------
     # GRIPPER
