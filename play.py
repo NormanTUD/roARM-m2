@@ -782,6 +782,8 @@ class SmoothPlayer:
             (ENDPOINT_FINAL_SPD, ENDPOINT_FINAL_ACC),
         ]
 
+        actual_duration = 0
+
         for pass_num in range(ENDPOINT_SETTLE_PASSES):
             spd, acc = speeds_sequence[min(pass_num, len(speeds_sequence) - 1)]
 
