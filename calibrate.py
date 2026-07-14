@@ -1200,7 +1200,7 @@ def main():
                     commanded, errors, manual_points, weight=1.0
                 )
 
-                if len(commanded) >= 10:
+                if len(commanded) >= 3:
                     print_section("MODELL FITTEN")
                     print_info(f"Fitte Polynom aus {len(commanded)} manuellen Datenpunkten...")
 
