@@ -955,6 +955,17 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
     for i in range(n_points):
         console.print(f"\n  [bold magenta]──── Punkt {i+1}/{n_points} ────[/]")
 
+        # === NEU: Zuerst zur Safe-UP/Default-Position fahren ===
+        console.print("  [dim]Fahre zur Ausgangsposition...[/]")
+        arm.torque_on()
+        time.sleep(0.2)
+        current = arm.read_position_deg()
+        if current:
+            move_to_safe_up(arm, current_pose=current)
+        else:
+            move_to_safe_up(arm, current_pose=None)
+        console.print("  [green]✓ Ausgangsposition erreicht[/]")
+
         # ═══════════════════════════════════════════════════════
         # SCHRITT 1: User positioniert den Arm frei
         # ═══════════════════════════════════════════════════════
