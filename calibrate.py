@@ -1224,7 +1224,7 @@ def main():
                 else:
                     print_warning(
                         f"Nur {len(commanded)} Datenpunkte – mindestens 10 nötig für Polynom-Fit.\n"
-                        f"   Brauche mindestens 5 manuelle Punkte (mit weight=2.0) oder 10 (mit weight=1.0)."
+                        f"   Brauche mindestens 3 manuelle Punkte (mit weight=2.0) oder 10 (mit weight=1.0)."
                     )
 
             # Zurück zu Safe-UP
