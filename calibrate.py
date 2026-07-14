@@ -40,6 +40,7 @@ import serial
 import serial.tools.list_ports
 import threading
 from rich.panel import Panel
+from rich.table import Table
 from rich import box
 
 from robot import (
