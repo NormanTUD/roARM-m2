@@ -849,12 +849,16 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
         border_style="magenta",
     ))
     
-    manual_input = input("  Anzahl Punkte (0 = überspringen, empfohlen: 5): ").strip()
-    n_manual = 0
-    try:
-        n_manual = int(manual_input) if manual_input else 0
-    except ValueError:
+    if n_manual_override > 0:
+        n_manual = n_manual_override
+    else:
+        # Interaktiv fragen (wie bisher)
+        manual_input = input("  Anzahl Punkte (0 = überspringen, empfohlen: 5): ").strip()
         n_manual = 0
+        try:
+            n_manual = int(manual_input) if manual_input else 0
+        except ValueError:
+            n_manual = 0
     
     if n_manual > 0:
         manual_points = run_manual_verification(arm, n_points=n_manual)
@@ -913,102 +917,173 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
     return model
 
 # ============================================================
-# MANUELLE VERIFIKATIONSPUNKTE (Real-World Ground Truth)
+# MANUELLE VERIFIKATIONSPUNKTE (NEUER WORKFLOW)
 # ============================================================
 
 def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
     """
-    Lässt den User den Arm N mal manuell positionieren.
-    Misst wo der Arm denkt dass er ist (Servo-Feedback),
-    dann korrigiert der User mit der realen Position.
-
-    Returns:
-        Liste von Dicts: {"servo_reading": {...}, "real_position": {...}}
+    Neuer Workflow:
+    1. Torque AUS → User bewegt Arm an gewünschte Position
+    2. Enter → Position wird aufgezeichnet
+    3. Arm fährt zurück zu Safe-UP / Startposition
+    4. Arm fährt die aufgezeichnete Position nochmal an (Torque AN)
+    5. "Drück Enter" → Torque wird AUS
+    6. User korrigiert den Arm dahin wo er WIRKLICH sein sollte
+    7. Enter → korrigierte Position wird gelesen
+    8. Differenz = Kalibrierungsfehler (ohne dass User Winkel wissen muss)
     """
     manual_points = []
 
-    print_section("MANUELLE VERIFIKATION (Real-World Ground Truth)")
+    print_section("MANUELLE VERIFIKATION (Replay + Korrektur)")
     console.print(Panel(
         f"[bold]Du wirst den Arm [cyan]{n_points}×[/cyan] manuell positionieren.[/]\n\n"
         "Ablauf pro Punkt:\n"
-        "  1. [ENTER] → Torque wird AUS, Arm ist frei\n"
-        "  2. Ziehe den Arm an eine beliebige Position\n"
-        "  3. [ENTER] → Arm misst wo er denkt dass er ist\n"
-        "  4. Du gibst ein wo er WIRKLICH ist (gemessen)\n"
-        "  5. Diese Info verbessert die Kalibrierung\n\n"
-        "[dim]Tipp: Nutze Lineal, Winkelmesser, oder markierte Punkte\n"
-        "auf dem Tisch als Referenz.[/]",
-        title="Manuelle Verifikation",
+        "  1. Torque AUS → Ziehe den Arm an eine Position\n"
+        "  2. [ENTER] → Position wird gespeichert\n"
+        "  3. Arm fährt zurück zur Safe-UP Position\n"
+        "  4. Arm fährt deine Position nochmal an (Torque AN)\n"
+        "  5. [ENTER] → Torque wird AUS\n"
+        "  6. Korrigiere den Arm dahin wo er WIRKLICH sein sollte\n"
+        "  7. [ENTER] → Differenz wird gemessen\n\n"
+        "[dim]Du musst KEINE Winkel kennen!\n"
+        "Der Arm misst selbst wie weit er daneben liegt.[/]",
+        title="Manuelle Verifikation (Replay-Methode)",
         border_style="magenta",
         box=box.ROUNDED,
     ))
 
     for i in range(n_points):
-        console.print(f"\n  [bold magenta]── Punkt {i+1}/{n_points} ──[/]")
+        console.print(f"\n  [bold magenta]──── Punkt {i+1}/{n_points} ────[/]")
 
-        # Schritt 1: Torque aus, User positioniert
+        # ═══════════════════════════════════════════════════════
+        # SCHRITT 1: User positioniert den Arm frei
+        # ═══════════════════════════════════════════════════════
         console.print("  [dim]Drücke [ENTER] um Torque zu deaktivieren...[/]")
         input()
 
         arm.torque_off()
         time.sleep(0.3)
 
-        console.print("  [bold green]✋ Torque AUS[/] – Ziehe den Arm an die gewünschte Position.")
+        console.print("  [bold green]✋ Torque AUS[/] – Bewege den Arm an die gewünschte Position.")
         console.print("  [dim]Drücke [ENTER] wenn der Arm an der Zielposition ist...[/]")
         input()
 
-        # Schritt 2: Messen wo der Arm denkt dass er ist
-        # Kurz Torque an für stabilen Read (wie Gravity Comp in teach.py)
+        # ═══════════════════════════════════════════════════════
+        # SCHRITT 2: Position aufzeichnen (= gewollte Position)
+        # ═══════════════════════════════════════════════════════
+        # Kurz Torque an für stabilen Read
         arm.torque_on()
-        time.sleep(0.05)  # Minimal, nur für stabilen Servo-Read
+        time.sleep(0.05)
 
-        servo_reading = arm.read_position_averaged(n=10, interval=0.05)
+        desired_pos = arm.read_position_averaged(n=10, interval=0.05)
 
-        if not servo_reading:
+        if not desired_pos:
             print_warning("Konnte Position nicht lesen, überspringe...")
             arm.torque_off()
             continue
 
-        console.print(f"\n  [bold]Servo denkt er ist bei:[/]")
-        console.print(f"    b = [cyan]{servo_reading['b']:+8.3f}°[/]  "
-                      f"(σ={servo_reading['b_std']:.4f}°)")
-        console.print(f"    s = [cyan]{servo_reading['s']:+8.3f}°[/]  "
-                      f"(σ={servo_reading['s_std']:.4f}°)")
-        console.print(f"    e = [cyan]{servo_reading['e']:+8.3f}°[/]  "
-                      f"(σ={servo_reading['e_std']:.4f}°)")
+        console.print(f"\n  [bold]📍 Gewünschte Position aufgezeichnet:[/]")
+        console.print(f"    b = [cyan]{desired_pos['b']:+8.3f}°[/]")
+        console.print(f"    s = [cyan]{desired_pos['s']:+8.3f}°[/]")
+        console.print(f"    e = [cyan]{desired_pos['e']:+8.3f}°[/]")
 
-        # Schritt 3: User gibt reale Position ein
-        console.print(f"\n  [bold]Wo ist der Arm WIRKLICH? (reale Messung)[/]")
-        console.print(f"  [dim](Leer = Servo-Wert übernehmen, d.h. kein Fehler)[/]")
+        # ═══════════════════════════════════════════════════════
+        # SCHRITT 3: Zurück zur Safe-UP Position
+        # ═══════════════════════════════════════════════════════
+        console.print(f"\n  [dim]Fahre zurück zu Safe-UP...[/]")
+        current = arm.read_position_deg()
+        if current:
+            move_to_safe_up(arm, current_pose=current)
+        else:
+            move_to_safe_up(arm, current_pose=None)
 
-        real_position = {}
-        for joint in JOINTS:
-            default = servo_reading[joint]
-            while True:
-                val = input(f"    {joint} real [Servo={default:+.3f}°]: ").strip()
-                if val == "":
-                    real_position[joint] = default
-                    break
-                try:
-                    real_position[joint] = float(val)
-                    break
-                except ValueError:
-                    console.print("    [red]Ungültige Eingabe![/]")
+        time.sleep(0.5)
 
-        # Differenz anzeigen
-        diff = {j: real_position[j] - servo_reading[j] for j in JOINTS}
-        console.print(f"\n  [bold]Differenz (Real - Servo):[/]")
+        # ═══════════════════════════════════════════════════════
+        # SCHRITT 4: Arm fährt die Position nochmal an
+        # ═══════════════════════════════════════════════════════
+        console.print(f"  [dim]Fahre die aufgezeichnete Position nochmal an...[/]")
+
+        target_pose = {
+            "b": desired_pos["b"],
+            "s": desired_pos["s"],
+            "e": desired_pos["e"],
+            "h": desired_pos.get("h", 180.0),
+        }
+
+        move_from_safe_up_to_pose(arm, target_pose)
+
+        # Präzisions-Nachfahrt
+        arm.move_to(target_pose["b"], target_pose["s"], target_pose["e"],
+                    target_pose["h"], spd=5, acc=3)
+        arm.wait_until_settled(tolerance_deg=0.3, stable_count=5, timeout=10.0)
+
+        # Messen wo der Arm gelandet ist (= Replay-Position)
+        replay_pos = arm.read_position_averaged(n=10, interval=0.05)
+        if not replay_pos:
+            print_warning("Konnte Replay-Position nicht lesen, überspringe...")
+            continue
+
+        console.print(f"\n  [bold]🎯 Arm ist angekommen bei:[/]")
+        console.print(f"    b = [cyan]{replay_pos['b']:+8.3f}°[/]")
+        console.print(f"    s = [cyan]{replay_pos['s']:+8.3f}°[/]")
+        console.print(f"    e = [cyan]{replay_pos['e']:+8.3f}°[/]")
+
+        # ═══════════════════════════════════════════════════════
+        # SCHRITT 5: User korrigiert den Arm
+        # ═══════════════════════════════════════════════════════
+        console.print(f"\n  [bold yellow]👉 Drücke [ENTER] → Torque wird AUS[/]")
+        console.print(f"  [dim]Dann korrigiere den Arm dahin wo er WIRKLICH sein sollte.[/]")
+        input()
+
+        arm.torque_off()
+        time.sleep(0.3)
+
+        console.print("  [bold green]✋ Torque AUS[/] – Korrigiere den Arm jetzt!")
+        console.print("  [dim]Drücke [ENTER] wenn der Arm an der RICHTIGEN Position ist...[/]")
+        input()
+
+        # ═══════════════════════════════════════════════════════
+        # SCHRITT 6: Korrigierte Position lesen
+        # ═══════════════════════════════════════════════════════
+        arm.torque_on()
+        time.sleep(0.05)
+
+        corrected_pos = arm.read_position_averaged(n=10, interval=0.05)
+
+        if not corrected_pos:
+            print_warning("Konnte korrigierte Position nicht lesen, überspringe...")
+            arm.torque_off()
+            continue
+
+        # ═══════════════════════════════════════════════════════
+        # SCHRITT 7: Fehler berechnen und anzeigen
+        # ═══════════════════════════════════════════════════════
+        # Fehler = wo der Arm war (replay) vs. wo er sein SOLLTE (korrigiert)
+        # error = replay - corrected (= wie weit der Arm daneben lag)
+        error = {j: replay_pos[j] - corrected_pos[j] for j in JOINTS}
+
+        console.print(f"\n  [bold]📊 Ergebnis:[/]")
+        console.print(f"    Replay-Position:    b={replay_pos['b']:+.3f}°  "
+                      f"s={replay_pos['s']:+.3f}°  e={replay_pos['e']:+.3f}°")
+        console.print(f"    Korrigierte Pos:    b={corrected_pos['b']:+.3f}°  "
+                      f"s={corrected_pos['s']:+.3f}°  e={corrected_pos['e']:+.3f}°")
+
         for j in JOINTS:
-            color = "green" if abs(diff[j]) < 0.5 else "yellow" if abs(diff[j]) < 2.0 else "red"
-            console.print(f"    Δ{j} = [{color}]{diff[j]:+.3f}°[/]")
+            color = "green" if abs(error[j]) < 0.5 else "yellow" if abs(error[j]) < 2.0 else "red"
+            console.print(f"    Δ{j} = [{color}]{error[j]:+.3f}°[/]  "
+                          f"(Arm lag {abs(error[j]):.3f}° daneben)")
 
         manual_points.append({
-            "servo_reading": {j: servo_reading[j] for j in JOINTS},
-            "real_position": real_position,
-            "servo_std": {j: servo_reading[f"{j}_std"] for j in JOINTS},
+            "desired_position": {j: desired_pos[j] for j in JOINTS},
+            "replay_position": {j: replay_pos[j] for j in JOINTS},
+            "corrected_position": {j: corrected_pos[j] for j in JOINTS},
+            "error": error,
+            "replay_std": {j: replay_pos.get(f"{j}_std", 0) for j in JOINTS},
+            "corrected_std": {j: corrected_pos.get(f"{j}_std", 0) for j in JOINTS},
         })
 
-        # Torque wieder aus für nächsten Punkt (oder an lassen am Ende)
+        # Torque aus für nächsten Punkt (oder an lassen am Ende)
         if i < n_points - 1:
             arm.torque_off()
             time.sleep(0.2)
@@ -1027,35 +1102,21 @@ def integrate_manual_points(commanded: list, errors: list,
     """
     Integriert manuelle Verifikationspunkte in die Kalibrierungsdaten.
 
-    Die manuellen Punkte werden als zusätzliche Datenpunkte behandelt,
-    wobei die "commanded" Position = Servo-Reading ist und der
-    "error" = Real - Servo.
-
-    Args:
-        commanded: Bisherige Soll-Posen (aus automatischer Kalibrierung)
-        errors: Bisherige Fehler (Ist - Soll)
-        manual_points: Ergebnis von run_manual_verification()
-        weight: Gewichtung der manuellen Punkte (>1 = stärker gewichtet)
-
-    Returns:
-        (new_commanded, new_errors) - Erweiterte Listen
+    Bei der neuen Methode:
+    - "commanded" = die gewünschte Position (wo der User den Arm hinbewegt hat)
+    - "error" = replay_position - corrected_position
+      (= wie weit der Arm daneben lag als er die Position nochmal anfuhr)
     """
     new_commanded = list(commanded)
     new_errors = list(errors)
 
     for point in manual_points:
-        servo = point["servo_reading"]
-        real = point["real_position"]
+        # Die "commanded" Position ist die gewünschte Position
+        pose = {j: point["desired_position"][j] for j in JOINTS}
+        pose["h"] = 180.0
 
-        # Der "commanded" Wert ist hier die Servo-Position
-        # (= was der Arm denkt wo er ist)
-        # Der "error" ist Real - Servo
-        # (= wie weit die Realität vom Servo-Feedback abweicht)
-
-        pose = {j: servo[j] for j in JOINTS}
-        pose["h"] = 180.0  # Dummy
-
-        error = {j: real[j] - servo[j] for j in JOINTS}
+        # Der Fehler ist: wo der Arm gelandet ist - wo er sein sollte
+        error = point["error"]
 
         # Mehrfach einfügen für höhere Gewichtung
         n_copies = max(1, int(weight))
@@ -1082,6 +1143,10 @@ def main():
     p.add_argument("--pose-set", type=str, default="standard",
                    choices=list(POSE_SETS.keys()),
                    help="Posen-Set: minimal (8), standard (12), extended (24)")
+    p.add_argument("--manual-points", type=int, default=0,
+                   help="Anzahl manueller Verifikationspunkte (default: 0 = interaktiv fragen)")
+    p.add_argument("--manual-only", action="store_true",
+                   help="Nur manuelle Verifikation, automatische Posen überspringen")
     args = p.parse_args()
 
     port = args.port or find_arm_port()
@@ -1089,22 +1154,89 @@ def main():
         print("❌ Kein serieller Port gefunden!")
         sys.exit(1)
 
-    print(f"📌 Verbinde mit {port}...")
+    print(f"🔌 Verbinde mit {port}...")
     try:
         arm = RoArmConnection(port)
-        print(f"   ✅ Verbunden")
+        print(f"   ✔ Verbunden")
     except Exception as e:
         print(f"   ❌ Fehler: {e}")
         sys.exit(1)
 
     try:
-        model = run_calibration(
-            arm,
-            auto_accept=args.auto,
-            skip_identify=args.no_identify,
-            repeats=args.repeats,
-            pose_set_name=args.pose_set,
-        )
+        if args.manual_only:
+            # ═══════════════════════════════════════════════════════
+            # NUR MANUELLE VERIFIKATION (kein automatischer Posen-Durchlauf)
+            # ═══════════════════════════════════════════════════════
+            print_banner("calibrate", "Nur manuelle Verifikation (Replay + Korrektur)")
+
+            n_manual = args.manual_points if args.manual_points > 0 else 5
+
+            arm.torque_on()
+            time.sleep(0.2)
+
+            # Zur Safe-UP fahren
+            print_info("Fahre zur Safe-UP Position...")
+            move_to_safe_up(arm, current_pose=None)
+            print_success("Safe-UP erreicht")
+
+            manual_points = run_manual_verification(arm, n_points=n_manual)
+
+            if manual_points:
+                # Modell nur aus manuellen Punkten fitten
+                commanded = []
+                errors = []
+                commanded, errors = integrate_manual_points(
+                    commanded, errors, manual_points, weight=1.0
+                )
+
+                if len(commanded) >= 10:
+                    print_section("MODELL FITTEN")
+                    print_info(f"Fitte Polynom aus {len(commanded)} manuellen Datenpunkten...")
+
+                    model = CalibrationModel()
+                    residuals = model.fit(commanded, errors)
+
+                    calibration_summary(
+                        residuals=residuals,
+                        total_time=0,
+                        n_poses=0,
+                        n_repeats=0,
+                    )
+
+                    cal_path = Path("calibration") / "roarm_calibration.cal"
+                    cal_path.parent.mkdir(exist_ok=True)
+                    model.save(str(cal_path), diagnostics={
+                        "mode": "manual_only",
+                        "n_manual_points": len(manual_points),
+                        "manual_points": manual_points,
+                    })
+                else:
+                    print_warning(
+                        f"Nur {len(commanded)} Datenpunkte – mindestens 10 nötig für Polynom-Fit.\n"
+                        f"   Brauche mindestens 5 manuelle Punkte (mit weight=2.0) oder 10 (mit weight=1.0)."
+                    )
+
+            # Zurück zu Safe-UP
+            print_info("Fahre zurück zu Safe-UP...")
+            current = arm.read_position_deg()
+            if current:
+                move_to_safe_up(arm, current_pose=current)
+            else:
+                move_to_safe_up(arm, current_pose=None)
+
+        else:
+            # ═══════════════════════════════════════════════════════
+            # NORMALER WORKFLOW (automatisch + optional manuell)
+            # ═══════════════════════════════════════════════════════
+            model = run_calibration(
+                arm,
+                auto_accept=args.auto,
+                skip_identify=args.no_identify,
+                repeats=args.repeats,
+                pose_set_name=args.pose_set,
+                n_manual_override=args.manual_points,  # NEU: Übergabe
+            )
+
         print(f"\n✅ Kalibrierung abgeschlossen!")
         print(f"   Datei: calibration/roarm_calibration.cal")
         print(f"   Wird automatisch von play.py geladen.")
@@ -1114,7 +1246,6 @@ def main():
         arm.torque_on()
         time.sleep(0.3)
         arm.close()
-
 
 if __name__ == "__main__":
     try:
