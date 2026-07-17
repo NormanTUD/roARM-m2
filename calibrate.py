@@ -337,61 +337,6 @@ def move_from_safe_up_to_pose(arm: RoArmConnection, target_pose: dict):
     )
     arm.wait_until_settled(tolerance_deg=1.0, stable_count=3, timeout=8.0)
 
-
-# ============================================================
-# GELENK-IDENTIFIKATION
-# ============================================================
-
-def identify_joint(arm, joint: str, current_pose: dict):
-    WIGGLE_AMOUNT = 15.0
-    WIGGLE_SPD = 20
-    WIGGLE_ACC = 10
-
-    joint_names = {
-        "b": "BASE (Drehung links/rechts)",
-        "s": "SHOULDER (Schulter hoch/runter)",
-        "e": "ELBOW (Ellbogen auf/zu)",
-        "h": "HAND/GRIPPER (Greifer auf/zu)",
-    }
-
-    print(f"\n  👁️  Zeige Gelenk: {joint} = {joint_names[joint]}")
-
-    if joint == "h":
-        print(f"      Gripper öffnet und schließt...")
-        arm.send_cmd({"T": 106, "cmd": 1.08, "spd": 50, "acc": 20})
-        time.sleep(1.0)
-        arm.send_cmd({"T": 106, "cmd": 3.14, "spd": 50, "acc": 20})
-        time.sleep(1.0)
-        arm.send_cmd({"T": 106, "cmd": 1.08, "spd": 50, "acc": 20})
-        time.sleep(0.8)
-        arm.send_cmd({"T": 106, "cmd": 3.14, "spd": 50, "acc": 20})
-        time.sleep(0.5)
-    else:
-        print(f"      Bewege jetzt ±{WIGGLE_AMOUNT}° hin und her...")
-        pose_plus = current_pose.copy()
-        pose_minus = current_pose.copy()
-        pose_plus[joint] = current_pose[joint] + WIGGLE_AMOUNT
-        pose_minus[joint] = current_pose[joint] - WIGGLE_AMOUNT
-
-        arm.move_to(pose_plus["b"], pose_plus["s"], pose_plus["e"], pose_plus["h"],
-                    spd=WIGGLE_SPD, acc=WIGGLE_ACC)
-        arm.wait_until_settled()
-
-        arm.move_to(pose_minus["b"], pose_minus["s"], pose_minus["e"], pose_minus["h"],
-                    spd=WIGGLE_SPD, acc=WIGGLE_ACC)
-        arm.wait_until_settled()
-
-        arm.move_to(pose_plus["b"], pose_plus["s"], pose_plus["e"], pose_plus["h"],
-                    spd=WIGGLE_SPD, acc=WIGGLE_ACC)
-        arm.wait_until_settled()
-
-        arm.move_to(current_pose["b"], current_pose["s"], current_pose["e"], current_pose["h"],
-                    spd=WIGGLE_SPD, acc=WIGGLE_ACC)
-        arm.wait_until_settled()
-
-    print(f"      ✅ Das war Gelenk '{joint}'")
-
-
 # ============================================================
 # POSE-VALIDIERUNG
 # ============================================================
@@ -589,15 +534,7 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
                         while True:
                             val = input(f"    {joint} [{joint_names[joint]}] "
                                        f"(Soll={pose[joint]:.1f}°, Servo={default:.3f}°): ").strip()
-                            if val.lower() == 'w':
-                                identify_joint(arm, joint, pose)
-                                arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
-                                arm.wait_until_settled()
-                                servo_avg = arm.read_position_averaged(n=10, interval=0.05)
-                                if servo_avg:
-                                    default = servo_avg[joint]
-                                continue
-                            elif val == "":
+                            if val == "":
                                 measured[joint] = default
                                 break
                             else:
