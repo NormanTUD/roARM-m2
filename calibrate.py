@@ -859,7 +859,7 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
         "  4. Arm fährt deine Position nochmal an (Torque AN)\n"
         "  5. [ENTER] → Torque wird AUS\n"
         "  6. Korrigiere den Arm dahin wo er WIRKLICH sein sollte\n"
-        "  7. [ENTER] → Differenz wird gemessen\n\n",
+        "  7. [ENTER] → Differenz wird gemessen\n",
         title="Manuelle Verifikation (Replay-Methode)",
         border_style="magenta",
         box=box.ROUNDED,
