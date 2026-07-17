@@ -321,7 +321,7 @@ class Ascii3DRenderer:
         gp = positions["gripper"]
         lines.append(
             f"  ┌─ 3D View ─ Az:{self.cam_azimuth:.0f}° El:{self.cam_elevation:.0f}°"
-            f" ─ [←/→]=Rotate [↑/↓]=Elevate ─┐"
+            f" ─ [A/D]=Rotate [W/S]=Elevate ─┐"
         )
         lines.append(f"  │ b={b_deg:+7.1f}° s={s_deg:+7.1f}° e={e_deg:+7.1f}°"
                      f"  │ Gripper: ({gp[0]:.0f}, {gp[1]:.0f}, {gp[2]:.0f})mm │")
