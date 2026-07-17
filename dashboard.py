@@ -19,6 +19,8 @@ Auto-Connect wenn USB-Port gefunden.
 #     "scipy",
 #     "textual>=0.79.0",
 #     "matplotlib",
+#     "rich_pixels",
+#     "Pillow",
 #     "pyyaml",
 # ]
 # ///
@@ -69,6 +71,9 @@ from robot import (
 )
 from safety import SafeArm, SafetyLimits
 from visualize import RobotVisualizer, forward_kinematics
+
+from rich_pixels import Pixels
+from PIL import Image
 
 # ============================================================
 # KONFIGURATION
@@ -736,24 +741,26 @@ class Arm3DWidget(Static):
         self._refresh_display()
 
     def _refresh_display(self):
-        if self._use_sixel and self._sixel_renderer:
-            sixel_str = self._sixel_renderer.render_to_sixel(
-                self.b, self.s, self.e,
-                trail=self._trail,
-                target=self._target
-            )
-            if sixel_str:
-                # Sixel direkt ausgeben (funktioniert in Sixel-fähigen Terminals)
-                self.update(sixel_str)
-                return
-
-        # Fallback: ASCII-Renderer
-        rendered = self._ascii_renderer.render(
+        # Immer Matplotlib rendern
+        renderer = Sixel3DRenderer(width=320, height=240, dpi=72)
+        filepath = renderer.render_to_file(
             self.b, self.s, self.e,
-            trail=self._trail,
-            target=self._target
+            trail=self._trail, target=self._target
         )
-        self.update(rendered)
+        
+        # Als farbige Pixel-Blöcke darstellen
+        img = Image.open(filepath)
+        
+        # Widget-Größe in Zeichen-Zellen holen
+        # Jedes Zeichen ist ca. 2 "Pixel" hoch (Half-Block ▀▄)
+        # Breite: 1 Zeichen = 1 Pixel-Spalte bei rich_pixels
+        widget_width = self.size.width if self.size.width > 0 else 70
+        widget_height = self.size.height if self.size.height > 0 else 24
+        
+        # rich_pixels nutzt Half-Block-Zeichen → doppelte vertikale Auflösung
+        img = img.resize((widget_width, widget_height * 2))
+        pixels = Pixels.from_image(img)
+        self.update(pixels)
 
     def on_mount(self):
         self._refresh_display()
