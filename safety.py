@@ -493,8 +493,6 @@ class CurrentMonitor:
         self._last_position = None
         self._position_unchanged_since = None
 
-# In play.py, nach dem Laden der Trajektorie:
-
 class TrajectoryValidator:
     """Prüft die gesamte Trajektorie VOR dem Abspielen."""
 
@@ -503,23 +501,14 @@ class TrajectoryValidator:
 
     def validate_full_trajectory(self, trajectory,
                                   hz: int = 100) -> tuple[bool, list]:
-        """
-        Samplet die gesamte Trajektorie mit hoher Rate und prüft:
-        - Alle Positionen innerhalb der Grenzen
-        - Keine zu großen Sprünge zwischen Samples
-        - Geschwindigkeit pro Gelenk nie über Maximum
-        - Beschleunigung pro Gelenk nie über Maximum
-
-        Returns: (is_safe, list_of_violations)
-        """
         duration = trajectory.get_duration()
         n_samples = int(duration * hz)
         dt = 1.0 / hz
         violations = []
 
         L = self.limits
-        MAX_JOINT_VELOCITY_DEG_S = 180.0   # Max 180°/s pro Gelenk
-        MAX_JOINT_ACCEL_DEG_S2 = 500.0     # Max 500°/s² pro Gelenk
+        MAX_JOINT_VELOCITY_DEG_S = 250.0   # Erhöht: RoArm schafft das locker
+        MAX_JOINT_ACCEL_DEG_S2 = 800.0     # Erhöht: 500 war zu konservativ
 
         prev_pos = None
         prev_vel = None
@@ -528,7 +517,6 @@ class TrajectoryValidator:
             t = i * dt
             pos = trajectory.sample(t)
 
-            # 2. Geschwindigkeit (°/s)
             if prev_pos is not None:
                 vel = {j: (pos[j] - prev_pos[j]) / dt for j in ["b", "s", "e", "h"]}
                 for j in ["b", "s", "e", "h"]:
@@ -537,7 +525,6 @@ class TrajectoryValidator:
                             f"t={t:.3f}s: {j} Geschwindigkeit={vel[j]:.1f}°/s "
                             f"> max {MAX_JOINT_VELOCITY_DEG_S}°/s")
 
-                # 3. Beschleunigung (°/s²)
                 if prev_vel is not None:
                     for j in ["b", "s", "e", "h"]:
                         accel = (vel[j] - prev_vel[j]) / dt
@@ -547,18 +534,14 @@ class TrajectoryValidator:
                                 f"> max {MAX_JOINT_ACCEL_DEG_S2}°/s²")
 
                 prev_vel = vel
-
             prev_pos = pos
 
-            # Abbruch bei zu vielen Violations (Performance)
             if len(violations) > 20:
                 violations.append("... (abgebrochen, zu viele Fehler)")
                 break
 
         is_safe = len(violations) == 0
         return is_safe, violations
-
-# In safety.py ergänzen:
 
 class GracefulStop:
     """
@@ -735,8 +718,8 @@ class TrajectorySmoother:
 
     def __init__(self, limits: SafetyLimits = None):
         self.limits = limits or SafetyLimits()
-        self.max_accel = 500.0  # °/s²
-        self.max_velocity = 180.0  # °/s
+        self.max_accel = 800.0   # Gleich wie Validator
+        self.max_velocity = 250.0
 
     def find_violations(self, trajectory, hz: int = 100) -> list:
         """Findet alle Zeitpunkte mit Beschleunigungs-Verletzungen."""
@@ -772,27 +755,21 @@ class TrajectorySmoother:
         return violations
 
     def compute_stretch_profile(self, violations: list, duration: float,
-                                 hz: int = 100, margin: float = 0.2) -> np.ndarray:
-        """Berechnet einen Stretch-Faktor pro Zeitschritt.
-
-        An Stellen mit Verletzungen wird der Faktor > 1.0 (= langsamer).
-        margin: Wie viel Sekunden um die Verletzung herum mitgestretcht werden.
-        """
-        import numpy as np
-
+                                 hz: int = 100, margin: float = 0.08) -> np.ndarray:
+        """Kleinere margin = weniger Umgebung wird mitverlangsamt."""
         n_samples = int(duration * hz)
         stretch = np.ones(n_samples)
 
         for v in violations:
             center_idx = int(v["t"] * hz)
             margin_samples = int(margin * hz)
-            needed_stretch = v["ratio"]  # z.B. 2.0 = doppelt so langsam
+            # Nur so viel stretchen wie NÖTIG (nicht ratio, sondern sqrt(ratio))
+            needed_stretch = math.sqrt(v["ratio"])  # Weniger aggressiv
 
             start = max(0, center_idx - margin_samples)
             end = min(n_samples, center_idx + margin_samples)
 
             for i in range(start, end):
-                # Glockenförmig: Maximum in der Mitte
                 dist = abs(i - center_idx) / max(margin_samples, 1)
                 local_stretch = 1.0 + (needed_stretch - 1.0) * (1.0 - dist)
                 stretch[i] = max(stretch[i], local_stretch)

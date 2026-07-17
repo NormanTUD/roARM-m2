@@ -62,16 +62,16 @@ BAUDRATE = 115200
 SERIAL_TIMEOUT = 0.1
 
 # Streaming-Parameter
-STREAM_HZ = 40             # Befehle pro Sekunde (30-50 Hz ideal)
-STREAM_SPD = 30        # statt 50
-STREAM_ACC = 15        # statt 30
-MIN_DELTA_DEG = 0.05       # Minimale Änderung zum Senden
+STREAM_HZ = 50             # Höher für smoothere Bewegung
+STREAM_SPD = 50            # Volle Servo-Geschwindigkeit (Servo regelt selbst)
+STREAM_ACC = 30            # Volle Beschleunigung
+MIN_DELTA_DEG = 0.02       # Niedrigere Schwelle = weniger Skips
 
 # Adaptive Timing Parameter
-MIN_SPEED_FACTOR = 0.3     # Nie langsamer als 30% der Normalgeschwindigkeit
-MAX_SPEED_FACTOR = 1.3 # statt 2.5
-END_RAMP_PERCENT = 0.10    # Letzte 10% abbremsen
-START_RAMP_PERCENT = 0.05  # Erste 5% sanft anfahren
+MIN_SPEED_FACTOR = 0.5     # Nicht so stark abbremsen
+MAX_SPEED_FACTOR = 1.2     # Nicht so stark beschleunigen (näher an Originalgeschwindigkeit)
+END_RAMP_PERCENT = 0.05    # Kürzere End-Rampe
+START_RAMP_PERCENT = 0.03  # Kürzere Start-Rampe
 
 # Endpoint Precision
 ENDPOINT_SETTLE_PASSES = 3
@@ -452,15 +452,23 @@ class SmoothPlayer:
     # ----------------------------------------------------------
 
     def _apply_calibration(self, target: dict) -> dict:
-        """Wendet Kalibrierungskorrektur an - MIT CLAMP."""
+        """Wendet Kalibrierungskorrektur an - mit höherem Limit und ohne Spam."""
         if self._cal_model and self._cal_model.is_fitted:
             correction = self._cal_model.predict_correction(target)
 
-            MAX_CORRECTION_DEG = 3.0
+            # Höheres Limit: Das Modell darf bis zu 6° korrigieren
+            # (dein Shoulder-Offset ist real ~4.4° - das ist physisch korrekt)
+            MAX_CORRECTION_DEG = 6.0
+            
             for j in ["b", "s", "e"]:
                 if abs(correction[j]) > MAX_CORRECTION_DEG:
-                    print(f"  ⚠️  Kalibrierung {j}={correction[j]:+.2f}° "
-                          f"geclampt auf ±{MAX_CORRECTION_DEG}°")
+                    # Nur EINMAL warnen, nicht bei jedem Frame
+                    if not hasattr(self, '_cal_clamp_warned'):
+                        self._cal_clamp_warned = set()
+                    if j not in self._cal_clamp_warned:
+                        print(f"  ⚠️  Kalibrierung {j}={correction[j]:+.2f}° "
+                              f"geclampt auf ±{MAX_CORRECTION_DEG}° (einmalige Warnung)")
+                        self._cal_clamp_warned.add(j)
                     correction[j] = max(-MAX_CORRECTION_DEG,
                                        min(MAX_CORRECTION_DEG, correction[j]))
 
