@@ -75,6 +75,11 @@ from visualize import RobotVisualizer, forward_kinematics
 from rich_pixels import Pixels
 from PIL import Image
 
+from textual.widgets import Static
+from textual.strip import Strip
+from rich.text import Text
+import math
+
 # ============================================================
 # KONFIGURATION
 # ============================================================
@@ -90,193 +95,143 @@ MIN_DELTA_DEG = 0.02
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ============================================================
-# SIXEL 3D RENDERER (Matplotlib → Sixel)
-# ============================================================
-
-def _check_sixel_support() -> bool:
-    """Prüft ob das Terminal Sixel unterstützt."""
-    # Prüfe ob img2sixel oder chafa verfügbar ist
-    for cmd in ["img2sixel", "chafa"]:
-        try:
-            result = subprocess.run(
-                [cmd, "--version"],
-                capture_output=True, timeout=2
-            )
-            if result.returncode == 0:
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-    return False
-
-SIXEL_AVAILABLE = _check_sixel_support()
-
-class Sixel3DRenderer:
+class BrailleCanvas:
     """
-    Rendert den Roboterarm als echtes 3D-Bild via Matplotlib.
-    Gibt das Bild als Sixel-String zurück (für Terminals die Sixel unterstützen)
-    oder als Datei-Pfad für die Anzeige.
+    Zeichnet auf einem Braille-Raster.
+    Jede Terminal-Zelle = 2x4 Braille-Dots → 2× horizontale, 4× vertikale Auflösung.
     """
 
-    def __init__(self, width: int = 400, height: int = 300, dpi: int = 72):
-        self.width = width
-        self.height = height
-        self.dpi = dpi
-        self.cam_azimuth = 45.0
-        self.cam_elevation = 25.0
-        self._last_render_path: Optional[str] = None
-        # Temporäres Verzeichnis für Bilder
-        self._tmp_dir = tempfile.mkdtemp(prefix="roarm_viz_")
+    BRAILLE_BASE = 0x2800
+    # Braille dot positions: (col, row) → bit
+    DOT_MAP = {
+        (0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04,
+        (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20,
+        (0, 3): 0x40, (1, 3): 0x80,
+    }
 
-    def rotate_camera(self, d_azimuth: float = 0, d_elevation: float = 0):
-        """Rotiert die Kamera."""
-        self.cam_azimuth = (self.cam_azimuth + d_azimuth) % 360
-        self.cam_elevation = max(-80, min(80, self.cam_elevation + d_elevation))
+    def __init__(self, char_width: int, char_height: int):
+        self.char_width = char_width
+        self.char_height = char_height
+        # Pixel-Auflösung
+        self.px_width = char_width * 2
+        self.px_height = char_height * 4
+        # Buffer: char_height × char_width, jeder Eintrag ist ein Braille-Bitmask
+        self._buf = [[0] * char_width for _ in range(char_height)]
+        # Farb-Buffer: speichert die Farbe pro Zelle (letzte gesetzte gewinnt)
+        self._color_buf = [[None] * char_width for _ in range(char_height)]
 
-    def render_to_file(self, b_deg: float, s_deg: float, e_deg: float,
-                       trail: list = None, target: dict = None) -> str:
-        """Rendert den Arm als PNG-Datei und gibt den Pfad zurück."""
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d import Axes3D
+    def clear(self):
+        for row in self._buf:
+            for i in range(len(row)):
+                row[i] = 0
+        for row in self._color_buf:
+            for i in range(len(row)):
+                row[i] = None
 
-        positions = forward_kinematics(b_deg, s_deg, e_deg)
+    def set_pixel(self, px: int, py: int, color: str = None):
+        """Setzt einen Pixel (in Braille-Koordinaten)."""
+        if px < 0 or px >= self.px_width or py < 0 or py >= self.px_height:
+            return
+        char_col = px // 2
+        char_row = py // 4
+        sub_col = px % 2
+        sub_row = py % 4
+        bit = self.DOT_MAP.get((sub_col, sub_row), 0)
+        self._buf[char_row][char_col] |= bit
+        if color:
+            self._color_buf[char_row][char_col] = color
 
-        fig = plt.figure(figsize=(self.width / self.dpi, self.height / self.dpi),
-                         dpi=self.dpi)
-        fig.patch.set_facecolor('#1e1e2e')
-        ax = fig.add_subplot(111, projection='3d')
-        ax.set_facecolor('#1e1e2e')
+    def draw_line(self, x0: int, y0: int, x1: int, y1: int, color: str = None):
+        """Bresenham-Linie in Braille-Pixeln."""
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
 
-        # Limits
-        limit = 500.0
-        ax.set_xlim([-limit, limit])
-        ax.set_ylim([-limit, limit])
-        ax.set_zlim([-50, limit])
-        ax.set_xlabel("X", fontsize=7, color='white')
-        ax.set_ylabel("Y", fontsize=7, color='white')
-        ax.set_zlabel("Z", fontsize=7, color='white')
-        ax.set_box_aspect([1, 1, 1])
-        ax.view_init(elev=self.cam_elevation, azim=self.cam_azimuth)
+        while True:
+            self.set_pixel(x0, y0, color)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
 
-        # Tick-Farben
-        ax.tick_params(colors='gray', labelsize=6)
-        for spine in ax.spines.values():
-            spine.set_color('gray')
+    def draw_thick_line(self, x0: int, y0: int, x1: int, y1: int,
+                        thickness: int = 2, color: str = None):
+        """Dicke Linie (mehrere parallele Linien)."""
+        dx = x1 - x0
+        dy = y1 - y0
+        length = math.sqrt(dx * dx + dy * dy)
+        if length == 0:
+            self.set_pixel(x0, y0, color)
+            return
 
-        # Arm zeichnen
-        pts = [positions["base"], positions["shoulder"],
-               positions["elbow"], positions["gripper"]]
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        zs = [p[2] for p in pts]
+        # Normale berechnen
+        nx = -dy / length
+        ny = dx / length
 
-        # Basis
-        from visualize import BASE_HEIGHT, UPPER_ARM, FOREARM, GRIPPER_LENGTH
-        ax.plot([0, 0], [0, 0], [0, BASE_HEIGHT],
-                color='#9e9e9e', linewidth=6, solid_capstyle='round', alpha=0.9)
+        for t in range(-(thickness // 2), thickness // 2 + 1):
+            ox = int(nx * t)
+            oy = int(ny * t)
+            self.draw_line(x0 + ox, y0 + oy, x1 + ox, y1 + oy, color)
 
-        # Oberarm
-        ax.plot([xs[1], xs[2]], [ys[1], ys[2]], [zs[1], zs[2]],
-                color='#42a5f5', linewidth=4, solid_capstyle='round')
+    def draw_circle(self, cx: int, cy: int, r: int, color: str = None):
+        """Midpoint-Circle in Braille-Pixeln."""
+        x = r
+        y = 0
+        err = 1 - r
 
-        # Unterarm + Gripper
-        ax.plot([xs[2], xs[3]], [ys[2], ys[3]], [zs[2], zs[3]],
-                color='#66bb6a', linewidth=3, solid_capstyle='round')
+        while x >= y:
+            for px, py in [(cx+x, cy+y), (cx-x, cy+y), (cx+x, cy-y), (cx-x, cy-y),
+                           (cx+y, cy+x), (cx-y, cy+x), (cx+y, cy-x), (cx-y, cy-x)]:
+                self.set_pixel(px, py, color)
+            y += 1
+            if err < 0:
+                err += 2 * y + 1
+            else:
+                x -= 1
+                err += 2 * (y - x) + 1
 
-        # Gelenke
-        joint_colors = ['#424242', '#ef5350', '#42a5f5', '#ff9800']
-        joint_sizes = [80, 60, 50, 40]
-        for i, (x, y, z) in enumerate(pts):
-            ax.scatter([x], [y], [z], c=joint_colors[i], s=joint_sizes[i],
-                       zorder=5, depthshade=False, edgecolors='white', linewidths=0.5)
+    def fill_circle(self, cx: int, cy: int, r: int, color: str = None):
+        """Gefüllter Kreis."""
+        for dy in range(-r, r + 1):
+            dx = int(math.sqrt(r * r - dy * dy))
+            for x in range(cx - dx, cx + dx + 1):
+                self.set_pixel(x, cy + dy, color)
 
-        # Trail
-        if trail:
-            trail_x = [p[0] for p in trail[-50:]]
-            trail_y = [p[1] for p in trail[-50:]]
-            trail_z = [p[2] for p in trail[-50:]]
-            ax.plot(trail_x, trail_y, trail_z,
-                    color='#ef5350', linewidth=1.2, alpha=0.6)
+    def draw_ellipse_arc(self, cx: int, cy: int, rx: int, ry: int,
+                         start_angle: float, end_angle: float,
+                         steps: int = 60, color: str = None):
+        """Zeichnet einen Ellipsen-Bogen."""
+        for i in range(steps):
+            t = start_angle + (end_angle - start_angle) * i / steps
+            x = int(cx + rx * math.cos(t))
+            y = int(cy + ry * math.sin(t))
+            self.set_pixel(x, y, color)
 
-        # Target
-        if target:
-            t_pos = forward_kinematics(target["b"], target["s"], target["e"])
-            tp = t_pos["gripper"]
-            ax.scatter([tp[0]], [tp[1]], [tp[2]],
-                       c='red', s=100, marker='x', linewidths=2, zorder=6)
-
-        # Koordinatenachsen
-        axis_len = 60.0
-        ax.quiver(0, 0, 0, axis_len, 0, 0, color='red', arrow_length_ratio=0.15, alpha=0.6, linewidth=1)
-        ax.quiver(0, 0, 0, 0, axis_len, 0, color='green', arrow_length_ratio=0.15, alpha=0.6, linewidth=1)
-        ax.quiver(0, 0, 0, 0, 0, axis_len, color='blue', arrow_length_ratio=0.15, alpha=0.6, linewidth=1)
-
-        # Arbeitsraum-Kreis
-        theta = np.linspace(0, 2 * np.pi, 80)
-        reach = UPPER_ARM + FOREARM + GRIPPER_LENGTH
-        ax.plot(reach * np.cos(theta), reach * np.sin(theta),
-                np.zeros(80), color='gray', linewidth=0.4, alpha=0.2)
-
-        # Boden-Gitter
-        grid_range = np.linspace(-400, 400, 5)
-        for g in grid_range:
-            ax.plot([g, g], [-400, 400], [0, 0], color='gray', linewidth=0.2, alpha=0.15)
-            ax.plot([-400, 400], [g, g], [0, 0], color='gray', linewidth=0.2, alpha=0.15)
-
-        # Info-Text
-        gp = positions["gripper"]
-        info = (f"b={b_deg:+.1f}° s={s_deg:+.1f}° e={e_deg:+.1f}°\n"
-                f"Gripper: ({gp[0]:.0f}, {gp[1]:.0f}, {gp[2]:.0f})mm")
-        ax.text2D(0.02, 0.95, info, transform=ax.transAxes,
-                  fontsize=8, fontfamily='monospace', color='white',
-                  verticalalignment='top',
-                  bbox=dict(boxstyle='round', facecolor='#2d2d3d', alpha=0.85))
-
-        plt.tight_layout(pad=0.5)
-
-        # Speichern
-        filepath = os.path.join(self._tmp_dir, "arm_3d.png")
-        fig.savefig(filepath, dpi=self.dpi, facecolor=fig.get_facecolor(),
-                    bbox_inches='tight', pad_inches=0.1)
-        plt.close(fig)
-
-        self._last_render_path = filepath
-        return filepath
-
-    def render_to_sixel(self, b_deg: float, s_deg: float, e_deg: float,
-                        trail: list = None, target: dict = None) -> Optional[str]:
-        """Rendert den Arm und konvertiert zu Sixel-String."""
-        filepath = self.render_to_file(b_deg, s_deg, e_deg, trail, target)
-
-        # Versuche img2sixel
-        try:
-            result = subprocess.run(
-                ["img2sixel", "-w", str(self.width), filepath],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return result.stdout.decode('utf-8', errors='ignore')
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        # Versuche chafa (Sixel-Modus)
-        try:
-            result = subprocess.run(
-                ["chafa", "-f", "sixel", "-s", f"{self.width // 8}x{self.height // 12}",
-                 filepath],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return result.stdout.decode('utf-8', errors='ignore')
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        return None
+    def render(self) -> list[Text]:
+        """Gibt eine Liste von Rich Text-Zeilen zurück."""
+        lines = []
+        for row_idx in range(self.char_height):
+            text = Text()
+            for col_idx in range(self.char_width):
+                bits = self._buf[row_idx][col_idx]
+                char = chr(self.BRAILLE_BASE + bits) if bits else ' '
+                color = self._color_buf[row_idx][col_idx]
+                if color and bits:
+                    text.append(char, style=color)
+                else:
+                    text.append(char)
+            lines.append(text)
+        return lines
 
 # ============================================================
-# 3D ASCII RENDERER (Fallback wenn kein Sixel)
+# 3D ASCII RENDERER
 # ============================================================
 
 class Ascii3DRenderer:
@@ -700,7 +655,10 @@ RichLog {
 # ============================================================
 
 class Arm3DWidget(Static):
-    """Widget das den 3D-Arm rendert (Sixel wenn verfügbar, sonst ASCII)."""
+    """
+    Widget das den 3D-Arm als hochauflösende Braille-Grafik rendert.
+    Nutzt 2×4 Braille-Dots pro Zeichen → deutlich schärfer als Half-Block.
+    """
 
     b = reactive(0.0)
     s = reactive(0.0)
@@ -708,14 +666,13 @@ class Arm3DWidget(Static):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._ascii_renderer = Ascii3DRenderer(width=70, height=24)
-        self._sixel_renderer = Sixel3DRenderer(width=480, height=320, dpi=72) if SIXEL_AVAILABLE else None
         self._trail = []
         self._target = None
-        self._use_sixel = SIXEL_AVAILABLE
+        self._cam_azimuth = 45.0
+        self._cam_elevation = 25.0
+        self._cam_distance = 600.0
 
-    def update_pose(self, b: float, s: float, e: float,
-                    target: dict = None):
+    def update_pose(self, b: float, s: float, e: float, target: dict = None):
         self.b = b
         self.s = s
         self.e = e
@@ -724,43 +681,158 @@ class Arm3DWidget(Static):
         # Trail updaten
         positions = forward_kinematics(b, s, e)
         self._trail.append(positions["gripper"])
-        if len(self._trail) > 50:
+        if len(self._trail) > 60:
             self._trail.pop(0)
 
         self._refresh_display()
 
     def rotate(self, d_azimuth: float = 0, d_elevation: float = 0):
-        """Rotiert die 3D-Ansicht."""
-        self._ascii_renderer.rotate_camera(d_azimuth, d_elevation)
-        if self._sixel_renderer:
-            self._sixel_renderer.rotate_camera(d_azimuth, d_elevation)
+        self._cam_azimuth = (self._cam_azimuth + d_azimuth) % 360
+        self._cam_elevation = max(-80, min(80, self._cam_elevation + d_elevation))
         self._refresh_display()
 
     def clear_trail(self):
         self._trail.clear()
         self._refresh_display()
 
+    def _project_3d(self, x: float, y: float, z: float,
+                    canvas_w: int, canvas_h: int) -> tuple[int, int]:
+        """Projiziert 3D → 2D Braille-Pixel-Koordinaten."""
+        az = math.radians(self._cam_azimuth)
+        el = math.radians(self._cam_elevation)
+
+        # Rotation um Z-Achse (Azimuth)
+        x1 = x * math.cos(az) - y * math.sin(az)
+        y1 = x * math.sin(az) + y * math.cos(az)
+        z1 = z
+
+        # Rotation um X-Achse (Elevation)
+        y2 = y1 * math.cos(el) - z1 * math.sin(el)
+        z2 = y1 * math.sin(el) + z1 * math.cos(el)
+        x2 = x1
+
+        # Perspektivische Projektion
+        d = self._cam_distance
+        scale = d / (d + y2 + 300)
+
+        # Auf Canvas-Koordinaten mappen
+        px = int(x2 * scale * 0.35 + canvas_w // 2)
+        py = int(-z2 * scale * 0.35 + canvas_h * 0.72)
+
+        return px, py
+
     def _refresh_display(self):
-        # Immer Matplotlib rendern
-        renderer = Sixel3DRenderer(width=320, height=240, dpi=72)
-        filepath = renderer.render_to_file(
-            self.b, self.s, self.e,
-            trail=self._trail, target=self._target
-        )
-        
-        # Als farbige Pixel-Blöcke darstellen
-        img = Image.open(filepath)
-        
-        # Widget-Größe in Zeichen-Zellen holen
-        # Jedes Zeichen ist ca. 2 "Pixel" hoch (Half-Block ▀▄)
-        # Breite: 1 Zeichen = 1 Pixel-Spalte bei rich_pixels
-        widget_width = self.size.width if self.size.width > 0 else 70
-        widget_height = self.size.height if self.size.height > 0 else 24
-        
-        # rich_pixels nutzt Half-Block-Zeichen → doppelte vertikale Auflösung
-        img = img.resize((widget_width, widget_height * 2))
-        pixels = Pixels.from_image(img)
-        self.update(pixels)
+        # Widget-Größe ermitteln
+        w = self.size.width if self.size.width > 0 else 70
+        h = self.size.height if self.size.height > 0 else 24
+
+        canvas = BrailleCanvas(w, h)
+        # Braille-Pixel-Auflösung
+        pw = canvas.px_width
+        ph = canvas.px_height
+
+        positions = forward_kinematics(self.b, self.s, self.e)
+
+        # --- Boden-Gitter ---
+        for g in range(-300, 301, 100):
+            pts_x = []
+            for i in range(-300, 301, 50):
+                px, py = self._project_3d(g, i, 0, pw, ph)
+                pts_x.append((px, py))
+            for i in range(len(pts_x) - 1):
+                canvas.draw_line(pts_x[i][0], pts_x[i][1],
+                                 pts_x[i+1][0], pts_x[i+1][1], "bright_black")
+
+            pts_y = []
+            for i in range(-300, 301, 50):
+                px, py = self._project_3d(i, g, 0, pw, ph)
+                pts_y.append((px, py))
+            for i in range(len(pts_y) - 1):
+                canvas.draw_line(pts_y[i][0], pts_y[i][1],
+                                 pts_y[i+1][0], pts_y[i+1][1], "bright_black")
+
+        # --- Koordinatenachsen ---
+        origin = self._project_3d(0, 0, 0, pw, ph)
+        ax_x = self._project_3d(80, 0, 0, pw, ph)
+        ax_y = self._project_3d(0, 80, 0, pw, ph)
+        ax_z = self._project_3d(0, 0, 80, pw, ph)
+        canvas.draw_line(origin[0], origin[1], ax_x[0], ax_x[1], "red")
+        canvas.draw_line(origin[0], origin[1], ax_y[0], ax_y[1], "green")
+        canvas.draw_line(origin[0], origin[1], ax_z[0], ax_z[1], "blue")
+
+        # --- Arbeitsraum-Kreis ---
+        from visualize import UPPER_ARM, FOREARM, GRIPPER_LENGTH
+        reach = UPPER_ARM + FOREARM + GRIPPER_LENGTH
+        prev = None
+        for i in range(65):
+            angle = 2 * math.pi * i / 64
+            x = reach * math.cos(angle)
+            y = reach * math.sin(angle)
+            pt = self._project_3d(x, y, 0, pw, ph)
+            if prev:
+                canvas.draw_line(prev[0], prev[1], pt[0], pt[1], "cyan")
+            prev = pt
+
+        # --- Trail ---
+        if self._trail and len(self._trail) > 1:
+            for i in range(1, len(self._trail)):
+                p1 = self._project_3d(*self._trail[i-1], pw, ph)
+                p2 = self._project_3d(*self._trail[i], pw, ph)
+                # Fade: ältere Punkte dunkler
+                alpha_color = "bright_red" if i > len(self._trail) * 0.7 else "red"
+                canvas.draw_line(p1[0], p1[1], p2[0], p2[1], alpha_color)
+
+        # --- Target ---
+        if self._target:
+            t_pos = forward_kinematics(self._target["b"], self._target["s"],
+                                       self._target["e"])
+            tp = self._project_3d(*t_pos["gripper"], pw, ph)
+            canvas.draw_circle(tp[0], tp[1], 4, "bright_red")
+            canvas.draw_line(tp[0]-3, tp[1]-3, tp[0]+3, tp[1]+3, "bright_red")
+            canvas.draw_line(tp[0]-3, tp[1]+3, tp[0]+3, tp[1]-3, "bright_red")
+
+        # --- Arm-Segmente ---
+        pts = [positions["base"], positions["shoulder"],
+               positions["elbow"], positions["gripper"]]
+        projected = [self._project_3d(p[0], p[1], p[2], pw, ph) for p in pts]
+
+        # Basis (dick, weiß/hellgrau)
+        base_bottom = self._project_3d(0, 0, 0, pw, ph)
+        canvas.draw_thick_line(base_bottom[0], base_bottom[1],
+                               projected[0][0], projected[0][1],
+                               thickness=4, color="white")
+
+        # Oberarm (dick, blau)
+        canvas.draw_thick_line(projected[1][0], projected[1][1],
+                               projected[2][0], projected[2][1],
+                               thickness=3, color="bright_blue")
+
+        # Unterarm + Gripper (mittel, grün)
+        canvas.draw_thick_line(projected[2][0], projected[2][1],
+                               projected[3][0], projected[3][1],
+                               thickness=2, color="bright_green")
+
+        # --- Gelenk-Punkte ---
+        joint_colors = ["white", "bright_red", "bright_blue", "bright_yellow"]
+        joint_radii = [5, 4, 3, 3]
+        for i, (px, py) in enumerate(projected):
+            canvas.fill_circle(px, py, joint_radii[i], joint_colors[i])
+
+        # --- Rendern ---
+        lines = canvas.render()
+
+        # Header-Info hinzufügen
+        gp = positions["gripper"]
+        header = Text()
+        header.append(f" Az:{self._cam_azimuth:.0f}° El:{self._cam_elevation:.0f}°",
+                      style="bright_black")
+        header.append(f"  b={self.b:+.1f}° s={self.s:+.1f}° e={self.e:+.1f}°",
+                      style="bold bright_white")
+        header.append(f"  Grip:({gp[0]:.0f},{gp[1]:.0f},{gp[2]:.0f})",
+                      style="cyan")
+
+        all_lines = [header] + lines
+        self.update(Text("\n").join(all_lines))
 
     def on_mount(self):
         self._refresh_display()
