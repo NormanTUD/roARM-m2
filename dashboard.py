@@ -1019,6 +1019,102 @@ class RoArmDashboard(App):
         self._all_log_lines = []
         self._log_filter_pattern = ""
 
+    @staticmethod
+    def _apply_calibration_static(cal_model, target: dict) -> dict:
+        """Wendet Kalibrierungskorrektur an (identisch zu play.py Logik)."""
+        if cal_model is None or not cal_model.is_fitted:
+            return target.copy()
+
+        correction = cal_model.predict_correction(target)
+
+        MAX_CORRECTION_DEG = 6.0
+        for j in ["b", "s", "e"]:
+            if abs(correction[j]) > MAX_CORRECTION_DEG:
+                correction[j] = max(-MAX_CORRECTION_DEG,
+                                   min(MAX_CORRECTION_DEG, correction[j]))
+
+        return {
+            "b": target["b"] - correction["b"],
+            "s": target["s"] - correction["s"],
+            "e": target["e"] - correction["e"],
+            "h": target["h"],
+        }
+
+    def _show_calibration_info(self):
+        """Zeigt Kalibrierungsinfos im Play-Log an."""
+        cal_path = Path("calibration") / "roarm_calibration.cal"
+        if not cal_path.exists():
+            self._log_play("[yellow]⚠ Keine Kalibrierungsdatei gefunden[/]")
+            self._log_play("[dim]  → Playback ohne Kalibrierung (wie raw Servo-Werte)[/]")
+            return
+
+        try:
+            from calibrate import CalibrationModel
+            model = CalibrationModel.load(str(cal_path))
+            res = model.residuals
+
+            self._log_play("[bold cyan]📐 Kalibrierungsmodell geladen:[/]")
+            self._log_play(f"  Datei: {cal_path}")
+            self._log_play(f"  Typ: Polynom 2. Ordnung (10 Koeffizienten/Gelenk)")
+            self._log_play(
+                f"  Residuen (Fit-Qualität):"
+            )
+            for j in ["b", "s", "e"]:
+                r = res.get(j, 0)
+                quality = "✅" if r < 0.3 else "⚠️" if r < 1.0 else "❌"
+                self._log_play(f"    {j.upper()}: {r:.4f}° {quality}")
+
+            # Diagnostik laden falls vorhanden
+            diag_path = Path("calibration") / "roarm_diagnostics.json"
+            if diag_path.exists():
+                with open(diag_path, 'r') as f:
+                    diag = json.load(f)
+
+                if "pose_set" in diag:
+                    self._log_play(f"  Pose-Set: {diag['pose_set']}")
+                if "total_measurements" in diag:
+                    self._log_play(f"  Messungen: {diag['total_measurements']}")
+                if "repeats_per_pose" in diag:
+                    self._log_play(f"  Wiederholungen/Pose: {diag['repeats_per_pose']}")
+                if "avg_settle_time_s" in diag:
+                    self._log_play(
+                        f"  Ø Settle-Zeit: {diag['avg_settle_time_s']:.2f}s"
+                    )
+                if "avg_noise_std_deg" in diag:
+                    noise = diag["avg_noise_std_deg"]
+                    self._log_play(
+                        f"  Ø Rauschen: b={noise.get('b',0):.4f}° "
+                        f"s={noise.get('s',0):.4f}° e={noise.get('e',0):.4f}°"
+                    )
+                if "position_error_stats" in diag:
+                    stats = diag["position_error_stats"]
+                    self._log_play(f"  Positionsfehler (vor Kalibrierung):")
+                    for j in ["b", "s", "e"]:
+                        if j in stats:
+                            s = stats[j]
+                            self._log_play(
+                                f"    {j.upper()}: mean={s['mean']:+.3f}° "
+                                f"σ={s['std']:.3f}° max={s['max']:.3f}°"
+                            )
+                if "repeatability_deg" in diag:
+                    rep = diag["repeatability_deg"]
+                    self._log_play(
+                        f"  Repeatability: Δb={rep.get('b',0):.3f}° "
+                        f"Δs={rep.get('s',0):.3f}° Δe={rep.get('e',0):.3f}°"
+                    )
+
+            # Beispiel-Korrektur für Home-Position
+            home = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
+            corr = model.predict_correction(home)
+            self._log_play(
+                f"  [dim]Beispiel Home-Korrektur: "
+                f"Δb={corr['b']:+.3f}° Δs={corr['s']:+.3f}° Δe={corr['e']:+.3f}°[/]"
+            )
+
+        except Exception as e:
+            self._log_play(f"[red]Fehler beim Laden der Kalibrierung: {e}[/]")
+
+
     # ============================================================
     # COMPOSE (Layout)
     # ============================================================
@@ -1273,6 +1369,9 @@ class RoArmDashboard(App):
         self._try_auto_connect()
         self._load_logs()
         self._apply_log_filter()
+
+        # Kalibrierungs-Info im Play-Tab anzeigen
+        self._show_calibration_info()
 
         # Periodischer Position-Poll (wenn verbunden)
         self.set_interval(0.5, self._periodic_position_poll)
@@ -1853,8 +1952,35 @@ class RoArmDashboard(App):
 
     @work(thread=True)
     def _run_playback(self, waypoints: list):
+        """Flüssiges Playback mit Cubic Spline + Kalibrierung (wie play.py)."""
         from scipy.interpolate import CubicSpline
+        from safety import RateLimiter
 
+        # --- Kalibrierungsmodell laden ---
+        cal_model = None
+        try:
+            from calibrate import CalibrationModel
+            cal_path = Path("calibration") / "roarm_calibration.cal"
+            if cal_path.exists():
+                cal_model = CalibrationModel.load(str(cal_path))
+                self.app.call_from_thread(
+                    self._log_play,
+                    f"[green]📂 Kalibrierung geladen: {cal_path}[/]"
+                )
+                # Zeige Residuen
+                res = cal_model.residuals
+                self.app.call_from_thread(
+                    self._log_play,
+                    f"[dim]  Residuen: b={res.get('b',0):.4f}° "
+                    f"s={res.get('s',0):.4f}° e={res.get('e',0):.4f}°[/]"
+                )
+        except Exception as e:
+            self.app.call_from_thread(
+                self._log_play,
+                f"[yellow]⚠ Kalibrierung nicht verfügbar: {e}[/]"
+            )
+
+        # --- Spline aufbauen ---
         times = np.array([wp["t"] for wp in waypoints])
         splines = {}
         for joint in ["b", "s", "e", "h"]:
@@ -1862,14 +1988,22 @@ class RoArmDashboard(App):
             splines[joint] = CubicSpline(times, values, bc_type='clamped')
 
         duration = times[-1]
-        interval = 1.0 / STREAM_HZ
+        stream_hz = STREAM_HZ
+        interval = 1.0 / stream_hz
 
-        # Zur Startposition fahren
+        # --- Rate Limiter (wie play.py) ---
+        rate_limiter = RateLimiter(max_hz=stream_hz + 10)
+
+        # --- Zur Startposition fahren ---
         self._arm.torque_on()
         time.sleep(0.2)
         start = waypoints[0]
+
+        # Kalibrierung auf Startposition anwenden
+        start_corrected = self._apply_calibration_static(cal_model, start)
         self._arm.move_to(
-            start["b"], start["s"], start["e"], start["h"],
+            start_corrected["b"], start_corrected["s"],
+            start_corrected["e"], start_corrected["h"],
             spd=20, acc=10
         )
         self.app.call_from_thread(
@@ -1877,7 +2011,7 @@ class RoArmDashboard(App):
         )
         time.sleep(2.0)
 
-        # Streaming
+        # --- Streaming ---
         self._play_start_time = time.time()
         last_pos = None
         commands_sent = 0
@@ -1888,6 +2022,14 @@ class RoArmDashboard(App):
         )
         gripper_idx = 0
 
+        # Info über Kalibrierungsstatus
+        cal_active = cal_model is not None and cal_model.is_fitted
+        self.app.call_from_thread(
+            self._log_play,
+            f"[bold]▶ Streaming: {stream_hz}Hz, Kalibrierung: "
+            f"{'✅ AKTIV' if cal_active else '❌ INAKTIV'}[/]"
+        )
+
         while self.playing:
             loop_start = time.time()
             elapsed = loop_start - self._play_start_time
@@ -1895,22 +2037,26 @@ class RoArmDashboard(App):
             if elapsed >= duration:
                 break
 
-            # Gripper-Events
+            # --- Gripper-Events ---
             while gripper_idx < len(gripper_cmds):
                 gc = gripper_cmds[gripper_idx]
                 if gc["t"] <= elapsed:
                     if gc["cmd"] == "CLOSE":
                         self._arm.gripper_close()
                         self.app.call_from_thread(
-                            self._log_play, f"[bold]  ✊ Gripper ZU [{elapsed:.2f}s][/]"
+                            self._log_play,
+                            f"[bold]  ✂ Gripper ZU [{elapsed:.2f}s][/]"
                         )
                     elif gc["cmd"] == "OPEN":
                         self._arm.gripper_open()
                         self.app.call_from_thread(
-                            self._log_play, f"[bold]  ✋ Gripper AUF [{elapsed:.2f}s][/]"
+                            self._log_play,
+                            f"[bold]  ✃ Gripper AUF [{elapsed:.2f}s][/]"
                         )
                     gripper_idx += 1
                     time.sleep(0.3)
+                    # Kompensiere Gripper-Pause
+                    self._play_start_time += 0.3
                 else:
                     break
 
@@ -1919,48 +2065,85 @@ class RoArmDashboard(App):
             if elapsed >= duration:
                 break
 
-            # Sample Spline
+            # --- Sample Spline ---
             target = {}
             for joint in ["b", "s", "e", "h"]:
-                target[joint] = round(float(splines[joint](elapsed)), 2)
+                target[joint] = round(float(splines[joint](
+                    np.clip(elapsed, times[0], times[-1])
+                )), 2)
 
-            # Delta-Check
+            # --- Kalibrierung anwenden ---
+            corrected = self._apply_calibration_static(cal_model, target)
+
+            # --- Delta-Check (wie play.py) ---
             should_send = True
             if last_pos:
                 max_delta = max(
-                    abs(target[j] - last_pos[j]) for j in ["b", "s", "e", "h"]
+                    abs(corrected[j] - last_pos[j]) for j in ["b", "s", "e", "h"]
                 )
                 if max_delta < MIN_DELTA_DEG:
                     should_send = False
                     skipped += 1
 
             if should_send:
+                # Rate Limiter
+                rate_limiter.acquire()
+
                 self._arm.move_to_fast(
-                    target["b"], target["s"], target["e"], target["h"],
+                    corrected["b"], corrected["s"],
+                    corrected["e"], corrected["h"],
                     spd=50, acc=30
                 )
-                last_pos = target.copy()
+                last_pos = corrected.copy()
                 commands_sent += 1
 
-            # UI updaten (throttled: alle 100ms)
-            if int(elapsed * 10) % 2 == 0:
-                self.app.call_from_thread(self._update_arm_views, target)
-                self.app.call_from_thread(
-                    self._update_play_timeline, elapsed
-                )
+            # --- UI updaten (nur alle 200ms, NICHT blockierend) ---
+            if commands_sent % max(1, stream_hz // 5) == 0:
+                self.app.call_from_thread(self._update_arm_views, corrected)
+                self.app.call_from_thread(self._update_play_timeline, elapsed)
 
-            # Timing
+            # --- Timing (wie play.py) ---
             loop_elapsed = time.time() - loop_start
             sleep_time = interval - loop_elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        # Ende
+        # --- Precision Endpoint (wie play.py) ---
+        if self.playing:
+            final_target = {}
+            for joint in ["b", "s", "e", "h"]:
+                final_target[joint] = round(float(splines[joint](times[-1])), 2)
+            final_corrected = self._apply_calibration_static(cal_model, final_target)
+
+            for spd, acc in [(8, 4), (5, 2), (3, 1)]:
+                self._arm.move_to(
+                    final_corrected["b"], final_corrected["s"],
+                    final_corrected["e"], final_corrected["h"],
+                    spd=spd, acc=acc
+                )
+                time.sleep(0.8)
+
+        # --- Ende ---
         self.playing = False
+
+        # Kalibrierungs-Info im Summary
+        cal_info = ""
+        if cal_active:
+            # Zeige die Korrektur am Endpunkt als Beispiel
+            if 'final_target' in dir() and 'final_corrected' in dir():
+                delta_b = final_corrected["b"] - final_target["b"]
+                delta_s = final_corrected["s"] - final_target["s"]
+                delta_e = final_corrected["e"] - final_target["e"]
+                cal_info = (
+                    f"\n  [dim]Kalibrierung (Endpunkt-Korrektur): "
+                    f"Δb={delta_b:+.2f}° Δs={delta_s:+.2f}° Δe={delta_e:+.2f}°[/]"
+                )
+
         self.app.call_from_thread(
             self._log_play,
             f"[green]✅ Playback beendet: {commands_sent} Cmds, "
-            f"{skipped} übersprungen[/]"
+            f"{skipped} übersprungen, {rate_limiter.violations} Rate-Limit-Eingriffe"
+            f"{cal_info}[/]"
         )
         self.app.call_from_thread(self._playback_finished)
 
