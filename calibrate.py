@@ -415,7 +415,7 @@ def validate_pose(pose: dict) -> bool:
 # ============================================================
 
 def run_calibration(arm, poses=None, auto_accept: bool = False,
-                    skip_identify: bool = False, repeats: int = REPEATS_PER_POSE,
+                    repeats: int = REPEATS_PER_POSE,
                     pose_set_name: str = "standard"):
 
     if poses is None:
@@ -468,12 +468,6 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
             border_style="dim",
             box=box.ROUNDED,
         ))
-
-    if not skip_identify and not auto_accept:
-        console.print("\n  Soll ich bei der ersten Pose alle Gelenke einzeln bewegen?", style="dim")
-        show_joints = input("  (j/n) > ").strip().lower() != 'n'
-    else:
-        show_joints = False
 
     if not auto_accept:
         input("\n  [ENTER] um zu starten...")
@@ -549,22 +543,6 @@ def run_calibration(arm, poses=None, auto_accept: bool = False,
                     diagnostics["overshoot_deg"].append(round(max_overshoot, 3))
                 else:
                     diagnostics["overshoot_deg"].append(0.0)
-
-                # Gelenk-Identifikation (nur bei allererster Messung)
-                if show_joints and not joints_identified and i == 0 and rep == 0:
-                    progress.stop()  # Progress pausieren für Interaktion
-                    print_section("GELENK-IDENTIFIKATION")
-                    input("     [ENTER] um zu starten...")
-                    for joint in ["b", "s", "e", "h"]:
-                        identify_joint(arm, joint, pose)
-                        time.sleep(0.3)
-                    joints_identified = True
-                    print_success("Alle Gelenke identifiziert!")
-                    arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=10, acc=5)
-                    arm.wait_until_settled()
-                    arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
-                    arm.wait_until_settled()
-                    progress.start()  # Progress wieder starten
 
                 # --- SCHRITT 4: Position auslesen (gemittelt) ---
                 servo_avg = arm.read_position_averaged(n=10, interval=0.05)
@@ -1242,7 +1220,6 @@ def main():
             model = run_calibration(
                 arm,
                 auto_accept=args.auto,
-                skip_identify=args.no_identify,
                 repeats=args.repeats,
                 pose_set_name=args.pose_set,
                 n_manual_override=args.manual_points,  # NEU: Übergabe
