@@ -516,8 +516,8 @@ def main():
                    help="Ausgabe-Verzeichnis")
     p.add_argument("--no-gravity-comp", action="store_true",
                    help="Gravity Compensation deaktivieren")
-    p.add_argument("--no-viz", action="store_true",
-                   help="3D-Visualisierung deaktivieren")
+    p.add_argument("-V", "--visualization", action="store_true",
+               help="3D-Visualisierung aktivieren")
     args = p.parse_args()
 
     recorder = TeachRecorder(
@@ -526,7 +526,7 @@ def main():
         hz=args.hz,
         threshold=args.threshold,
         gravity_comp=not args.no_gravity_comp,
-        visualize=not args.no_viz,
+        visualize=args.visualization,
     )
     recorder.run()
 
