@@ -11,6 +11,7 @@ Enthält:
 - Gemeinsame Konstanten
 """
 
+import os
 import sys
 import json
 import time
@@ -67,11 +68,11 @@ def setup_command_logger(log_dir: str = "logs") -> logging.Logger:
     logger.addHandler(fh)
 
     # Optional: Auch auf Console (nur Warnungen+)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.WARNING)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-
+    if not os.environ.get("TEXTUAL_RUNNING"):
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.WARNING)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
     logger.info(f"=== SESSION START === Port wird gleich verbunden")
     logger.info(f"Python: {sys.version}")
     logger.info(f"Log-Datei: {log_file}")

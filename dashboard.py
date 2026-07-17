@@ -2502,7 +2502,7 @@ class RoArmDashboard(App):
 # ============================================================
 
 def main():
-    """Startet das Dashboard."""
+    os.environ["TEXTUAL_RUNNING"] = "1"
     app = RoArmDashboard()
     app.run()
 
