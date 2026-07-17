@@ -885,7 +885,7 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
         console.print("  [dim]Drücke [ENTER] um Torque zu deaktivieren...[/]")
         input()
 
-        arm.torque_off_fast(exclude_gripper=True)
+        arm.torque_off()
         time.sleep(0.3)
 
         console.print("  [bold green]✋ Torque AUS[/] – Bewege den Arm an die gewünschte Position.")
