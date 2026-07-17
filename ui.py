@@ -475,7 +475,7 @@ class TeachDisplay:
         
         # Controls
         controls = Text()
-        controls.append("\n  [ENTER]=Stop  [g]=Gripper  ", style="dim")
+        controls.append("\n  [ENTER]=Stop  [g]=Gripper  [l]=Light", style="dim")
         main.add_row(controls)
         
         return main
