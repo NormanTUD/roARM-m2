@@ -97,6 +97,31 @@ MIN_DELTA_DEG = 0.02
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+import logging
+
+class TUILogHandler(logging.Handler):
+    """Leitet robot.py Warnungen ins Teach-Log der TUI."""
+
+    def __init__(self, app: "RoArmDashboard"):
+        super().__init__()
+        self.app = app
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            if record.levelno >= logging.WARNING:
+                styled = f"[yellow]{msg}[/]"
+            else:
+                styled = f"[dim]{msg}[/]"
+
+            # Wenn wir schon im Main-Thread sind (z.B. periodic poll):
+            try:
+                self.app._log_teach(styled)
+            except Exception:
+                self.app.call_from_thread(self.app._log_teach, styled)
+        except Exception:
+            pass
+
 class BrailleCanvas:
     """
     Zeichnet auf einem Braille-Raster.
@@ -1226,6 +1251,17 @@ class RoArmDashboard(App):
 
     def on_mount(self) -> None:
         """Initialisierung nach dem Mounten."""
+        # Robot-Logger in die TUI umleiten
+        robot_logger = logging.getLogger("roarm.commands")
+        handler = TUILogHandler(self)
+        handler.setLevel(logging.WARNING)  # Nur WARNING+ in der TUI
+        fmt = logging.Formatter(
+            '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        handler.setFormatter(fmt)
+        robot_logger.addHandler(handler)
+
         self._refresh_recordings_table()
         self._try_auto_connect()
         self._load_logs()
