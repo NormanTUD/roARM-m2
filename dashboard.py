@@ -26,6 +26,8 @@ Auto-Connect wenn USB-Port gefunden.
 # ///
 
 import os
+os.environ["TEXTUAL_RUNNING"] = "1"  # ← HIER, vor allen robot-Imports!
+
 import sys
 import re
 
@@ -2502,7 +2504,6 @@ class RoArmDashboard(App):
 # ============================================================
 
 def main():
-    os.environ["TEXTUAL_RUNNING"] = "1"
     app = RoArmDashboard()
     app.run()
 
