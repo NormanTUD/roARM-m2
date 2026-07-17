@@ -35,6 +35,10 @@ import time
 import math
 import threading
 import asyncio
+import io
+import base64
+import subprocess
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -82,7 +86,192 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
-# 3D ASCII RENDERER (echte 3D-Projektion mit Rotation)
+# SIXEL 3D RENDERER (Matplotlib → Sixel)
+# ============================================================
+
+def _check_sixel_support() -> bool:
+    """Prüft ob das Terminal Sixel unterstützt."""
+    # Prüfe ob img2sixel oder chafa verfügbar ist
+    for cmd in ["img2sixel", "chafa"]:
+        try:
+            result = subprocess.run(
+                [cmd, "--version"],
+                capture_output=True, timeout=2
+            )
+            if result.returncode == 0:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return False
+
+SIXEL_AVAILABLE = _check_sixel_support()
+
+class Sixel3DRenderer:
+    """
+    Rendert den Roboterarm als echtes 3D-Bild via Matplotlib.
+    Gibt das Bild als Sixel-String zurück (für Terminals die Sixel unterstützen)
+    oder als Datei-Pfad für die Anzeige.
+    """
+
+    def __init__(self, width: int = 400, height: int = 300, dpi: int = 72):
+        self.width = width
+        self.height = height
+        self.dpi = dpi
+        self.cam_azimuth = 45.0
+        self.cam_elevation = 25.0
+        self._last_render_path: Optional[str] = None
+        # Temporäres Verzeichnis für Bilder
+        self._tmp_dir = tempfile.mkdtemp(prefix="roarm_viz_")
+
+    def rotate_camera(self, d_azimuth: float = 0, d_elevation: float = 0):
+        """Rotiert die Kamera."""
+        self.cam_azimuth = (self.cam_azimuth + d_azimuth) % 360
+        self.cam_elevation = max(-80, min(80, self.cam_elevation + d_elevation))
+
+    def render_to_file(self, b_deg: float, s_deg: float, e_deg: float,
+                       trail: list = None, target: dict = None) -> str:
+        """Rendert den Arm als PNG-Datei und gibt den Pfad zurück."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+
+        positions = forward_kinematics(b_deg, s_deg, e_deg)
+
+        fig = plt.figure(figsize=(self.width / self.dpi, self.height / self.dpi),
+                         dpi=self.dpi)
+        fig.patch.set_facecolor('#1e1e2e')
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_facecolor('#1e1e2e')
+
+        # Limits
+        limit = 500.0
+        ax.set_xlim([-limit, limit])
+        ax.set_ylim([-limit, limit])
+        ax.set_zlim([-50, limit])
+        ax.set_xlabel("X", fontsize=7, color='white')
+        ax.set_ylabel("Y", fontsize=7, color='white')
+        ax.set_zlabel("Z", fontsize=7, color='white')
+        ax.set_box_aspect([1, 1, 1])
+        ax.view_init(elev=self.cam_elevation, azim=self.cam_azimuth)
+
+        # Tick-Farben
+        ax.tick_params(colors='gray', labelsize=6)
+        for spine in ax.spines.values():
+            spine.set_color('gray')
+
+        # Arm zeichnen
+        pts = [positions["base"], positions["shoulder"],
+               positions["elbow"], positions["gripper"]]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        zs = [p[2] for p in pts]
+
+        # Basis
+        from visualize import BASE_HEIGHT, UPPER_ARM, FOREARM, GRIPPER_LENGTH
+        ax.plot([0, 0], [0, 0], [0, BASE_HEIGHT],
+                color='#9e9e9e', linewidth=6, solid_capstyle='round', alpha=0.9)
+
+        # Oberarm
+        ax.plot([xs[1], xs[2]], [ys[1], ys[2]], [zs[1], zs[2]],
+                color='#42a5f5', linewidth=4, solid_capstyle='round')
+
+        # Unterarm + Gripper
+        ax.plot([xs[2], xs[3]], [ys[2], ys[3]], [zs[2], zs[3]],
+                color='#66bb6a', linewidth=3, solid_capstyle='round')
+
+        # Gelenke
+        joint_colors = ['#424242', '#ef5350', '#42a5f5', '#ff9800']
+        joint_sizes = [80, 60, 50, 40]
+        for i, (x, y, z) in enumerate(pts):
+            ax.scatter([x], [y], [z], c=joint_colors[i], s=joint_sizes[i],
+                       zorder=5, depthshade=False, edgecolors='white', linewidths=0.5)
+
+        # Trail
+        if trail:
+            trail_x = [p[0] for p in trail[-50:]]
+            trail_y = [p[1] for p in trail[-50:]]
+            trail_z = [p[2] for p in trail[-50:]]
+            ax.plot(trail_x, trail_y, trail_z,
+                    color='#ef5350', linewidth=1.2, alpha=0.6)
+
+        # Target
+        if target:
+            t_pos = forward_kinematics(target["b"], target["s"], target["e"])
+            tp = t_pos["gripper"]
+            ax.scatter([tp[0]], [tp[1]], [tp[2]],
+                       c='red', s=100, marker='x', linewidths=2, zorder=6)
+
+        # Koordinatenachsen
+        axis_len = 60.0
+        ax.quiver(0, 0, 0, axis_len, 0, 0, color='red', arrow_length_ratio=0.15, alpha=0.6, linewidth=1)
+        ax.quiver(0, 0, 0, 0, axis_len, 0, color='green', arrow_length_ratio=0.15, alpha=0.6, linewidth=1)
+        ax.quiver(0, 0, 0, 0, 0, axis_len, color='blue', arrow_length_ratio=0.15, alpha=0.6, linewidth=1)
+
+        # Arbeitsraum-Kreis
+        theta = np.linspace(0, 2 * np.pi, 80)
+        reach = UPPER_ARM + FOREARM + GRIPPER_LENGTH
+        ax.plot(reach * np.cos(theta), reach * np.sin(theta),
+                np.zeros(80), color='gray', linewidth=0.4, alpha=0.2)
+
+        # Boden-Gitter
+        grid_range = np.linspace(-400, 400, 5)
+        for g in grid_range:
+            ax.plot([g, g], [-400, 400], [0, 0], color='gray', linewidth=0.2, alpha=0.15)
+            ax.plot([-400, 400], [g, g], [0, 0], color='gray', linewidth=0.2, alpha=0.15)
+
+        # Info-Text
+        gp = positions["gripper"]
+        info = (f"b={b_deg:+.1f}° s={s_deg:+.1f}° e={e_deg:+.1f}°\n"
+                f"Gripper: ({gp[0]:.0f}, {gp[1]:.0f}, {gp[2]:.0f})mm")
+        ax.text2D(0.02, 0.95, info, transform=ax.transAxes,
+                  fontsize=8, fontfamily='monospace', color='white',
+                  verticalalignment='top',
+                  bbox=dict(boxstyle='round', facecolor='#2d2d3d', alpha=0.85))
+
+        plt.tight_layout(pad=0.5)
+
+        # Speichern
+        filepath = os.path.join(self._tmp_dir, "arm_3d.png")
+        fig.savefig(filepath, dpi=self.dpi, facecolor=fig.get_facecolor(),
+                    bbox_inches='tight', pad_inches=0.1)
+        plt.close(fig)
+
+        self._last_render_path = filepath
+        return filepath
+
+    def render_to_sixel(self, b_deg: float, s_deg: float, e_deg: float,
+                        trail: list = None, target: dict = None) -> Optional[str]:
+        """Rendert den Arm und konvertiert zu Sixel-String."""
+        filepath = self.render_to_file(b_deg, s_deg, e_deg, trail, target)
+
+        # Versuche img2sixel
+        try:
+            result = subprocess.run(
+                ["img2sixel", "-w", str(self.width), filepath],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8', errors='ignore')
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Versuche chafa (Sixel-Modus)
+        try:
+            result = subprocess.run(
+                ["chafa", "-f", "sixel", "-s", f"{self.width // 8}x{self.height // 12}",
+                 filepath],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.decode('utf-8', errors='ignore')
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        return None
+
+# ============================================================
+# 3D ASCII RENDERER (Fallback wenn kein Sixel)
 # ============================================================
 
 class Ascii3DRenderer:
@@ -95,10 +284,9 @@ class Ascii3DRenderer:
     def __init__(self, width: int = 72, height: int = 28):
         self.width = width
         self.height = height
-        # Kamera-Parameter (Azimut, Elevation)
-        self.cam_azimuth = 45.0  # Grad
-        self.cam_elevation = 25.0  # Grad
-        self.cam_distance = 600.0  # mm
+        self.cam_azimuth = 45.0
+        self.cam_elevation = 25.0
+        self.cam_distance = 600.0
 
     def rotate_camera(self, d_azimuth: float = 0, d_elevation: float = 0):
         """Rotiert die Kamera."""
@@ -107,23 +295,19 @@ class Ascii3DRenderer:
 
     def _project_3d_to_2d(self, x: float, y: float, z: float) -> tuple:
         """Projiziert einen 3D-Punkt auf 2D-Canvas mit perspektivischer Projektion."""
-        # Kamera-Rotation
         az = math.radians(self.cam_azimuth)
         el = math.radians(self.cam_elevation)
 
-        # Rotation um Z-Achse (Azimut)
         x1 = x * math.cos(az) - y * math.sin(az)
         y1 = x * math.sin(az) + y * math.cos(az)
         z1 = z
 
-        # Rotation um X-Achse (Elevation)
         y2 = y1 * math.cos(el) - z1 * math.sin(el)
         z2 = y1 * math.sin(el) + z1 * math.cos(el)
         x2 = x1
 
-        # Perspektivische Projektion
         d = self.cam_distance
-        scale = d / (d + y2 + 300)  # +300 um Clipping zu vermeiden
+        scale = d / (d + y2 + 300)
 
         px = int(x2 * scale * 0.15 + self.width // 2)
         py = int(-z2 * scale * 0.12 + self.height * 0.7)
@@ -135,23 +319,17 @@ class Ascii3DRenderer:
         """Rendert den Arm als 3D ASCII-String."""
         positions = forward_kinematics(b_deg, s_deg, e_deg)
 
-        # Canvas erstellen
         canvas = [[' ' for _ in range(self.width)] for _ in range(self.height)]
         depth_buf = [[float('inf') for _ in range(self.width)] for _ in range(self.height)]
 
-        # Boden-Gitter zeichnen
         self._draw_ground_grid(canvas, depth_buf)
-
-        # Achsen zeichnen (X=rot, Y=grün, Z=blau)
         self._draw_axes(canvas, depth_buf)
 
-        # Trail zeichnen
         if trail:
             for tp in trail[-40:]:
                 px, py, _ = self._project_3d_to_2d(tp[0], tp[1], tp[2])
                 self._put_char(canvas, px, py, '·')
 
-        # Target-Marker
         if target:
             t_pos = forward_kinematics(target["b"], target["s"], target["e"])
             tp = t_pos["gripper"]
@@ -160,10 +338,8 @@ class Ascii3DRenderer:
             self._put_char(canvas, px - 1, py, '(')
             self._put_char(canvas, px + 1, py, ')')
 
-        # Arm-Segmente zeichnen
         joint_names = ["base", "shoulder", "elbow", "gripper"]
-        joint_chars = ['◆', '●', '●', '◇']
-        segment_chars = ['│', '╱', '╲']
+        joint_chars = ['◆', '◉', '◉', '◇']
 
         projected = []
         for name in joint_names:
@@ -171,19 +347,16 @@ class Ascii3DRenderer:
             px, py, scale = self._project_3d_to_2d(p[0], p[1], p[2])
             projected.append((px, py, scale))
 
-        # Segmente (Linien zwischen Gelenken)
-        seg_styles = ['║', '▓', '░']
+        seg_styles = ['║', '▓', '▒']
         for i in range(len(projected) - 1):
             p1 = projected[i]
             p2 = projected[i + 1]
             ch = seg_styles[min(i, len(seg_styles) - 1)]
             self._draw_line_3d(canvas, p1[0], p1[1], p2[0], p2[1], ch)
 
-        # Gelenke (über den Linien)
         for i, (px, py, scale) in enumerate(projected):
             self._put_char(canvas, px, py, joint_chars[i])
 
-        # Info-Header
         lines = []
         gp = positions["gripper"]
         lines.append(
@@ -194,17 +367,15 @@ class Ascii3DRenderer:
                      f"  │ Gripper: ({gp[0]:.0f}, {gp[1]:.0f}, {gp[2]:.0f})mm │")
         lines.append('  ' + '─' * (self.width - 2))
 
-        # Canvas zu String
         for row in canvas:
             lines.append('  ' + ''.join(row))
 
         lines.append('  ' + '─' * (self.width - 2))
-        lines.append(f"  ◆=Base ●=Shoulder/Elbow ◇=Gripper  ✕=Target  ·=Trail")
+        lines.append(f"  ◆=Base ◉=Shoulder/Elbow ◇=Gripper  ✕=Target  ·=Trail")
 
         return '\n'.join(lines)
 
     def _draw_ground_grid(self, canvas, depth_buf):
-        """Zeichnet ein Boden-Gitter auf Z=0."""
         grid_size = 200
         step = 100
         for x in range(-grid_size, grid_size + 1, step):
@@ -215,17 +386,13 @@ class Ascii3DRenderer:
                         canvas[py][px] = '·' if (x == 0 or y == 0) else '.'
 
     def _draw_axes(self, canvas, depth_buf):
-        """Zeichnet Koordinatenachsen."""
         axis_len = 80
-        # X-Achse
         for i in range(0, axis_len, 8):
             px, py, _ = self._project_3d_to_2d(i, 0, 0)
             self._put_char(canvas, px, py, '→' if i == axis_len - 8 else '─')
-        # Y-Achse
         for i in range(0, axis_len, 8):
             px, py, _ = self._project_3d_to_2d(0, i, 0)
             self._put_char(canvas, px, py, '→' if i == axis_len - 8 else '─')
-        # Z-Achse
         for i in range(0, axis_len, 8):
             px, py, _ = self._project_3d_to_2d(0, 0, i)
             self._put_char(canvas, px, py, '↑' if i == axis_len - 8 else '│')
@@ -235,7 +402,6 @@ class Ascii3DRenderer:
             canvas[y][x] = ch
 
     def _draw_line_3d(self, canvas, x1, y1, x2, y2, ch):
-        """Bresenham-Linie."""
         dx = abs(x2 - x1)
         dy = abs(y2 - y1)
         steps = max(dx, dy, 1)
@@ -529,7 +695,7 @@ RichLog {
 # ============================================================
 
 class Arm3DWidget(Static):
-    """Widget das den 3D-Arm rendert."""
+    """Widget das den 3D-Arm rendert (Sixel wenn verfügbar, sonst ASCII)."""
 
     b = reactive(0.0)
     s = reactive(0.0)
@@ -537,9 +703,11 @@ class Arm3DWidget(Static):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._renderer = Ascii3DRenderer(width=70, height=24)
+        self._ascii_renderer = Ascii3DRenderer(width=70, height=24)
+        self._sixel_renderer = Sixel3DRenderer(width=480, height=320, dpi=72) if SIXEL_AVAILABLE else None
         self._trail = []
         self._target = None
+        self._use_sixel = SIXEL_AVAILABLE
 
     def update_pose(self, b: float, s: float, e: float,
                     target: dict = None):
@@ -558,7 +726,9 @@ class Arm3DWidget(Static):
 
     def rotate(self, d_azimuth: float = 0, d_elevation: float = 0):
         """Rotiert die 3D-Ansicht."""
-        self._renderer.rotate_camera(d_azimuth, d_elevation)
+        self._ascii_renderer.rotate_camera(d_azimuth, d_elevation)
+        if self._sixel_renderer:
+            self._sixel_renderer.rotate_camera(d_azimuth, d_elevation)
         self._refresh_display()
 
     def clear_trail(self):
@@ -566,7 +736,19 @@ class Arm3DWidget(Static):
         self._refresh_display()
 
     def _refresh_display(self):
-        rendered = self._renderer.render(
+        if self._use_sixel and self._sixel_renderer:
+            sixel_str = self._sixel_renderer.render_to_sixel(
+                self.b, self.s, self.e,
+                trail=self._trail,
+                target=self._target
+            )
+            if sixel_str:
+                # Sixel direkt ausgeben (funktioniert in Sixel-fähigen Terminals)
+                self.update(sixel_str)
+                return
+
+        # Fallback: ASCII-Renderer
+        rendered = self._ascii_renderer.render(
             self.b, self.s, self.e,
             trail=self._trail,
             target=self._target
@@ -725,7 +907,6 @@ class RoArmDashboard(App):
         Binding("space", "toggle_action", "Start/Stop", show=True),
         Binding("g", "gripper_toggle", "Gripper", show=True),
         Binding("h", "go_home", "Home", show=True),
-        Binding("v", "toggle_viz", "3D Viz", show=True),
         Binding("left", "rotate_left", "Rot←", show=False),
         Binding("right", "rotate_right", "Rot→", show=False),
         Binding("up", "rotate_up", "Rot↑", show=False),
@@ -960,7 +1141,7 @@ class RoArmDashboard(App):
 
                                 with Horizontal(classes="control-buttons"):
                                     yield Button(
-                                        "📖 Read All [r]", id="btn-servo-read",
+                                        "📑 Read All [r]", id="btn-servo-read",
                                         variant="default"
                                     )
                                     yield Button(
@@ -968,7 +1149,7 @@ class RoArmDashboard(App):
                                         variant="default"
                                     )
                                     yield Button(
-                                        "🔓 Torque Off [t]",
+                                        "🔌 Torque Off [t]",
                                         id="btn-servo-torque-off",
                                         variant="warning"
                                     )
@@ -1012,6 +1193,7 @@ class RoArmDashboard(App):
         self._refresh_recordings_table()
         self._try_auto_connect()
         self._load_logs()
+        self._apply_log_filter()
 
         # Periodischer Position-Poll (wenn verbunden)
         self.set_interval(0.5, self._periodic_position_poll)
@@ -1064,6 +1246,7 @@ class RoArmDashboard(App):
             if pos:
                 self._current_pos = pos
                 self._update_joint_displays(pos)
+                self._update_arm_views(pos)
                 # Servo-Readouts updaten
                 self._update_servo_readouts(pos)
         except Exception:
@@ -1247,6 +1430,8 @@ class RoArmDashboard(App):
                 self._stop_playback()
             else:
                 self._start_playback()
+        elif active == "calibrate":
+            self._start_calibration()
 
     def action_gripper_toggle(self) -> None:
         if not self._arm or not self.connected:
@@ -1285,7 +1470,7 @@ class RoArmDashboard(App):
             self._update_arm_views(pos)
             self._update_servo_readouts(pos)
             self._log_servo(
-                f"[green]📖 Position:[/] b={pos['b']:+.2f}° "
+                f"[green]📑 Position:[/] b={pos['b']:+.2f}° "
                 f"s={pos['s']:+.2f}° e={pos['e']:+.2f}° h={pos['h']:+.2f}°"
             )
         else:
@@ -1316,10 +1501,6 @@ class RoArmDashboard(App):
                 widget.rotate(d_azimuth, d_elevation)
             except NoMatches:
                 pass
-
-    def action_toggle_viz(self) -> None:
-        """Placeholder für externe 3D-Viz (optional)."""
-        self._log_teach("[dim]3D-Visualisierung ist jetzt inline im Dashboard.[/]")
 
     # ============================================================
     # TEACH MODE
@@ -1866,12 +2047,12 @@ class RoArmDashboard(App):
                          "e": servo_avg["e"], "h": servo_avg.get("h", 180.0)}
                     )
 
-                self.app.call_from_thread(
-                    self._log_calibrate,
-                    f"[dim]  ✓ Pose {i+1} Rep {rep+1}: "
-                    f"Δb={error['b']:+.2f}° Δs={error['s']:+.2f}° "
-                    f"Δe={error['e']:+.2f}°[/]"
-                )
+                    self.app.call_from_thread(
+                        self._log_calibrate,
+                        f"[dim]  ✓ Pose {i+1} Rep {rep+1}: "
+                        f"Δb={error['b']:+.2f}° Δs={error['s']:+.2f}° "
+                        f"Δe={error['e']:+.2f}°[/]"
+                    )
 
             # Mittelwert für diese Pose
             if pose_errors:
@@ -1892,7 +2073,6 @@ class RoArmDashboard(App):
         residuals = model.fit(commanded, errors)
 
         # Speichern
-        from pathlib import Path
         cal_path = Path("calibration") / "roarm_calibration.cal"
         cal_path.parent.mkdir(exist_ok=True)
         model.save(str(cal_path))
@@ -1933,8 +2113,6 @@ class RoArmDashboard(App):
     def _abort_calibration(self):
         """Bricht die Kalibrierung ab."""
         self._log_calibrate("[yellow]⚠ Kalibrierung abgebrochen![/]")
-        # Worker-Thread kann nicht direkt gestoppt werden,
-        # aber wir setzen ein Flag
         try:
             self.query_one("#btn-cal-start", Button).disabled = False
             self.query_one("#btn-cal-abort", Button).disabled = True
@@ -2057,6 +2235,10 @@ class RoArmDashboard(App):
         except Exception:
             self._all_log_lines = []
 
+        # Beim ersten Laden auch direkt anzeigen
+        if self._all_log_lines:
+            self._apply_log_filter()
+
     @on(Button.Pressed, "#btn-log-filter")
     def on_log_filter(self) -> None:
         self._apply_log_filter()
@@ -2094,7 +2276,8 @@ class RoArmDashboard(App):
             return
 
         if not self._all_log_lines:
-            self._load_logs()
+            self._log_to_viewer("[dim]Keine Log-Dateien gefunden.[/]")
+            return
 
         filtered = []
 
