@@ -986,10 +986,10 @@ class RoArmDashboard(App):
         Binding("space", "toggle_action", "Start/Stop", show=True),
         Binding("g", "gripper_toggle", "Gripper", show=True),
         Binding("h", "go_home", "Home", show=True),
-        Binding("left", "rotate_left", "Rot←", show=False),
-        Binding("right", "rotate_right", "Rot→", show=False),
-        Binding("up", "rotate_up", "Rot↑", show=False),
-        Binding("down", "rotate_down", "Rot↓", show=False),
+        Binding("a", "rotate_left", "Rot←", show=False),
+        Binding("d", "rotate_right", "Rot→", show=False),
+        Binding("w", "rotate_up", "Rot↑", show=False),
+        Binding("s", "rotate_down", "Rot↓", show=False),
         Binding("r", "read_position", "Read Pos", show=True),
     ]
 
