@@ -885,7 +885,7 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
         console.print("  [dim]Drücke [ENTER] um Torque zu deaktivieren...[/]")
         input()
 
-        arm.torque_off()
+        arm.torque_off_fast(exclude_gripper=True)
         time.sleep(0.3)
 
         console.print("  [bold green]✋ Torque AUS[/] – Bewege den Arm an die gewünschte Position.")
@@ -903,7 +903,7 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
 
         if not desired_pos:
             print_warning("Konnte Position nicht lesen, überspringe...")
-            arm.torque_off()
+            arm.torque_off_fast(exclude_gripper=True)
             continue
 
         console.print(f"\n  [bold]📍 Gewünschte Position aufgezeichnet:[/]")
@@ -960,7 +960,7 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
         console.print(f"  [dim]Dann korrigiere den Arm dahin wo er WIRKLICH sein sollte.[/]")
         input()
 
-        arm.torque_off()
+        arm.torque_off_fast(exclude_gripper=True)
         time.sleep(0.3)
 
         console.print("  [bold green]✋ Torque AUS[/] – Korrigiere den Arm jetzt!")
@@ -977,7 +977,7 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
 
         if not corrected_pos:
             print_warning("Konnte korrigierte Position nicht lesen, überspringe...")
-            arm.torque_off()
+            arm.torque_off_fast(exclude_gripper=True)
             continue
 
         # ═══════════════════════════════════════════════════════
@@ -1009,7 +1009,7 @@ def run_manual_verification(arm: RoArmConnection, n_points: int = 5) -> list:
 
         # Torque aus für nächsten Punkt (oder an lassen am Ende)
         if i < n_points - 1:
-            arm.torque_off()
+            arm.torque_off_fast(exclude_gripper=True)
             time.sleep(0.2)
 
     # Am Ende Torque an
