@@ -320,17 +320,6 @@ def apply_offset_to_waypoints(waypoints: list, offset: dict, blend_points: int =
 
     return result
 
-
-# ============================================================
-# SMOOTH PLAYER
-# ============================================================
-
-STREAM_HZ = 40
-STREAM_SPD = 30
-STREAM_ACC = 15
-MIN_DELTA_DEG = 0.05
-MAX_SPEED_FACTOR = 1.3
-
 # ==============================================================
 # PLAYBACK DISPLAY - GEÄNDERT für target + corrected Output
 # ==============================================================
