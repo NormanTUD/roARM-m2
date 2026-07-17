@@ -282,6 +282,15 @@ def parse_roarm_file(filepath: str) -> dict:
                     if p.startswith("t="):
                         t = float(p.split("=")[1])
                 gripper_cmds.append({"t": t, "cmd": cmd})
+            elif line.startswith("LED"):
+                parts = line.split()
+                cmd = parts[1] if len(parts) > 1 else "ON"
+                t = 0.0
+                for p in parts[1:]:
+                    if p.startswith("t="):
+                        t = float(p.split("=")[1])
+                led_cmd = "LED_ON" if cmd == "ON" else "LED_OFF"
+                gripper_cmds.append({"t": t, "cmd": led_cmd})
 
     if start_pos is None:
         start_pos = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
@@ -735,7 +744,7 @@ class SmoothPlayer:
                 temp, temp_status = self._thermal.get_status()
 
                 # --- Gripper ---
-                gripper_idx, gripper_pause = self._process_gripper(
+                gripper_idx, gripper_pause = self._process_gripper_and_led(
                     gripper_cmds, gripper_idx, elapsed
                 )
                 if gripper_pause > 0:
@@ -823,10 +832,10 @@ class SmoothPlayer:
 
         return False
 
-    def _process_gripper(self, gripper_cmds: list, gripper_idx: int,
+    def _process_gripper_and_led(self, gripper_cmds: list, gripper_idx: int,
                          elapsed: float) -> tuple:
         """
-        Verarbeitet Gripper-Befehle.
+        Verarbeitet Gripper- und LED-Befehle.
         Returns: (neuer gripper_idx, pause_duration)
         """
         total_pause = 0.0
@@ -838,11 +847,19 @@ class SmoothPlayer:
                 if gc["cmd"] == "CLOSE":
                     self._arm.gripper_close()
                     print(f"\n   ✊ GRIPPER ZU [{elapsed:.2f}s]")
-                else:
+                    time.sleep(0.3)
+                    total_pause += 0.3
+                elif gc["cmd"] == "OPEN":
                     self._arm.gripper_open()
                     print(f"\n   ✋ GRIPPER AUF [{elapsed:.2f}s]")
-                time.sleep(0.3)
-                total_pause += 0.3
+                    time.sleep(0.3)
+                    total_pause += 0.3
+                elif gc["cmd"] == "LED_ON":
+                    self._arm_raw.send_cmd({"T": 114, "led": 255})
+                    print(f"\n   💡 LED AN [{elapsed:.2f}s]")
+                elif gc["cmd"] == "LED_OFF":
+                    self._arm_raw.send_cmd({"T": 114, "led": 0})
+                    print(f"\n   💡 LED AUS [{elapsed:.2f}s]")
                 gripper_idx += 1
             else:
                 break

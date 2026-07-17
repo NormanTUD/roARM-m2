@@ -213,7 +213,7 @@ class TeachRecorder:
         viz_str = " + 3D-Viz" if self._viz else ""
         print(f"\n🔴 AUFNAHME LÄUFT ({self._hz} Hz, Schwelle: {self._threshold}°{comp_str}{viz_str})")
         print(f"   Bewege den Arm jetzt!")
-        print(f"   [ENTER] = Stopp | [g] = Gripper toggle")
+        print(f"   [ENTER] = Stopp | [g] = Gripper toggle | [l] = LED toggle")
         print(f"   {'─' * 24}")
 
     def _record_point(self, pos: dict, force: bool = False) -> bool:
@@ -284,6 +284,17 @@ class TeachRecorder:
                             elapsed = time.time() - self._rec_start_time
                             self._waypoints.append({"t": round(elapsed, 4), "cmd": "GRIPPER_OPEN"})
                             print(f"\n   ✋ Gripper AUF [{elapsed:.2f}s]")
+                    elif ch == 'l':
+                        # Toggle LED
+                        if not hasattr(self, '_led_on'):
+                            self._led_on = True  # LED starts ON (default after connect)
+                        self._led_on = not self._led_on
+                        brightness = 255 if self._led_on else 0
+                        self._arm.send_cmd({"T": 114, "led": brightness})
+                        elapsed = time.time() - self._rec_start_time
+                        self._waypoints.append({"t": round(elapsed, 4), "cmd": "LED_ON" if self._led_on else "LED_OFF"})
+                        print(f"\n   💡 LED {'AN' if self._led_on else 'AUS'} [{elapsed:.2f}s]")
+
 
                 # Position lesen
                 self._sample_counter += 1
@@ -427,6 +438,10 @@ class TeachRecorder:
                     lines.append(f"GRIPPER CLOSE t={wp['t']:.4f}")
                 elif wp["cmd"] == "GRIPPER_OPEN":
                     lines.append(f"GRIPPER OPEN t={wp['t']:.4f}")
+                elif wp["cmd"] == "LED_ON":
+                    lines.append(f"LED ON t={wp['t']:.4f}")
+                elif wp["cmd"] == "LED_OFF":
+                    lines.append(f"LED OFF t={wp['t']:.4f}")
             else:
                 lines.append(
                     f"MOVE b={wp['b']:.2f} s={wp['s']:.2f} "
