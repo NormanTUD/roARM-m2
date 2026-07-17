@@ -534,6 +534,17 @@ DataTable {
 RichLog {
     scrollbar-gutter: stable;
 }
+
+#teach-left {
+    width: 2fr;
+    height: 1fr;
+}
+
+#teach-right {
+    width: 1fr;
+    height: auto;
+    max-height: 100%;
+}
 """
 
 # ============================================================
