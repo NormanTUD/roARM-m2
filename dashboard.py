@@ -1057,6 +1057,7 @@ class RoArmDashboard(App):
         Binding("w", "rotate_up", "Rot↑", show=False),
         Binding("s", "rotate_down", "Rot↓", show=False),
         Binding("r", "read_position", "Read Pos", show=True),
+        Binding("escape", "emergency_stop", "E-STOP", show=True, priority=True),
     ]
 
     # --- Reactive State ---
@@ -1094,6 +1095,14 @@ class RoArmDashboard(App):
 
         # Recording elapsed timer
         self._recording_elapsed_timer: Optional[Timer] = None
+
+    def action_emergency_stop(self):
+        """Immediate halt: stop all motion, torque off, cancel all workers."""
+        self.playing = False
+        self.recording = False
+        if self._arm:
+            self._arm.torque_off()  # or send stop command
+        self._log_teach("[bold red]🚨 EMERGENCY STOP[/]")
 
     @property
     def _active_arm(self):
