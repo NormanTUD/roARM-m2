@@ -1295,6 +1295,7 @@ class RoArmDashboard(App):
 
     def __init__(self):
         super().__init__()
+
         self._arm: Optional[RoArmConnection] = None
         self._sim_arm: Optional[SimulatedArm] = None
         self._simulation_mode = False
@@ -1324,7 +1325,7 @@ class RoArmDashboard(App):
         self._recording_elapsed_timer: Optional[Timer] = None
 
         self._led_on = False
-        self._gravity_comp_enabled = args.gravity_comp
+        self._gravity_comp_enabled = args.enable_gravity_comp
         self._speed_factor = 1.0
         self._loop_enabled = False
         self._loop_pause_s = 0.0
