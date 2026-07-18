@@ -135,6 +135,9 @@ GRAVITY_COMP_SETTLE_MS = 30
 MAX_TRACKING_ERROR = 15.0
 
 MAX_DEG_PER_TICK = 1.5  # Max 1.5° pro 20ms Tick = 75°/s (Servo-Limit ~60°/s)
+LOOKAHEAD_MS = 40  # 2 Frames voraus
+MIN_DELTA_DEG = 0.0  # Jeden Frame senden, auch wenn kaum Bewegung
+
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
 # ============================================================
@@ -154,7 +157,6 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 RECORD_HZ = 50
 MOVE_THRESHOLD_DEG = 0.1
 STREAM_HZ = 50
-MIN_DELTA_DEG = 0.02
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2885,13 +2887,11 @@ class RoArmDashboard(App):
             if max_delta < MIN_DELTA_DEG:
                 return False, commands_sent, skipped + 1
 
-            # Dynamische Speed/Acc basierend auf Delta
-            # Kein Clamping mehr! Die Auto-Speed-Reduktion sorgt dafür
-            # dass max_delta nie zu groß wird.
-            spd = min(80, max(30, int(max_delta * 20)))
-            acc = min(50, max(20, int(max_delta * 12)))
-        else:
-            spd, acc = 50, 30
+        # FIX: Konstant hohe Speed/Acc damit der Servo NICHT zwischen
+        # Wegpunkten abbremst. Der Servo soll das Ziel "überschießen"
+        # wollen, bevor der nächste Command kommt.
+        spd = 0  # 0 = maximale Geschwindigkeit (bei vielen Servo-Controllern)
+        acc = 0  # 0 = maximale Beschleunigung
 
         if rate_limiter:
             rate_limiter.acquire()
