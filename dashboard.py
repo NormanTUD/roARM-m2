@@ -1738,12 +1738,10 @@ class RoArmDashboard(App):
                                         variant="default"
                                     )
 
-                                    yield Input(value="1.0", id="play-speed-input", type="number")
                                     yield Input(value="0", id="play-loop-pause-input", type="number")
                                     yield Label("Speed:", classes="joint-label")
                                     yield Input(value="1.0", id="play-speed-input", type="number")
                                     yield Label("Loop Pause (s):", classes="joint-label")
-                                    yield Input(value="0", id="play-loop-pause-input", type="number")
 
                             with Vertical():
                                 yield Label("📁 Recordings:", classes="joint-label")
