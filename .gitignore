@@ -221,3 +221,4 @@ recordings/
 trained_models/
 teach_recordings/
 old_recordings
+logs
