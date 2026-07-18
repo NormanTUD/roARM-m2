@@ -1698,24 +1698,15 @@ class RoArmDashboard(App):
                                 )
                                 yield TimelineWidget(id="play-timeline")
                                 with Horizontal(classes="control-buttons"):
-                                    yield Button(
-                                        "▶ Play [Space]", id="btn-play-start",
-                                        classes="btn-play", variant="success"
-                                    )
-                                    yield Button(
-                                        "⏹ Stop [Space]", id="btn-play-stop",
-                                        classes="btn-stop", variant="warning",
-                                        disabled=True
-                                    )
-                                    yield Button(
-                                        "🔁 Loop", id="btn-play-loop",
-                                        variant="default"
-                                    )
-
-                                yield Input(value="0", id="play-loop-pause-input", type="number")
-                                yield Label("Speed:", classes="joint-label")
-                                yield Input(value="1.0", id="play-speed-input", type="number")
-                                yield Label("Loop Pause (s):", classes="joint-label")
+                                    yield Button("▶ Play [Space]", id="btn-play-start",
+                                                 classes="btn-play", variant="success")
+                                    yield Button("⏹ Stop [Space]", id="btn-play-stop",
+                                                 classes="btn-stop", variant="warning", disabled=True)
+                                    yield Button("🔁 Loop", id="btn-play-loop", variant="default")
+                                    yield Label("Speed:", classes="joint-label")
+                                    yield Input(value="1.0", id="play-speed-input", type="number")
+                                    yield Label("Loop Pause (s):", classes="joint-label")
+                                    yield Input(value="0", id="play-loop-pause-input", type="number")
 
                             with Vertical():
                                 yield Label("📁 Recordings:", classes="joint-label")
@@ -3483,6 +3474,7 @@ class RoArmDashboard(App):
         self.action_torque_release()
 
     def _servo_go(self, joint: str):
+        """Moves a single servo to the specified angle."""
         arm = self._active_arm
         if arm is None:
             self._log_servo("[red]Nicht verbunden und keine Simulation![/]")
@@ -3498,17 +3490,14 @@ class RoArmDashboard(App):
         pos = self._current_pos.copy()
         pos[joint] = angle
 
-        # === NEU: Sofort die View mit den Zielwerten updaten ===
         self._current_pos = pos
         self._update_arm_views(pos)
         self._update_joint_displays(pos)
         self._update_servo_readouts(pos)
 
-        # === NEU: Warnung wenn nicht physisch verbunden ===
         if self._is_sim:
             self._log_servo(
-                "[bold yellow]⚠ SIMULATION – Kein realer Arm angeschlossen! "
-                "Angezeigte Position ist NICHT der echte Arm.[/]"
+                "[bold yellow]⚠ SIMULATION – Kein realer Arm angeschlossen![/]"
             )
 
         arm.torque_on()
@@ -3516,7 +3505,19 @@ class RoArmDashboard(App):
         self._update_status_torque(True)
         time.sleep(0.1)
 
-        # ... rest bleibt gleich
+        arm.move_to(pos["b"], pos["s"], pos["e"], pos["h"], spd=20, acc=10)
+
+        self._start_activity(f"Moving {joint.upper()}", "🎯")
+
+        sim_tag = " (sim)" if self._is_sim else ""
+        self._log_servo(
+            f"[green]🎯 {joint.upper()} → {angle:.2f}°{sim_tag}[/]"
+        )
+
+        if self._is_sim:
+            self.set_timer(0.5, self._servo_read_after_move)
+        else:
+            self.set_timer(1.5, self._servo_read_after_move)
 
     def _servo_read_after_move(self):
         """Liest Position nach einem Servo-Move."""
