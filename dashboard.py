@@ -1653,6 +1653,9 @@ class RoArmDashboard(App):
             except Exception:
                 table.add_row(rec.name, "?", "?", "?")
 
+        if table.row_count > 0:
+            table.move_cursor(row=0)
+
     # ============================================================
     # LOGGING HELPERS
     # ============================================================
