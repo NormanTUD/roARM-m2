@@ -132,6 +132,7 @@ GRIPPER_LENGTH = 80.0    # Gripper-Länge (Teil des Unterarm-Segments)
 ENDPOINT_SPEEDS = [(8, 4), (5, 2), (3, 1)]
 ENDPOINT_SETTLE_WAIT = 0.8
 GRAVITY_COMP_SETTLE_MS = 30
+MAX_TRACKING_ERROR = 15.0
 
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
@@ -1390,7 +1391,6 @@ class RoArmDashboard(App):
                                commands_sent: int) -> Optional[float]:
         """Periodically checks tracking error. Returns error or None."""
         FEEDBACK_INTERVAL = max(1, STREAM_HZ // 2)
-        MAX_TRACKING_ERROR = 8.0
         if commands_sent % FEEDBACK_INTERVAL != 0 or commands_sent <= FEEDBACK_INTERVAL:
             return None
         try:
@@ -2819,18 +2819,23 @@ class RoArmDashboard(App):
     def _send_if_changed(self, arm, corrected: dict, last_pos: Optional[dict],
                          commands_sent: int, skipped: int,
                          rate_limiter, is_sim: bool, interval: float) -> tuple:
-        """Sends command only if position changed enough."""
         if last_pos:
             max_delta = max(abs(corrected[j] - last_pos[j])
                             for j in ["b", "s", "e", "h"])
             if max_delta < MIN_DELTA_DEG:
                 return False, commands_sent, skipped + 1
+            # Dynamische Speed basierend auf Delta
+            spd = min(80, max(30, int(max_delta * 15)))
+            acc = min(50, max(20, int(max_delta * 10)))
+        else:
+            spd, acc = 50, 30
+        
         if rate_limiter:
             rate_limiter.acquire()
         arm.move_to_fast(
             corrected["b"], corrected["s"],
             corrected["e"], corrected["h"],
-            spd=50, acc=30
+            spd=spd, acc=acc
         )
         if is_sim:
             self._sim_arm.step_simulation(interval)
