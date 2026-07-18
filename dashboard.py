@@ -1245,6 +1245,9 @@ class RoArmDashboard(App):
     SUB_TITLE = "Teach · Play · Calibrate · Servo · Logs"
     CSS = CSS
 
+    ENDPOINT_SPEEDS = [(8, 4), (5, 2), (3, 1)]
+    ENDPOINT_SETTLE_WAIT = 0.8
+
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("1", "switch_tab('teach')", "Teach", show=True),
@@ -2990,17 +2993,62 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
 
+    def _precision_endpoint_real(self, arm, final_corrected: dict):
+        """Drives to endpoint with multiple passes for precision."""
+        for spd, acc in ENDPOINT_SPEEDS:
+            arm.move_to(
+                final_corrected["b"], final_corrected["s"],
+                final_corrected["e"], final_corrected["h"],
+                spd=spd, acc=acc
+            )
+            time.sleep(ENDPOINT_SETTLE_WAIT)
+
+    def _precision_endpoint_sim(self, arm, final_corrected: dict):
+        """Precision endpoint for simulation mode."""
+        arm.move_to(
+            final_corrected["b"], final_corrected["s"],
+            final_corrected["e"], final_corrected["h"],
+            spd=5, acc=2
+        )
+        for _ in range(100):
+            time.sleep(0.02)
+            self._sim_arm.step_simulation(0.02)
+            if not self._sim_arm.is_moving:
+                break
+
+    def _verify_endpoint(self, arm, final_target: dict) -> Optional[float]:
+        """Reads final position and returns max error in degrees."""
+        time.sleep(0.3)
+        pos = arm.read_position_deg()
+        if pos is None:
+            return None
+        err = max(abs(pos[j] - final_target[j]) for j in ["b", "s", "e", "h"])
+        self.app.call_from_thread(
+            self._log_play,
+            f"[dim]  Endposition: Fehler={err:.3f}° "
+            f"(b={pos['b']:.2f} s={pos['s']:.2f} e={pos['e']:.2f})[/]"
+        )
+        return err
+
+    def _graceful_stop(self, arm_raw, last_commanded: dict):
+        """Executes a graceful stop instead of hard torque-off."""
+        from safety import GracefulStop
+        if last_commanded and arm_raw:
+            GracefulStop.execute(arm_raw, last_commanded)
+
+
     def _stop_playback(self):
-        """Stoppt das Playback."""
+        """Stops playback gracefully."""
         self.playing = False
+        if self._arm and hasattr(self, '_last_play_commanded'):
+            self._graceful_stop(self._arm, self._last_play_commanded)
         self._stop_activity("⏹ Stopped")
-        self._log_play("[yellow]⏹ Playback gestoppt[/]")
+        self._log_play("[yellow]⏹ Playback gestoppt (graceful)[/]")
         try:
             self.query_one("#btn-play-start", Button).disabled = False
             self.query_one("#btn-play-stop", Button).disabled = True
         except NoMatches:
             pass
-        # Clear stop message after 3 seconds
         self.set_timer(3.0, lambda: self._stop_activity())
 
     # ============================================================
