@@ -1308,6 +1308,22 @@ class RoarmFileViewer(Static):
         self._context_lines: int = 10
         self._parsed_lines: list[dict] = []  # Vorparsed für schnelles Matching
 
+
+    def set_finished(self):
+        """Setzt den Viewer auf 'fertig' – zeigt die letzte Zeile und dann Reset."""
+        if self._parsed_lines:
+            # Zeige die allerletzte MOVE-Zeile als aktiv
+            for i in range(len(self._parsed_lines) - 1, -1, -1):
+                if self._parsed_lines[i]["type"] == "MOVE":
+                    self._current_line_idx = i
+                    break
+            self._refresh_display()
+
+    def reset(self):
+        """Setzt den Viewer zurück zum Anfang (für nächsten Playback oder Loop)."""
+        self._current_line_idx = -1
+        self._refresh_display()
+
     def load_file(self, filepath: str):
         """Lädt die .roarm-Datei und parst alle Zeilen vor."""
         with open(filepath, 'r') as f:
@@ -1538,6 +1554,15 @@ class RoArmDashboard(App):
         self._safe_arm: Optional[object] = None
         self._watchdog: Optional[object] = None
         self._current_monitor: Optional[object] = None
+
+    def _reset_file_viewer(self):
+        """Setzt den File-Viewer zurück zum Anfang."""
+        try:
+            file_viewer = self.query_one("#roarm-file-viewer", RoarmFileViewer)
+            file_viewer.reset()
+        except NoMatches:
+            pass
+
 
     def _setup_safety_layer(self, arm: RoArmConnection):
         """Wraps the raw arm connection in safety layers."""
@@ -3134,6 +3159,19 @@ class RoArmDashboard(App):
         if not is_sim and self._last_play_commanded:
             final_target = self._last_play_commanded
             err = self._verify_endpoint(arm, final_target)
+        
+        # ✅ FIX: File-Viewer auf letzte Zeile setzen, dann nach 2s resetten
+        try:
+            file_viewer = self.query_one("#roarm-file-viewer", RoarmFileViewer)
+            file_viewer.set_finished()
+            # Nach 2 Sekunden zurück zum Anfang
+            self.call_from_thread(
+                self.set_timer, 2.0,
+                lambda: self._reset_file_viewer()
+            )
+        except NoMatches:
+            pass
+
         self.call_from_thread(
             self._stop_activity, "✅ Playback complete")
         self.call_from_thread(self._playback_finished)
@@ -3164,6 +3202,13 @@ class RoArmDashboard(App):
                 self.call_from_thread(
                     self._log_play, f"[dim]⏸ Loop-Pause: {pause_s:.1f}s[/]")
                 time.sleep(pause_s)
+
+            # ✅ FIX: Viewer resetten für neuen Loop-Durchlauf
+            try:
+                self.call_from_thread(self._reset_file_viewer)
+            except Exception:
+                pass
+
             self.playing = True
             cal_model = self._load_calibration_model(is_sim)
             trajectory = SmoothTrajectory(waypoints, self._get_play_speed())
@@ -3739,13 +3784,20 @@ class RoArmDashboard(App):
             self._sim_arm.torque_off()
         self._stop_activity("⏹ Stopped")
         self._log_play("[yellow]⏹ Playback gestoppt (graceful)[/]")
+        
+        # ✅ FIX: File-Viewer resetten bei manuellem Stop
+        try:
+            file_viewer = self.query_one("#roarm-file-viewer", RoarmFileViewer)
+            file_viewer.reset()
+        except NoMatches:
+            pass
+        
         try:
             self.query_one("#btn-play-start", Button).disabled = False
             self.query_one("#btn-play-stop", Button).disabled = True
         except NoMatches:
             pass
         self.set_timer(3.0, lambda: self._stop_activity())
-
 
     # ============================================================
     # CALIBRATE MODE
