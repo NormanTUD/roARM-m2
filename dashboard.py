@@ -110,6 +110,9 @@ with spinner("Importing safety..."):
 with spinner("Importing Pillow..."):
     from PIL import Image
 
+with spinner("Importing CalibrationModel..."):
+    from calibrate import CalibrationModel
+
 parser = argparse.ArgumentParser(description="Robot Control Script")
 
 parser.add_argument(
@@ -1619,7 +1622,6 @@ class RoArmDashboard(App):
             return
 
         try:
-            from calibrate import CalibrationModel
             model = CalibrationModel.load(str(cal_path))
             res = model.residuals
 
@@ -3951,7 +3953,6 @@ class RoArmDashboard(App):
             return
 
         try:
-            from calibrate import CalibrationModel
             model = CalibrationModel.load(str(cal_path))
             self._log_calibrate(
                 f"[green]✅ Kalibrierung geladen: {cal_path}[/]\n"
