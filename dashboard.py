@@ -120,6 +120,7 @@ GRIPPER_LENGTH = 80.0    # Gripper-Länge (Teil des Unterarm-Segments)
 
 ENDPOINT_SPEEDS = [(8, 4), (5, 2), (3, 1)]
 ENDPOINT_SETTLE_WAIT = 0.8
+GRAVITY_COMP_SETTLE_MS = 30
 
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
@@ -1276,8 +1277,6 @@ class RoArmDashboard(App):
     playing = reactive(False)
     torque_on_state = reactive(True)
 
-    GRAVITY_COMP_SETTLE_MS = 30
-
     def __init__(self):
         super().__init__()
         self._arm: Optional[RoArmConnection] = None
@@ -1308,9 +1307,6 @@ class RoArmDashboard(App):
         # Recording elapsed timer
         self._recording_elapsed_timer: Optional[Timer] = None
 
-        self._teach_waypoints = []
-        self._teach_start_time = 0.0
-        self._teach_timer: Optional[Timer] = None
         self._led_on = False
         self._gravity_comp_enabled = True
         self._speed_factor = 1.0
@@ -1318,9 +1314,6 @@ class RoArmDashboard(App):
         self._loop_pause_s = 0.0
 
         # New state variables for enhanced features
-        self._led_on = False
-        self._gravity_comp_enabled = True
-        self._speed_factor = 1.0
         self._last_play_commanded: Optional[dict] = None
         self._safe_arm: Optional[object] = None
         self._watchdog: Optional[object] = None
@@ -1417,24 +1410,9 @@ class RoArmDashboard(App):
         self.playing = False
         if self._arm:
             self._arm.torque_off()
-        self.app.call_from_thread(
+        self.call_from_thread(
             self._log_play, f"[bold red]🚨 E-STOP: {reason}[/]"
         )
-
-    def action_led_toggle(self) -> None:
-        """Toggles the LED on/off and records the event."""
-        arm = self._active_arm
-        if arm is None:
-            return
-        self._led_on = not getattr(self, '_led_on', False)
-        brightness = 255 if self._led_on else 0
-        if hasattr(arm, 'send_cmd'):
-            arm.send_cmd({"T": 114, "led": brightness})
-        self._log_teach(f"[bold]💡 LED {'AN' if self._led_on else 'AUS'}[/]")
-        if self.recording:
-            elapsed = time.time() - self._teach_start_time
-            cmd = "LED_ON" if self._led_on else "LED_OFF"
-            self._teach_waypoints.append({"t": round(elapsed, 4), "cmd": cmd})
 
 
     def _teach_read_position(self, arm) -> Optional[dict]:
@@ -3073,9 +3051,11 @@ class RoArmDashboard(App):
     def _graceful_stop(self, arm_raw, last_commanded: dict):
         """Executes a graceful stop instead of hard torque-off."""
         from safety import GracefulStop
-        if last_commanded and arm_raw:
-            GracefulStop.execute(arm_raw, last_commanded)
-
+        if not last_commanded or not arm_raw:
+            return
+        # SafeArm hat ._arm_raw, RoArmConnection ist direkt nutzbar
+        raw = getattr(arm_raw, '_arm_raw', arm_raw)
+        GracefulStop.execute(raw, last_commanded)
 
     def _stop_playback(self):
         """Stops playback gracefully."""
@@ -3179,7 +3159,7 @@ class RoArmDashboard(App):
 
     def _cal_log(self, msg: str):
         """Thread-safe calibration log."""
-        self.app.call_from_thread(self._log_calibrate, msg)
+        self.call_from_thread(self._log_calibrate, msg)
 
     def _log_cal_pose_validation(self, valid: list, all_poses: list):
         """Logs pose validation results."""
@@ -3269,6 +3249,33 @@ class RoArmDashboard(App):
                     f"Δs={repeat_err['s']:.3f}° Δe={repeat_err['e']:.3f}°[/]"
                 )
 
+    def _cal_run_manual_verification(self, arm, commanded: list,
+                                      errors: list, diagnostics: dict) -> tuple:
+        """Runs manual verification if manual points were previously collected."""
+        from calibrate import integrate_manual_points
+        manual_path = Path("calibration") / "manual_points.json"
+        if not manual_path.exists():
+            return commanded, errors
+        try:
+            with open(manual_path, 'r') as f:
+                manual_points = json.load(f)
+            if manual_points:
+                old_count = len(commanded)
+                commanded, errors = integrate_manual_points(
+                    commanded, errors, manual_points, weight=2.0
+                )
+                self._cal_log(
+                    f"[green]  ✓ {len(commanded) - old_count} manuelle Punkte "
+                    f"integriert (×2 Gewichtung)[/]"
+                )
+                diagnostics["manual_verification"] = {
+                    "n_points": len(manual_points),
+                    "weight": 2.0,
+                }
+        except Exception as e:
+            self._cal_log(f"[yellow]  ⚠ Manuelle Punkte nicht ladbar: {e}[/]")
+        return commanded, errors
+
 
     def _cal_aggregate_pose(self, pose: dict, measurements: list,
                             commanded: list, errors: list,
@@ -3313,25 +3320,31 @@ class RoArmDashboard(App):
         from calibrate import move_from_safe_up_to_pose, JOINTS
         move_start = time.time()
         move_from_safe_up_to_pose(self._arm, pose)
-        # Precision settle
         self._arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
         result = self._arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
         settle_time = time.time() - move_start
         diagnostics["settle_times_s"].append(settle_time)
-        # Overshoot
         overshoot = self._cal_compute_overshoot(result)
         diagnostics["overshoot_deg"].append(overshoot)
-        # Read averaged position
         servo_avg = self._arm.read_position_averaged(n=10, interval=0.05)
         if not servo_avg:
             return None
-        # Noise
         diagnostics["noise_std_deg"].append({
             j: servo_avg.get(f"{j}_std", 0) for j in JOINTS
         })
         error = {j: servo_avg[j] - pose[j] for j in JOINTS}
-        # Update arm view
-        self.app.call_from_thread(self._update_arm_views, {
+        measured = {j: servo_avg[j] for j in JOINTS}
+        # Store in per_pose diagnostics
+        diagnostics["per_pose"].append({
+            "pose_index": pose_idx,
+            "repeat": rep,
+            "commanded": {j: pose[j] for j in JOINTS},
+            "measured": measured,
+            "error": error,
+            "settle_time_s": settle_time,
+            "overshoot_deg": overshoot,
+        })
+        self.call_from_thread(self._update_arm_views, {
             "b": servo_avg["b"], "s": servo_avg["s"],
             "e": servo_avg["e"], "h": servo_avg.get("h", 180.0)
         })
@@ -3339,22 +3352,21 @@ class RoArmDashboard(App):
             f"[dim]  ✓ Pose {pose_idx+1} Rep {rep+1}: "
             f"Δb={error['b']:+.2f}° Δs={error['s']:+.2f}° Δe={error['e']:+.2f}°[/]"
         )
-        return {"error": error, "measured": {j: servo_avg[j] for j in JOINTS}}
+        return {"error": error, "measured": measured}
 
 
     def _cal_update_progress(self, pose_idx: int, n_poses: int,
                              rep: int, repeats: int, count: int, total: int):
         """Updates calibration progress in UI."""
         pct = count / total * 100
-        self.app.call_from_thread(
+        self.call_from_thread(
             self._update_cal_status,
             f"Pose {pose_idx+1}/{n_poses} · Rep {rep+1}/{repeats} · {pct:.0f}%"
         )
-        self.app.call_from_thread(
+        self.call_from_thread(
             self._start_activity,
             f"Cal {pct:.0f}% P{pose_idx+1}/{n_poses}", "🎯"
         )
-
 
     @work(thread=True)
     def _run_calibration_worker(self, pose_set: str, repeats: int,
@@ -3389,6 +3401,12 @@ class RoArmDashboard(App):
             self._cal_aggregate_pose(pose, pose_measurements, commanded, errors, diagnostics, repeats)
         # Repeatability test
         self._cal_repeatability_test(valid_poses, diagnostics)
+
+        # Manual verification points (if available)
+        commanded, errors = self._cal_run_manual_verification(
+            self._arm, commanded, errors, diagnostics
+        )
+
         # Fit model
         model, residuals = self._cal_fit_model(commanded, errors, repeats)
         # Save
