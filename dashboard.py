@@ -113,6 +113,10 @@ with spinner("Importing Pillow..."):
 with spinner("Importing CalibrationModel..."):
     from calibrate import CalibrationModel
 
+
+with spinner("Importing CubicSpline..."):
+    from scipy.interpolate import CubicSpline
+
 parser = argparse.ArgumentParser(description="Robot Control Script")
 
 parser.add_argument(
@@ -271,7 +275,6 @@ class SmoothTrajectory:
 
     def _build_splines(self):
         """Creates clamped cubic splines for each joint."""
-        from scipy.interpolate import CubicSpline
         times = np.array([wp["t"] for wp in self._waypoints])
         if times[0] > 0.01:
             times = np.concatenate([[0.0, times[0] * 0.5], times])
