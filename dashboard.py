@@ -1305,29 +1305,75 @@ class RoarmFileViewer(Static):
         super().__init__(**kwargs)
         self._lines: list[str] = []
         self._current_line_idx: int = -1
-        self._context_lines: int = 8  # Zeilen über/unter der aktuellen Zeile
+        self._context_lines: int = 10
+        self._parsed_lines: list[dict] = []  # Vorparsed für schnelles Matching
 
     def load_file(self, filepath: str):
-        """Lädt die .roarm-Datei."""
+        """Lädt die .roarm-Datei und parst alle Zeilen vor."""
         with open(filepath, 'r') as f:
             self._lines = f.readlines()
         self._current_line_idx = -1
+        self._parsed_lines = []
+        for i, line in enumerate(self._lines):
+            stripped = line.strip()
+            parsed = {"type": None, "t": None, "pos": None}
+            if stripped.startswith("MOVE"):
+                parsed["type"] = "MOVE"
+                vals = {}
+                for p in stripped.split()[1:]:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        try:
+                            vals[k] = float(v)
+                        except ValueError:
+                            pass
+                parsed["t"] = vals.get("t")
+                parsed["pos"] = {
+                    "b": vals.get("b", 0),
+                    "s": vals.get("s", 0),
+                    "e": vals.get("e", 0),
+                    "h": vals.get("h", 180),
+                }
+            elif stripped.startswith("GRIPPER") or stripped.startswith("LED"):
+                parsed["type"] = "EVENT"
+                parsed["t"] = self._extract_time(stripped)
+            self._parsed_lines.append(parsed)
         self._refresh_display()
 
     def set_current_time(self, elapsed: float):
-        """Findet die Zeile die dem aktuellen Zeitpunkt entspricht und zeigt sie an."""
+        """Findet die Zeile anhand der Zeit."""
         best_idx = -1
-        for i, line in enumerate(self._lines):
-            stripped = line.strip()
-            if stripped.startswith("MOVE") or stripped.startswith("GRIPPER") or stripped.startswith("LED"):
-                # t= Wert extrahieren
-                t_val = self._extract_time(stripped)
-                if t_val is not None and t_val <= elapsed:
-                    best_idx = i
-                elif t_val is not None and t_val > elapsed:
-                    break  # Zeilen sind chronologisch sortiert
+        for i, parsed in enumerate(self._parsed_lines):
+            if parsed["t"] is not None and parsed["t"] <= elapsed:
+                best_idx = i
+            elif parsed["t"] is not None and parsed["t"] > elapsed:
+                break
 
         if best_idx != self._current_line_idx:
+            self._current_line_idx = best_idx
+            self._refresh_display()
+
+    def set_current_line_by_position(self, pos: dict):
+        """Findet die nächste Zeile anhand der aktuellen Gelenkposition.
+        
+        Robuster als Zeit-basiert, weil es unabhängig von Speed-Faktor funktioniert.
+        """
+        best_idx = -1
+        best_dist = float('inf')
+
+        for i, parsed in enumerate(self._parsed_lines):
+            if parsed["type"] != "MOVE" or parsed["pos"] is None:
+                continue
+            # Euklidische Distanz im Gelenkraum
+            dist = sum(
+                (pos.get(j, 0) - parsed["pos"].get(j, 0)) ** 2
+                for j in ["b", "s", "e", "h"]
+            )
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        if best_idx != self._current_line_idx and best_idx >= 0:
             self._current_line_idx = best_idx
             self._refresh_display()
 
@@ -1342,7 +1388,7 @@ class RoarmFileViewer(Static):
         return None
 
     def _refresh_display(self):
-        """Rendert die Datei mit Kontext um die aktuelle Zeile."""
+        """Rendert die Datei mit Kontext um die aktuelle Zeile – zentriert."""
         if not self._lines:
             self.update("[dim]Keine Datei geladen[/]")
             return
@@ -1350,53 +1396,66 @@ class RoarmFileViewer(Static):
         idx = self._current_line_idx
         total = len(self._lines)
 
-        # Fenster berechnen: context_lines über und unter der aktuellen Zeile
-        start = max(0, idx - self._context_lines)
-        end = min(total, idx + self._context_lines + 1)
-
-        # Falls noch kein aktiver Index, zeige den Anfang
-        if idx < 0:
+        # ✅ Fenster ZENTRIERT um die aktuelle Zeile
+        context = self._context_lines
+        if idx >= 0:
+            start = max(0, idx - context)
+            end = min(total, idx + context + 1)
+        else:
             start = 0
-            end = min(total, self._context_lines * 2)
+            end = min(total, context * 2)
 
         output_parts = []
-        output_parts.append(
-            f"[bold cyan]📄 .roarm Datei[/] "
-            f"[dim]Zeile {idx + 1 if idx >= 0 else '-'}/{total}[/]\n"
-        )
-        output_parts.append("─" * 50 + "\n")
+
+        # Header mit Fortschritt
+        if idx >= 0:
+            progress_pct = (idx / max(total - 1, 1)) * 100
+            progress_bar_w = 30
+            filled = int(progress_pct / 100 * progress_bar_w)
+            bar = "█" * filled + "░" * (progress_bar_w - filled)
+            output_parts.append(
+                f"[bold cyan]📄 .roarm[/] "
+                f"[dim]Zeile[/] [bold white]{idx + 1}[/][dim]/{total}[/] "
+                f"[dim]{bar}[/] [bold]{progress_pct:.0f}%[/]\n"
+            )
+        else:
+            output_parts.append(
+                f"[bold cyan]📄 .roarm[/] [dim]Warte auf Start...[/]\n"
+            )
+
+        output_parts.append("─" * 54 + "\n")
 
         for i in range(start, end):
             line_content = self._lines[i].rstrip()
             line_num = f"{i + 1:4d}"
 
             if i == idx:
-                # ▶ Aktuelle Zeile hervorheben
+                # ▶ AKTUELLE ZEILE – fett hervorgehoben, zentriert
                 output_parts.append(
                     f"[bold white on dark_green] ▶ {line_num} │ {line_content} [/]\n"
                 )
-            elif i == idx + 1:
-                # Nächste Zeile (kommt als nächstes)
+            elif idx >= 0 and i == idx + 1:
+                # Nächste Zeile
                 output_parts.append(
-                    f"[yellow]   {line_num} │ {line_content}[/]\n"
+                    f"[yellow]   {line_num} │ ➤ {line_content}[/]\n"
                 )
             elif self._lines[i].strip().startswith("#"):
                 # Kommentare/Header
                 output_parts.append(
-                    f"[dim]   {line_num} │ {line_content}[/]\n"
+                    f"[dim italic]   {line_num} │ {line_content}[/]\n"
+                )
+            elif idx >= 0 and i < idx:
+                # Bereits abgespielt
+                output_parts.append(
+                    f"[dim green]   {line_num} │ ✓ {line_content}[/]\n"
                 )
             else:
-                # Bereits abgespielte oder kommende Zeilen
-                if i < idx:
-                    output_parts.append(
-                        f"[dim green]   {line_num} │ ✓ {line_content}[/]\n"
-                    )
-                else:
-                    output_parts.append(
-                        f"[dim]   {line_num} │   {line_content}[/]\n"
-                    )
+                # Kommende Zeilen
+                output_parts.append(
+                    f"[dim]   {line_num} │   {line_content}[/]\n"
+                )
 
-        output_parts.append("─" * 50)
+        output_parts.append("─" * 54)
 
         self.update("".join(output_parts))
 
@@ -3395,20 +3454,15 @@ class RoArmDashboard(App):
 
 
     def _lightweight_ui_update(self, pos: dict, elapsed: float):
-        """Minimaler UI-Update ohne schwere 3D-Berechnung.
-        
-        FIX #3: Statt alle Arm-Views + Sparklines + Timeline zu updaten,
-        updaten wir nur die Timeline und die Sparklines.
-        Der 3D-View wird nur am Ende aktualisiert.
-        """
-        # Timeline ist billig (nur Text)
+        """Minimaler UI-Update ohne schwere 3D-Berechnung."""
+        # Timeline
         try:
             timeline = self.query_one("#play-timeline", TimelineWidget)
             timeline.set_position(elapsed)
         except NoMatches:
             pass
-        
-        # Sparklines sind billig (nur Text)
+
+        # Sparklines
         self._joint_history.push(pos)
         for joint in ["b", "s", "e", "h"]:
             try:
@@ -3416,7 +3470,7 @@ class RoArmDashboard(App):
                 widget.update_value(pos[joint])
             except NoMatches:
                 pass
-        
+
         # 3D-View: NUR den Play-View updaten, und nur wenn Tab aktiv
         try:
             tabs = self.query_one(TabbedContent)
@@ -3426,9 +3480,10 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
 
+        # ✅ FIX: File-Viewer mit korrektem Parameter-Namen updaten
         try:
             file_viewer = self.query_one("#roarm-file-viewer", RoarmFileViewer)
-            file_viewer.set_current_time(ui_elapsed)
+            file_viewer.set_current_line_by_position(pos)
         except NoMatches:
             pass
 
