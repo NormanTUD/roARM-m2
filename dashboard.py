@@ -1254,8 +1254,6 @@ class RoArmDashboard(App):
     SUB_TITLE = "Teach · Play · Calibrate · Servo · Logs"
     CSS = CSS
 
-    self._rate_limiter = None
-
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("1", "switch_tab('teach')", "Teach", show=True),
@@ -1319,6 +1317,8 @@ class RoArmDashboard(App):
         self._speed_factor = 1.0
         self._loop_enabled = False
         self._loop_pause_s = 0.0
+
+        self._rate_limiter = None
 
         # New state variables for enhanced features
         self._last_play_commanded: Optional[dict] = None
