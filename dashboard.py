@@ -567,7 +567,7 @@ class BrailleCanvas:
 # ============================================================
 
 def parse_roarm_file(filepath: str) -> dict:
-    """Parses a .roarm recording file including LED events."""
+    """Parses a .roarm file including LED events."""
     waypoints = []
     events = []
     config = {"hz": 20, "threshold": 0.3, "gravity_comp": 1}
@@ -1267,6 +1267,7 @@ class RoArmDashboard(App):
         Binding("s", "rotate_down", "Rot↓", show=False),
         Binding("r", "read_position", "Read Pos", show=True),
         Binding("escape", "emergency_stop", "E-STOP", show=True, priority=True),
+        Binding("l", "led_toggle", "LED", show=False),
     ]
 
     # --- Reactive State ---
@@ -1310,12 +1311,21 @@ class RoArmDashboard(App):
         self._teach_waypoints = []
         self._teach_start_time = 0.0
         self._teach_timer: Optional[Timer] = None
-        self._gripper_open = True
         self._led_on = False
         self._gravity_comp_enabled = True
         self._speed_factor = 1.0
         self._loop_enabled = False
         self._loop_pause_s = 0.0
+
+        # New state variables for enhanced features
+        self._led_on = False
+        self._gravity_comp_enabled = True
+        self._speed_factor = 1.0
+        self._last_play_commanded: Optional[dict] = None
+        self._safe_arm: Optional[object] = None
+        self._watchdog: Optional[object] = None
+        self._current_monitor: Optional[object] = None
+
 
     def _init_safety_state(self):
         """Initializes safety-related state variables."""
@@ -1729,6 +1739,10 @@ class RoArmDashboard(App):
                                     )
 
                                     yield Input(value="1.0", id="play-speed-input", type="number")
+                                    yield Input(value="0", id="play-loop-pause-input", type="number")
+                                    yield Label("Speed:", classes="joint-label")
+                                    yield Input(value="1.0", id="play-speed-input", type="number")
+                                    yield Label("Loop Pause (s):", classes="joint-label")
                                     yield Input(value="0", id="play-loop-pause-input", type="number")
 
                             with Vertical():
@@ -2321,6 +2335,22 @@ class RoArmDashboard(App):
         elif active == "calibrate":
             self._start_calibration()
 
+    def action_led_toggle(self) -> None:
+        """Toggles LED and records the event during teach."""
+        arm = self._active_arm
+        if arm is None:
+            return
+        self._led_on = not getattr(self, '_led_on', False)
+        brightness = 255 if self._led_on else 0
+        if hasattr(arm, 'send_cmd'):
+            arm.send_cmd({"T": 114, "led": brightness})
+        self._log_teach(f"[bold]💡 LED {'AN' if self._led_on else 'AUS'}[/]")
+        if self.recording:
+            elapsed = time.time() - self._teach_start_time
+            cmd = "LED_ON" if self._led_on else "LED_OFF"
+            self._teach_waypoints.append({"t": round(elapsed, 4), "cmd": cmd})
+
+
     def action_gripper_toggle(self) -> None:
         arm = self._active_arm
         if arm is None:
@@ -2471,61 +2501,59 @@ class RoArmDashboard(App):
         self.add_class("recording-active")
 
     def _teach_poll_position(self):
+        """Polls position during teach, with optional gravity compensation."""
         if not self.recording:
             return
-
         arm = self._active_arm
         if arm is None:
             return
-
-        # In simulation mode, generate a demo trajectory
         if self._is_sim:
-            elapsed = time.time() - self._teach_start_time
-            # Generate smooth demo movement (figure-8 pattern)
-            pos = {
-                "b": 30.0 * math.sin(elapsed * 0.8),
-                "s": 20.0 * math.sin(elapsed * 0.5) + 10.0,
-                "e": 90.0 + 25.0 * math.sin(elapsed * 0.6),
-                "h": 180.0 + 15.0 * math.sin(elapsed * 0.3),
-            }
-            # Update the sim arm's internal position directly
-            with self._sim_arm._lock:
-                self._sim_arm._position = pos.copy()
+            pos = self._generate_sim_teach_position()
         else:
-            pos = arm.read_position_deg()
+            pos = self._teach_read_position(arm)
             if pos is None:
                 return
-
         self._current_pos = pos
         elapsed = time.time() - self._teach_start_time
-
-        # Schwellwert-Check
-        should_record = True
-        if self._teach_waypoints:
-            last_move = None
-            for wp in reversed(self._teach_waypoints):
-                if "cmd" not in wp:
-                    last_move = wp
-                    break
-            if last_move:
-                max_delta = max(
-                    abs(pos[j] - last_move[j]) for j in ["b", "s", "e", "h"]
-                )
-                if max_delta < MOVE_THRESHOLD_DEG:
-                    should_record = False
-
-        if should_record:
+        if self._should_record_waypoint(pos):
             self._teach_waypoints.append({
                 "t": round(elapsed, 4),
                 "b": pos["b"], "s": pos["s"],
                 "e": pos["e"], "h": pos["h"],
             })
-
-        # UI updaten
         self._update_joint_displays(pos)
         self._update_arm_views(pos)
+        self._teach_log_periodic(pos, elapsed)
 
-        # Status-Log (alle 50 Frames)
+    def _generate_sim_teach_position(self) -> dict:
+        """Generates simulated teach position (figure-8 demo)."""
+        elapsed = time.time() - self._teach_start_time
+        pos = {
+            "b": 30.0 * math.sin(elapsed * 0.8),
+            "s": 20.0 * math.sin(elapsed * 0.5) + 10.0,
+            "e": 90.0 + 25.0 * math.sin(elapsed * 0.6),
+            "h": 180.0 + 15.0 * math.sin(elapsed * 0.3),
+        }
+        with self._sim_arm._lock:
+            self._sim_arm._position = pos.copy()
+        return pos
+
+    def _should_record_waypoint(self, pos: dict) -> bool:
+        """Checks if position changed enough to record a new waypoint."""
+        if not self._teach_waypoints:
+            return True
+        last_move = None
+        for wp in reversed(self._teach_waypoints):
+            if "cmd" not in wp:
+                last_move = wp
+                break
+        if last_move is None:
+            return True
+        max_delta = max(abs(pos[j] - last_move[j]) for j in ["b", "s", "e", "h"])
+        return max_delta >= MOVE_THRESHOLD_DEG
+
+    def _teach_log_periodic(self, pos: dict, elapsed: float):
+        """Logs teach status every 50 waypoints."""
         move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
         if len(move_wps) % 50 == 0 and len(move_wps) > 0:
             sim_tag = " (sim)" if self._is_sim else ""
@@ -2534,7 +2562,6 @@ class RoArmDashboard(App):
                 f"b={pos['b']:+.1f}° s={pos['s']:+.1f}° "
                 f"e={pos['e']:+.1f}° h={pos['h']:+.1f}°[/]"
             )
-
 
     def _stop_recording(self):
         if not self.recording:
@@ -2621,7 +2648,7 @@ class RoArmDashboard(App):
 
 
     def _save_recording(self) -> Optional[str]:
-        """Saves the current recording to a .roarm file."""
+        """Saves recording with LED events and gravity comp config."""
         move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
         if not move_wps:
             return None
