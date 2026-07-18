@@ -1319,15 +1319,6 @@ class RoArmDashboard(App):
         self._watchdog: Optional[object] = None
         self._current_monitor: Optional[object] = None
 
-
-    def _init_safety_state(self):
-        """Initializes safety-related state variables."""
-        self._safe_arm: Optional['SafeArm'] = None
-        self._watchdog: Optional['SafetyWatchdog'] = None
-        self._current_monitor: Optional['CurrentMonitor'] = None
-        self._rate_limiter = None
-
-
     def _setup_safety_layer(self, arm: RoArmConnection):
         """Wraps the raw arm connection in safety layers."""
         from safety import SafeArm, SafetyLimits, SafetyWatchdog, CurrentMonitor, RateLimiter
@@ -2942,33 +2933,31 @@ class RoArmDashboard(App):
         """Full playback with SmoothTrajectory, safety, tracking, precision endpoint."""
         arm = self._active_arm
         if arm is None:
-            self.app.call_from_thread(self._log_play, "[red]Kein Arm![/]")
+            self.call_from_thread(self._log_play, "[red]Kein Arm![/]")
             self.playing = False
             return
         is_sim = self._is_sim
         speed = self._get_play_speed()
         cal_model = self._load_calibration_model(is_sim)
         trajectory = SmoothTrajectory(waypoints, speed)
-        # Pre-flight check
         if not is_sim:
             ok, violations = self._validate_trajectory(trajectory)
             if not ok:
                 trajectory = self._attempt_trajectory_repair(trajectory, violations)
                 if trajectory is None:
-                    self.app.call_from_thread(
+                    self.call_from_thread(
                         self._log_play, "[red]❌ Trajektorie unsicher![/]")
                     self.playing = False
                     return
         duration = trajectory.get_duration()
         self._move_to_start_position(arm, waypoints[0], cal_model, is_sim)
-        self.app.call_from_thread(
+        self.call_from_thread(
             self._start_activity, f"Playing ({duration:.1f}s)", "▶️")
         events = sorted(self._play_data.get("events", []), key=lambda x: x["t"])
         self._streaming_loop(arm, trajectory, duration, cal_model, events, is_sim)
         if self.playing:
             self._do_precision_endpoint(arm, trajectory, duration, cal_model, is_sim)
         self._finalize_playback(arm, is_sim, cal_model, duration)
-        # Loop handling
         if self._is_loop_enabled():
             self._run_loop(waypoints, arm, is_sim)
 
