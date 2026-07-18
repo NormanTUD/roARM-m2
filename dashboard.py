@@ -721,7 +721,9 @@ class ActivityIndicator:
         dots = self.DOTS_FRAMES[self._frame_index % len(self.DOTS_FRAMES)]
         elapsed = self.elapsed
         self._frame_index += 1
-        return f"{self._icon} {spinner} {self._message}{dots} [{elapsed:.1f}s]"
+        # Pad dots to fixed width of 3 so the elapsed time doesn't shift
+        dots_padded = f"{dots:<3}"
+        return f"{self._icon} {spinner} {self._message}{dots_padded} [{elapsed:.1f}s]"
 
 # ============================================================
 # CSS STYLESHEET
