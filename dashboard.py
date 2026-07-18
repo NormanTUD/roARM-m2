@@ -1254,6 +1254,8 @@ class RoArmDashboard(App):
     SUB_TITLE = "Teach · Play · Calibrate · Servo · Logs"
     CSS = CSS
 
+    self._rate_limiter = None
+
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("1", "switch_tab('teach')", "Teach", show=True),
@@ -1426,14 +1428,28 @@ class RoArmDashboard(App):
         arm.torque_off_fast()
         return pos
 
-
     def action_emergency_stop(self):
-        """Immediate halt: stop all motion, torque off, cancel all workers."""
+        """Immediate halt: stop all motion, torque off, cancel all."""
         self.playing = False
         self.recording = False
+        if self._teach_timer:
+            self._teach_timer.stop()
+            self._teach_timer = None
         if self._arm:
-            self._arm.torque_off()  # or send stop command
+            self._arm.torque_off()
+        if self._sim_arm:
+            self._sim_arm.torque_off()
+        self._stop_activity("🚨 E-STOP")
+        self._stop_recording_timer()
         self._log_teach("[bold red]🚨 EMERGENCY STOP[/]")
+        try:
+            self.query_one("#btn-teach-record", Button).disabled = False
+            self.query_one("#btn-teach-stop", Button).disabled = True
+            self.query_one("#btn-play-start", Button).disabled = False
+            self.query_one("#btn-play-stop", Button).disabled = True
+        except NoMatches:
+            pass
+
 
     @property
     def _active_arm(self):
@@ -2238,14 +2254,14 @@ class RoArmDashboard(App):
                 self._log_teach("[red]❌ Kein Port gefunden![/]")
 
     def _disconnect(self):
+        """Disconnects from the arm and cleans up."""
+        self._teardown_safety_layer()
         if self._arm:
             self._arm.close()
             self._arm = None
         self.connected = False
         self._log_teach("[yellow]🔌 Getrennt[/]")
         self._update_status_connection(None)
-
-        # Re-enable simulation mode
         self._enable_simulation_mode()
 
     def action_torque_release(self) -> None:
@@ -2772,12 +2788,14 @@ class RoArmDashboard(App):
     def _send_if_changed(self, arm, corrected: dict, last_pos: Optional[dict],
                          commands_sent: int, skipped: int,
                          rate_limiter, is_sim: bool, interval: float) -> tuple:
-        """Sends command only if position changed enough. Returns (sent, cmds, skips)."""
+        """Sends command only if position changed enough."""
         if last_pos:
-            max_delta = max(abs(corrected[j] - last_pos[j]) for j in ["b", "s", "e", "h"])
+            max_delta = max(abs(corrected[j] - last_pos[j])
+                            for j in ["b", "s", "e", "h"])
             if max_delta < MIN_DELTA_DEG:
                 return False, commands_sent, skipped + 1
-        rate_limiter.acquire()
+        if rate_limiter:
+            rate_limiter.acquire()
         arm.move_to_fast(
             corrected["b"], corrected["s"],
             corrected["e"], corrected["h"],
@@ -2786,6 +2804,7 @@ class RoArmDashboard(App):
         if is_sim:
             self._sim_arm.step_simulation(interval)
         return True, commands_sent + 1, skipped
+
 
     def _update_playback_ui(self, arm, corrected: dict, elapsed: float, is_sim: bool):
         """Updates UI during playback (called from worker thread)."""
@@ -2863,7 +2882,7 @@ class RoArmDashboard(App):
         """Main streaming loop: samples trajectory and sends commands."""
         from safety import RateLimiter
         interval = 1.0 / STREAM_HZ
-        rate_limiter = RateLimiter(max_hz=STREAM_HZ + 10)
+        rate_limiter = RateLimiter(max_hz=STREAM_HZ + 10) if not is_sim else None
         playback_start = time.time()
         last_pos = None
         commands_sent = 0
@@ -2884,16 +2903,15 @@ class RoArmDashboard(App):
                 elapsed = time.time() - playback_start
                 if elapsed >= duration:
                     break
+            # Sample trajectory ONCE
+            target = trajectory.sample(elapsed)
+            corrected = self._apply_calibration_static(cal_model, target)
             # Safety checks (real arm only)
             if not is_sim and self._current_monitor:
-                target = trajectory.sample(elapsed)
-                corrected = self._apply_calibration_static(cal_model, target)
                 err = self._check_tracking_error(arm, corrected, commands_sent)
                 if not self.playing:
                     break
-            # Sample + send
-            target = trajectory.sample(elapsed)
-            corrected = self._apply_calibration_static(cal_model, target)
+            # Send
             sent, commands_sent, skipped = self._send_if_changed(
                 arm, corrected, last_pos, commands_sent, skipped,
                 rate_limiter, is_sim, interval
@@ -2932,11 +2950,12 @@ class RoArmDashboard(App):
 
     @work(thread=True)
     def _run_playback(self, waypoints: list):
-        """Full playback with SmoothTrajectory, safety, tracking, precision endpoint."""
+        """Full playback with SmoothTrajectory, safety, tracking."""
         arm = self._active_arm
         if arm is None:
             self.call_from_thread(self._log_play, "[red]Kein Arm![/]")
             self.playing = False
+            self.call_from_thread(self._playback_finished)
             return
         is_sim = self._is_sim
         speed = self._get_play_speed()
@@ -2950,6 +2969,7 @@ class RoArmDashboard(App):
                     self.call_from_thread(
                         self._log_play, "[red]❌ Trajektorie unsicher![/]")
                     self.playing = False
+                    self.call_from_thread(self._playback_finished)
                     return
         duration = trajectory.get_duration()
         self._move_to_start_position(arm, waypoints[0], cal_model, is_sim)
@@ -3029,8 +3049,10 @@ class RoArmDashboard(App):
     def _stop_playback(self):
         """Stops playback gracefully."""
         self.playing = False
-        if self._arm and hasattr(self, '_last_play_commanded'):
+        if self._arm and not self._is_sim and hasattr(self, '_last_play_commanded'):
             self._graceful_stop(self._arm, self._last_play_commanded)
+        elif self._is_sim and self._sim_arm:
+            self._sim_arm.torque_off()
         self._stop_activity("⏹ Stopped")
         self._log_play("[yellow]⏹ Playback gestoppt (graceful)[/]")
         try:
@@ -3039,6 +3061,7 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
         self.set_timer(3.0, lambda: self._stop_activity())
+
 
     # ============================================================
     # CALIBRATE MODE
