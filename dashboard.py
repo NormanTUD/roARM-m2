@@ -1416,11 +1416,30 @@ class RoArmDashboard(App):
         return False
 
     def _trigger_playback_estop(self, reason: str):
-        """Triggers emergency stop during playback."""
+        """Triggers emergency stop during playback - HOLDS position."""
         self.playing = False
+        if self._arm:
+            # NICHT torque_off! Stattdessen: aktuelle Position halten
+            try:
+                pos = self._arm.read_position_deg()
+                if pos:
+                    # Arm an aktueller Position fixieren
+                    self._arm.move_to(
+                        pos["b"], pos["s"], pos["e"], pos["h"],
+                        spd=1, acc=1
+                    )
+                # Torque bleibt AN damit der Arm nicht fällt
+                self._arm.torque_on()
+            except Exception:
+                # Im Worst Case: Torque trotzdem AN lassen
+                self._arm.torque_on()
         self.call_from_thread(
             self._log_play, f"[bold red]🚨 E-STOP: {reason}[/]"
         )
+        self.call_from_thread(
+            self._log_play, "[yellow]⚠ Arm hält Position. Torque ON.[/]"
+        )
+
 
     def _teach_read_position(self, arm) -> Optional[dict]:
         if self._gravity_comp_enabled and not self._is_sim:
@@ -1449,8 +1468,6 @@ class RoArmDashboard(App):
         if self._teach_timer:
             self._teach_timer.stop()
             self._teach_timer = None
-        if self._arm:
-            self._arm.torque_off()
         if self._sim_arm:
             self._sim_arm.torque_off()
         self._stop_activity("🚨 E-STOP")
