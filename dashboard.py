@@ -714,6 +714,8 @@ RichLog {
     width: auto;
     margin: 0 1;
 }
+
+.recording-active { border: heavy red; }
 """
 
 # ============================================================
@@ -2044,6 +2046,7 @@ class RoArmDashboard(App):
             1.0 / RECORD_HZ, self._teach_poll_position
         )
 
+        self.add_class("recording-active")
 
     def _teach_poll_position(self):
         if not self.recording:
@@ -2157,6 +2160,8 @@ class RoArmDashboard(App):
 
         # Clear the final message after 3 seconds
         self.set_timer(3.0, lambda: self._stop_activity())
+
+        self.remove_class("recording-active")
 
     def _save_recording(self) -> Optional[str]:
         move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
