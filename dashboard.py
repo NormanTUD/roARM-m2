@@ -134,6 +134,7 @@ ENDPOINT_SETTLE_WAIT = 0.8
 GRAVITY_COMP_SETTLE_MS = 30
 MAX_TRACKING_ERROR = 15.0
 
+MAX_DEG_PER_TICK = 1.5  # Max 1.5° pro 20ms Tick = 75°/s (Servo-Limit ~60°/s)
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
 # ============================================================
@@ -1389,21 +1390,29 @@ class RoArmDashboard(App):
 
     def _check_tracking_error(self, arm_raw, corrected: dict,
                                commands_sent: int) -> Optional[float]:
-        """Periodically checks tracking error. Returns error or None."""
+        """Periodically checks tracking error. More tolerant at start."""
         FEEDBACK_INTERVAL = max(1, STREAM_HZ // 2)
-        if commands_sent % FEEDBACK_INTERVAL != 0 or commands_sent <= FEEDBACK_INTERVAL:
+        # Erst nach 2 Sekunden (100 commands) anfangen zu checken
+        if commands_sent < STREAM_HZ * 2:
+            return None
+        if commands_sent % FEEDBACK_INTERVAL != 0:
             return None
         try:
             actual = arm_raw.read_position_deg()
             if actual is None:
                 return None
             err = max(abs(actual[j] - corrected[j]) for j in ["b", "s", "e", "h"])
-            if err > MAX_TRACKING_ERROR:
+            # Dynamischer Threshold: am Anfang toleranter
+            threshold = MAX_TRACKING_ERROR
+            if commands_sent < STREAM_HZ * 5:  # Erste 5 Sekunden
+                threshold = MAX_TRACKING_ERROR * 2  # Doppelt so tolerant
+            if err > threshold:
                 self._trigger_playback_estop(
-                    f"Tracking Error {err:.1f}° > {MAX_TRACKING_ERROR}°")
+                    f"Tracking Error {err:.1f}° > {threshold:.1f}°")
             return err
         except Exception:
             return None
+
 
     def _check_stall_detection(self, actual_deg: dict) -> bool:
         """Checks for stalled servos. Returns True if stall detected."""
@@ -2824,12 +2833,24 @@ class RoArmDashboard(App):
                             for j in ["b", "s", "e", "h"])
             if max_delta < MIN_DELTA_DEG:
                 return False, commands_sent, skipped + 1
+            
+            # GESCHWINDIGKEITSBEGRENZUNG: Wenn Delta zu groß, interpolieren
+            if max_delta > MAX_DEG_PER_TICK:
+                # Clamp: Bewege nur MAX_DEG_PER_TICK in Richtung Ziel
+                scale = MAX_DEG_PER_TICK / max_delta
+                corrected = {
+                    j: last_pos[j] + (corrected[j] - last_pos[j]) * scale
+                    for j in ["b", "s", "e", "h"]
+                }
+                corrected = {j: round(v, 2) for j, v in corrected.items()}
+                max_delta = MAX_DEG_PER_TICK
+            
             # Dynamische Speed basierend auf Delta
             spd = min(80, max(30, int(max_delta * 15)))
             acc = min(50, max(20, int(max_delta * 10)))
         else:
             spd, acc = 50, 30
-        
+
         if rate_limiter:
             rate_limiter.acquire()
         arm.move_to_fast(
@@ -2970,7 +2991,7 @@ class RoArmDashboard(App):
 
 
     def _move_to_start_position(self, arm, first_wp: dict, cal_model, is_sim: bool):
-        """Moves arm to the first waypoint before playback starts."""
+        """Moves arm to the first waypoint and VERIFIES arrival before streaming."""
         start_corrected = self._apply_calibration_static(cal_model, first_wp)
         arm.torque_on()
         time.sleep(0.2)
@@ -2986,7 +3007,46 @@ class RoArmDashboard(App):
                 if not self._sim_arm.is_moving:
                     break
         else:
-            time.sleep(2.0)
+            # Warte bis der Arm WIRKLICH angekommen ist (nicht nur 2s blind)
+            MAX_WAIT = 8.0  # Maximal 8s warten
+            TOLERANCE = 2.0  # Innerhalb 2° ist OK
+            start_wait = time.time()
+            while time.time() - start_wait < MAX_WAIT:
+                time.sleep(0.3)
+                pos = arm.read_position_deg()
+                if pos is None:
+                    continue
+                err = max(abs(pos[j] - start_corrected[j])
+                          for j in ["b", "s", "e", "h"])
+                if err < TOLERANCE:
+                    self.call_from_thread(
+                        self._log_play,
+                        f"[green]  ✓ Startposition erreicht (err={err:.1f}°)[/]"
+                    )
+                    break
+            else:
+                # Timeout – trotzdem weitermachen aber warnen
+                pos = arm.read_position_deg()
+                if pos:
+                    err = max(abs(pos[j] - start_corrected[j])
+                              for j in ["b", "s", "e", "h"])
+                    self.call_from_thread(
+                        self._log_play,
+                        f"[yellow]⚠ Start-Timeout: err={err:.1f}° "
+                        f"(Ziel: b={start_corrected['b']:.1f} "
+                        f"s={start_corrected['s']:.1f} "
+                        f"e={start_corrected['e']:.1f})[/]"
+                    )
+                    if err > MAX_TRACKING_ERROR:
+                        self.call_from_thread(
+                            self._log_play,
+                            "[red]✗ Startposition nicht erreichbar! Abbruch.[/]"
+                        )
+                        self.playing = False
+                        return
+            # Kurze Settle-Pause nach Ankunft
+            time.sleep(0.5)
+
 
     @work(thread=True)
     def _run_playback(self, waypoints: list):
@@ -3023,6 +3083,28 @@ class RoArmDashboard(App):
             events = sorted(
                 self._play_data.get("events", []),
                 key=lambda x: x["t"])
+
+            max_speed_in_recording = 0.0
+            for i in range(1, len(waypoints)):
+                dt = waypoints[i]["t"] - waypoints[i-1]["t"]
+                if dt > 0.001:
+                    for j in ["b", "s", "e", "h"]:
+                        speed = abs(waypoints[i][j] - waypoints[i-1][j]) / dt
+                        max_speed_in_recording = max(max_speed_in_recording, speed)
+
+            SERVO_MAX_SPEED = 60.0  # °/s - konservatives Servo-Limit
+            if max_speed_in_recording > SERVO_MAX_SPEED:
+                auto_speed = SERVO_MAX_SPEED / max_speed_in_recording
+                if auto_speed < speed:
+                    speed = auto_speed
+                    self.call_from_thread(
+                        self._log_play,
+                        f"[yellow]⚠ Speed auto-reduziert auf {speed:.2f}x "
+                        f"(Recording enthält {max_speed_in_recording:.0f}°/s, "
+                        f"Servo-Max: {SERVO_MAX_SPEED}°/s)[/]"
+                    )
+                    trajectory = SmoothTrajectory(waypoints, speed)
+
             self._streaming_loop(
                 arm, trajectory, duration,
                 cal_model, events, is_sim)
