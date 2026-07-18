@@ -461,15 +461,35 @@ class RoArmConnection:
             return response
 
     def send_cmd_fast(self, cmd: dict):
-        """Sendet Befehl OHNE auf Antwort zu warten (für Streaming)."""
-        with self._lock:
-            msg = json.dumps(cmd, separators=(',', ':'))
-            
-            # >>> LOGGING: Fast-Send
-            self._log.debug(f"SEND_FAST| {msg}")
-            
-            self._ser.write(msg.encode() + b'\n')
-            self._ser.flush()
+        """Sendet Befehl OHNE auf Antwort zu warten (für Streaming).
+        
+        KEIN Lock hier! Streaming hat exklusiven Zugriff während Playback.
+        Der Lock wird nur für send_cmd (mit Antwort) verwendet.
+        """
+        msg = json.dumps(cmd, separators=(',', ':'))
+        self._ser.write(msg.encode() + b'\n')
+        # KEIN flush() — lässt den OS-Buffer batchen für weniger USB-Overhead
+        # self._ser.flush()  # ENTFERNT!
+
+    def enter_streaming_mode(self):
+        """Bereitet die serielle Verbindung für High-Speed-Streaming vor.
+
+        - Erhöht Write-Buffer
+        - Deaktiviert unnötige Reads
+        - Flusht alten Input-Buffer
+        """
+        self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
+        # Setze Timeout auf 0 (non-blocking) während Streaming
+        self._ser.timeout = 0
+        self._streaming = True
+
+    def exit_streaming_mode(self):
+        """Stellt normale Kommunikation wieder her."""
+        self._ser.timeout = SERIAL_TIMEOUT
+        self._ser.flush()
+        self._streaming = False
+        time.sleep(0.05)  # Servo Zeit geben letzten Command zu verarbeiten
 
     # ----------------------------------------------------------
     # POSITION LESEN

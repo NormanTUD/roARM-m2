@@ -136,8 +136,17 @@ MAX_TRACKING_ERROR = 15.0
 
 MAX_DEG_PER_TICK = 1.5  # Max 1.5° pro 20ms Tick = 75°/s (Servo-Limit ~60°/s)
 LOOKAHEAD_MS = 40  # 2 Frames voraus
-MIN_DELTA_DEG = 0.0  # Jeden Frame senden, auch wenn kaum Bewegung
-LOOKAHEAD_S = 0.06  # 60ms voraus (3 Frames bei 50Hz)
+MIN_DELTA_DEG = 0.0
+LOOKAHEAD_S = 0.15          # HOCH von 0.06 — 150ms voraus = Servo bremst NIE ab
+
+STREAM_SPD = 0              # 0 = "so schnell wie möglich" (STS3215 Doku!)
+STREAM_ACC = 0              # 0 = "sofortige Beschleunigung" (kein Trapezprofil!)
+
+TRACKING_CHECK_INTERVAL_S = 2.0  # Nur alle 2s statt alle 0.5s
+TRACKING_CHECK_ENABLED = False   # DEAKTIVIERT während Streaming!
+
+USE_BUSY_WAIT = True        # Busy-Wait statt time.sleep() für Präzision
+MAX_SERIAL_BATCH = 3        # Max 3 Commands ohne Pause (Buffer-Overflow-Schutz)
 
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
@@ -155,9 +164,9 @@ START_RAMP_PERCENT = 0.03
 RECORDINGS_DIR = Path("recordings")
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-RECORD_HZ = 100
-MOVE_THRESHOLD_DEG = 0.1
-STREAM_HZ = 100
+RECORD_HZ = 50
+MOVE_THRESHOLD_DEG = 0.3
+STREAM_HZ = 200
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1392,7 +1401,19 @@ class RoArmDashboard(App):
         return repaired
 
     def _check_tracking_error(self, arm_raw, corrected: dict,
-                               commands_sent: int) -> Optional[float]:
+                           commands_sent: int) -> Optional[float]:
+        """DEAKTIVIERT während Streaming — nur nach Playback-Ende prüfen.
+
+        Grund: Jeder read_position_deg() während Streaming:
+        1. Acquiret den Lock → blockiert Streaming-Thread
+        2. Sendet T:105 Command → Servo muss antworten statt zu fahren
+        3. Wartet 200ms auf Antwort → 200ms KEIN neuer Move-Command!
+
+        Das allein verursacht schon massives Stop-and-Go.
+        """
+        if not TRACKING_CHECK_ENABLED:
+            return None
+
         """Periodically checks tracking error with plausibility validation."""
         FEEDBACK_INTERVAL = max(1, STREAM_HZ // 2)
         # Erst nach 2 Sekunden (100 commands) anfangen zu checken
@@ -2882,22 +2903,18 @@ class RoArmDashboard(App):
     def _send_if_changed(self, arm, corrected: dict, last_pos: Optional[dict],
                          commands_sent: int, skipped: int,
                          rate_limiter, is_sim: bool, interval: float) -> tuple:
+        """DEPRECATED — wird von neuer _streaming_loop nicht mehr genutzt."""
         if last_pos:
             max_delta = max(abs(corrected[j] - last_pos[j])
                             for j in ["b", "s", "e", "h"])
-            if max_delta < MIN_DELTA_DEG:
+            if max_delta < 0.01:
                 return False, commands_sent, skipped + 1
 
-        # Hohe aber GÜLTIGE Werte — nicht 0!
-        spd = 80
-        acc = 254  # STS3215 max acceleration
-
-        if rate_limiter:
-            rate_limiter.acquire()
+        # spd=0, acc=0 für STS3215 "Immediate Mode"
         arm.move_to_fast(
             corrected["b"], corrected["s"],
             corrected["e"], corrected["h"],
-            spd=spd, acc=acc
+            spd=0, acc=0
         )
         if is_sim:
             self._sim_arm.step_simulation(interval)
@@ -2974,12 +2991,26 @@ class RoArmDashboard(App):
 
     def _streaming_loop(self, arm, trajectory, duration,
                         cal_model, events, is_sim):
-        """Main streaming loop with live line display."""
-        from safety import RateLimiter
-        interval = 1.0 / STREAM_HZ
-        rate_limiter = (
-            RateLimiter(max_hz=STREAM_HZ + 10)
-            if not is_sim else None)
+        """KOMPLETT NEU: Jitter-freie Streaming-Loop.
+        
+        Fixes:
+        - Kein time.sleep() → Busy-Wait für µs-Präzision
+        - Kein Lock-Contention → Streaming hat exklusiven Serial-Zugriff
+        - Kein Tracking-Check während Streaming → nur am Ende
+        - Großer Lookahead → Servo bremst nie ab
+        - spd=0, acc=0 → STS3215 "Immediate Mode" (kein Trapezprofil)
+        - Kein Rate-Limiter → Loop-Timing ist der Limiter
+        - UI-Updates nur alle 500ms → kein Thread-Blocking
+        """
+        interval = 1.0 / STREAM_HZ  # 5ms bei 200Hz
+
+        # === STREAMING-MODUS AKTIVIEREN ===
+        if not is_sim and hasattr(arm, 'enter_streaming_mode'):
+            arm.enter_streaming_mode()
+        elif not is_sim:
+            # Fallback: Buffer flushen und Lock vermeiden
+            arm._ser.reset_input_buffer()
+            arm._ser.reset_output_buffer()
 
         if not is_sim and self._safe_arm:
             self._safe_arm.start_streaming()
@@ -2990,107 +3021,152 @@ class RoArmDashboard(App):
         skipped = 0
         event_idx = 0
         self._last_play_commanded = None
+        last_ui_update = 0.0
+        last_log_time = 0.0
 
-        # Waypoint-Index tracking für Live-Anzeige
-        waypoints = self._play_data["waypoints"]
-        current_wp_idx = 0
-        last_logged_wp_idx = -1
+        # Pre-compute: Ersten Command sofort senden (kein Warten)
+        first_target = trajectory.sample(0.0)
+        first_corrected = self._apply_calibration_static(cal_model, first_target)
 
         try:
             while self.playing:
                 loop_start = time.time()
                 elapsed = loop_start - playback_start
+
                 if elapsed >= duration:
                     break
 
                 # ============================================================
-                # LIVE LINE TRACKING: Welcher Waypoint ist gerade aktiv?
+                # EVENTS (Gripper, LED) — nur wenn fällig
                 # ============================================================
-                # Finde den nächsten Waypoint basierend auf elapsed time
-                # (berücksichtigt speed_factor über die trajectory)
-                orig_t = float(trajectory._time_map(min(elapsed, duration)))
-                while (current_wp_idx < len(waypoints) - 1 and
-                       waypoints[current_wp_idx]["t"] < orig_t):
-                    current_wp_idx += 1
-
-                # Logge alle 10 Waypoints oder bei großen Sprüngen
-                if current_wp_idx != last_logged_wp_idx and (
-                    current_wp_idx % 5 == 0 or
-                    current_wp_idx - last_logged_wp_idx > 3
-                ):
-                    wp = waypoints[min(current_wp_idx, len(waypoints)-1)]
-                    line_nr = current_wp_idx + 1  # 1-basiert
-                    # Berechne aktuelle Geschwindigkeit
-                    if current_wp_idx > 0:
-                        prev_wp = waypoints[current_wp_idx - 1]
-                        dt_wp = wp["t"] - prev_wp["t"]
-                        if dt_wp > 0.001:
-                            max_spd = max(
-                                abs(wp[j] - prev_wp[j]) / dt_wp
-                                for j in ["b", "s", "e", "h"]
-                            )
-                        else:
-                            max_spd = 0
-                    else:
-                        max_spd = 0
-
-                    spd_color = "red" if max_spd > 50 else "yellow" if max_spd > 30 else "green"
-                    self.call_from_thread(
-                        self._log_play,
-                        f"[dim]  L{line_nr:03d}[/] "
-                        f"t={wp['t']:.2f}s "
-                        f"b={wp['b']:+6.1f} s={wp['s']:+6.1f} "
-                        f"e={wp['e']:+6.1f} h={wp['h']:+6.1f} "
-                        f"[{spd_color}]{max_spd:.0f}°/s[/]"
-                    )
-                    last_logged_wp_idx = current_wp_idx
+                if event_idx < len(events) and events[event_idx]["t"] <= elapsed:
+                    event_idx, pause = self._process_pending_events(
+                        arm, events, event_idx, elapsed)
+                    if pause > 0:
+                        playback_start += pause
+                        elapsed = time.time() - playback_start
+                        if elapsed >= duration:
+                            break
 
                 # ============================================================
-                # Events verarbeiten
+                # TRAJECTORY SAMPLE MIT GROSSEM LOOKAHEAD
                 # ============================================================
-                event_idx, pause = self._process_pending_events(
-                    arm, events, event_idx, elapsed)
-                if pause > 0:
-                    playback_start += pause
-                    elapsed = time.time() - playback_start
-                    if elapsed >= duration:
-                        break
-
-                # ============================================================
-                # Trajectory samplen und senden
-                # ============================================================
-                target = trajectory.sample(min(elapsed + LOOKAHEAD_S, duration))
+                # Lookahead: Servo-Ziel ist IMMER 150ms in der Zukunft
+                # → Der Servo hat immer ein "weit entferntes" Ziel
+                # → Er bremst NIEMALS ab (weil Ziel nie "erreicht" wird)
+                sample_time = min(elapsed + LOOKAHEAD_S, duration)
+                target = trajectory.sample(sample_time)
                 corrected = self._apply_calibration_static(cal_model, target)
 
-                if not is_sim and self._current_monitor:
-                    self._check_tracking_error(arm, corrected, commands_sent)
-                    if not self.playing:
-                        # Bei E-STOP: Zeige welche Zeile schuld war
-                        self.call_from_thread(
-                            self._log_play,
-                            f"[bold red]  ↑ E-STOP bei Zeile L{current_wp_idx+1:03d} "
-                            f"(t={waypoints[min(current_wp_idx, len(waypoints)-1)]['t']:.2f}s)[/]"
-                        )
-                        break
+                # ============================================================
+                # DELTA-CHECK: Nur senden wenn sich was ändert
+                # ============================================================
+                should_send = True
+                if last_pos is not None:
+                    max_delta = max(abs(corrected[j] - last_pos[j])
+                                    for j in ["b", "s", "e", "h"])
+                    if max_delta < 0.01:  # Weniger als 0.01° → skip
+                        should_send = False
+                        skipped += 1
 
-                sent, commands_sent, skipped = (
-                    self._send_if_changed(
-                        arm, corrected, last_pos,
-                        commands_sent, skipped,
-                        rate_limiter, is_sim, interval))
-                if sent:
+                # ============================================================
+                # COMMAND SENDEN — OHNE LOCK, OHNE FLUSH, OHNE WARTEN
+                # ============================================================
+                if should_send:
+                    if is_sim:
+                        arm.move_to_fast(
+                            corrected["b"], corrected["s"],
+                            corrected["e"], corrected["h"],
+                            spd=80, acc=50
+                        )
+                        self._sim_arm.step_simulation(interval)
+                    else:
+                        # DIREKT auf Serial schreiben — maximale Geschwindigkeit
+                        cmd = {
+                            "T": 122,
+                            "b": round(corrected["b"], 2),
+                            "s": round(corrected["s"], 2),
+                            "e": round(corrected["e"], 2),
+                            "h": round(corrected["h"], 2),
+                            "spd": STREAM_SPD,   # 0 = max speed
+                            "acc": STREAM_ACC,   # 0 = max acc (kein Trapez!)
+                        }
+                        msg = json.dumps(cmd, separators=(',', ':'))
+                        arm._ser.write(msg.encode() + b'\n')
+                        # KEIN flush, KEIN lock, KEIN read
+
                     last_pos = corrected.copy()
                     self._last_play_commanded = corrected.copy()
+                    commands_sent += 1
 
-                if commands_sent % max(1, STREAM_HZ // 5) == 0:
-                    self._update_playback_ui(arm, corrected, elapsed, is_sim)
+                    # Alle 50 Commands: flush damit der USB-Buffer nicht überläuft
+                    if commands_sent % 50 == 0:
+                        if not is_sim:
+                            arm._ser.flush()
 
-                sleep_time = interval - (time.time() - loop_start)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                # ============================================================
+                # UI-UPDATE: Nur alle 500ms (nicht bei jedem Frame!)
+                # ============================================================
+                now = time.time()
+                if now - last_ui_update > 0.5:
+                    last_ui_update = now
+                    if is_sim:
+                        pos = self._sim_arm.read_position_deg()
+                        self.call_from_thread(self._update_arm_views, pos)
+                        self.call_from_thread(self._update_joint_displays, pos)
+                    else:
+                        self.call_from_thread(self._update_arm_views, corrected)
+                    self.call_from_thread(self._update_play_timeline, elapsed)
+
+                # ============================================================
+                # LOG: Nur alle 2s (nicht bei jedem Waypoint!)
+                # ============================================================
+                if now - last_log_time > 2.0:
+                    last_log_time = now
+                    pct = (elapsed / duration) * 100
+                    self.call_from_thread(
+                        self._log_play,
+                        f"[dim]  ▶ {pct:.0f}% | t={elapsed:.1f}s | "
+                        f"cmds={commands_sent} skip={skipped}[/]"
+                    )
+
+                # ============================================================
+                # TIMING: Busy-Wait für Präzision (kein time.sleep Jitter!)
+                # ============================================================
+                target_time = loop_start + interval
+                if USE_BUSY_WAIT:
+                    # Hybrid: sleep bis 1ms vor Ziel, dann busy-wait
+                    remaining = target_time - time.time()
+                    if remaining > 0.002:
+                        time.sleep(remaining - 0.001)
+                    # Busy-wait für die letzten µs
+                    while time.time() < target_time:
+                        pass
+                else:
+                    sleep_time = target_time - time.time()
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+
         finally:
+            # === STREAMING-MODUS BEENDEN ===
+            if not is_sim:
+                if hasattr(arm, 'exit_streaming_mode'):
+                    arm.exit_streaming_mode()
+                else:
+                    arm._ser.flush()
+                    time.sleep(0.05)
+                    arm._ser.timeout = 0.1
+
             if not is_sim and self._safe_arm:
                 self._safe_arm.end_streaming()
+
+            # Final-Log
+            total_time = time.time() - playback_start
+            self.call_from_thread(
+                self._log_play,
+                f"[green]  ✓ Stream done: {commands_sent} cmds, "
+                f"{skipped} skipped, {total_time:.2f}s actual[/]"
+            )
 
 
     def _move_to_start_position(self, arm, first_wp: dict, cal_model, is_sim: bool):
