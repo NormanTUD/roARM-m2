@@ -1988,14 +1988,24 @@ class RoArmDashboard(App):
 
         try:
             table = self.query_one("#recordings-table", DataTable)
+
+            # Check if table has any rows
+            if table.row_count == 0:
+                self._log_play("[yellow]⚠ Keine Recordings vorhanden![/]")
+                self._log_play("[dim]  → Nimm zuerst ein Recording im Teach-Tab auf (Tab 1, Space)[/]")
+                return
+
             row_key = table.cursor_row
             if row_key is None:
-                self._log_play("[yellow]Kein Recording ausgewählt![/]")
+                self._log_play("[yellow]⚠ Kein Recording ausgewählt! Wähle eine Zeile in der Tabelle.[/]")
                 return
             row_data = table.get_row_at(row_key)
             filename = row_data[0]
-        except (NoMatches, Exception) as e:
-            self._log_play(f"[red]Fehler: {e}[/]")
+        except NoMatches:
+            self._log_play("[red]❌ Recordings-Tabelle nicht gefunden![/]")
+            return
+        except Exception as e:
+            self._log_play(f"[red]❌ Konnte Recording nicht laden: {e}[/]")
             return
 
         filepath = RECORDINGS_DIR / filename
