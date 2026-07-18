@@ -2471,7 +2471,7 @@ class RoArmDashboard(App):
             self._sim_recording_start_time = time.time()
         else:
             self._log_teach("[bold red]⏺ AUFNAHME LÄUFT[/]")
-            self._log_teach("[dim]Bewege den Arm! [Space]=Stop [g]=Gripper [t]=Torque[/]")
+            self._log_teach("[dim]Bewege den Arm! <Space>=Stop <g>=Gripper <t>=Torque[/]")
 
         # Start activity indicator
         self._start_activity("Recording", "🔴")
