@@ -1341,8 +1341,7 @@ class RoArmDashboard(App):
 
         self._refresh_recordings_table()
         self._try_auto_connect()
-        self._load_logs()
-        self._apply_log_filter()
+        self.set_timer(0.5, self._initial_log_load)
 
         # Kalibrierungs-Info im Play-Tab anzeigen
         self._show_calibration_info()
@@ -2638,8 +2637,16 @@ class RoArmDashboard(App):
         self.set_timer(3.0, lambda: self._stop_activity())
 
     # ============================================================
-    # LOGS TAB
+    # LOGS TAB - KOMPLETT GEFIXT
     # ============================================================
+
+    @on(TabbedContent.TabActivated)
+    def on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Wird aufgerufen wenn ein Tab aktiviert wird."""
+        if event.tab.id == "--content-tab-logs" or str(event.pane.id) == "logs":
+            # Logs neu laden wenn der Tab sichtbar wird
+            self._load_logs()
+            self._apply_log_filter()
 
     def _load_logs(self) -> bool:
         """Lädt die neuesten Log-Dateien.
@@ -2654,8 +2661,15 @@ class RoArmDashboard(App):
             log_files = sorted(LOGS_DIR.glob("*.log"), reverse=True)
 
         if not log_files:
+            # Generiere eine synthetische "Willkommen"-Nachricht
             if not self._all_log_lines:
-                self._all_log_lines = []
+                self._all_log_lines = [
+                    f"═══ Dashboard Log ═══\n",
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.000 | INFO     | Dashboard gestartet\n",
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.001 | INFO     | Log-Verzeichnis: {LOGS_DIR.absolute()}\n",
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.002 | INFO     | Warte auf Arm-Verbindung...\n",
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.003 | NOTE     | Verbinde den Arm um echte Logs zu sehen\n",
+                ]
             return False
 
         new_lines = []
@@ -2678,7 +2692,17 @@ class RoArmDashboard(App):
         return len(self._all_log_lines) != old_count
 
     def _periodic_log_refresh(self):
-        """Lädt neue Log-Zeilen und aktualisiert die Anzeige."""
+        """Lädt neue Log-Zeilen und aktualisiert die Anzeige.
+        
+        Nur updaten wenn der Logs-Tab aktiv ist (Performance).
+        """
+        try:
+            tabs = self.query_one(TabbedContent)
+            if tabs.active != "logs":
+                return
+        except NoMatches:
+            return
+
         had_lines = len(self._all_log_lines)
         self._load_logs()
         # Nur neu rendern wenn sich was geändert hat
@@ -2724,7 +2748,6 @@ class RoArmDashboard(App):
     @on(Input.Changed, "#log-search-input")
     def on_log_search_changed(self, event: Input.Changed) -> None:
         """Live-Filterung bei Eingabe (mit Debounce via Timer)."""
-        # Debounce: Nur alle 300ms filtern
         if hasattr(self, '_log_search_timer') and self._log_search_timer:
             self._log_search_timer.stop()
         self._log_search_timer = self.set_timer(
@@ -2732,15 +2755,7 @@ class RoArmDashboard(App):
         )
 
     def _apply_log_filter(self, auto_scroll: bool = True):
-        """Filtert und zeigt die Logs an.
-
-        Unterstützt:
-        - Leerer Filter: Alle Zeilen anzeigen
-        - Text: Case-insensitive Suche
-        - /regex/: Regex-Suche
-        - Mehrere Begriffe mit | trennen: OR-Suche
-        - Prefix ! für Negation: !SEND_FAST zeigt alles OHNE SEND_FAST
-        """
+        """Filtert und zeigt die Logs an."""
         # Filter-Pattern lesen
         try:
             search_input = self.query_one("#log-search-input", Input)
@@ -2757,7 +2772,7 @@ class RoArmDashboard(App):
         # Viewer leeren für neuen Inhalt
         viewer.clear()
 
-        # Keine Daten?
+        # Keine Daten? Hilfreiche Meldung
         if not self._all_log_lines:
             viewer.write("[bold yellow]⚠ Keine Log-Dateien gefunden.[/]")
             viewer.write("")
@@ -2768,13 +2783,16 @@ class RoArmDashboard(App):
                 "[dim]Logs werden automatisch erstellt wenn der Arm "
                 "verbunden wird.[/]"
             )
-            # Vorhandene Dateien im Verzeichnis auflisten
             if LOGS_DIR.exists():
                 all_files = list(LOGS_DIR.iterdir())
                 if all_files:
                     viewer.write(f"\n[dim]Dateien in {LOGS_DIR}/:[/]")
                     for f in sorted(all_files)[:20]:
-                        viewer.write(f"[dim]  • {f.name} ({f.stat().st_size} bytes)[/]")
+                        try:
+                            size = f.stat().st_size
+                            viewer.write(f"[dim]  • {f.name} ({size} bytes)[/]")
+                        except OSError:
+                            viewer.write(f"[dim]  • {f.name}[/]")
                 else:
                     viewer.write(f"\n[dim]Verzeichnis {LOGS_DIR}/ ist leer.[/]")
             return
@@ -2826,47 +2844,33 @@ class RoArmDashboard(App):
             viewer.write("[dim]  • SEND|RECV für OR-Suche[/]")
 
     def _filter_log_lines(self, pattern: str) -> list:
-        """Filtert Log-Zeilen nach Pattern.
-
-        Unterstützte Formate:
-        - "": Alle Zeilen
-        - "text": Case-insensitive Textsuche
-        - "/regex/": Regex-Suche
-        - "/regex/i": Regex case-insensitive (default)
-        - "!text": Negation (alles OHNE text)
-        - "term1|term2": OR-Suche
-        - "!SEND_FAST|DEBUG": Negation mit OR
-        """
+        """Filtert Log-Zeilen nach Pattern."""
         if not pattern:
             return list(self._all_log_lines)
 
-        # Negation?
         negate = False
         if pattern.startswith("!"):
             negate = True
             pattern = pattern[1:]
 
-        # Regex-Modus?
+        # Regex-Modus
         if pattern.startswith("/") and "/" in pattern[1:]:
-            # Finde das schließende /
             end_idx = pattern.rindex("/")
             if end_idx > 0:
                 regex_str = pattern[1:end_idx]
                 flags_str = pattern[end_idx+1:]
 
-                flags = re.IGNORECASE  # Default
+                flags = re.IGNORECASE
                 if 's' in flags_str:
                     flags |= re.DOTALL
                 if 'm' in flags_str:
                     flags |= re.MULTILINE
-                # Explizit case-sensitive mit 'c' flag
                 if 'c' in flags_str:
                     flags &= ~re.IGNORECASE
 
                 try:
                     regex = re.compile(regex_str, flags)
                 except re.error as e:
-                    # Bei Regex-Fehler: Fehlermeldung als einzige Zeile
                     return [f"[REGEX-FEHLER: {e}]\n"]
 
                 if negate:
@@ -2874,19 +2878,15 @@ class RoArmDashboard(App):
                 else:
                     return [l for l in self._all_log_lines if regex.search(l)]
 
-        # OR-Suche mit |
+        # OR-Suche
         if "|" in pattern:
             terms = [t.strip().lower() for t in pattern.split("|") if t.strip()]
             if negate:
-                return [
-                    l for l in self._all_log_lines
-                    if not any(t in l.lower() for t in terms)
-                ]
+                return [l for l in self._all_log_lines
+                        if not any(t in l.lower() for t in terms)]
             else:
-                return [
-                    l for l in self._all_log_lines
-                    if any(t in l.lower() for t in terms)
-                ]
+                return [l for l in self._all_log_lines
+                        if any(t in l.lower() for t in terms)]
 
         # Einfache Textsuche
         pattern_lower = pattern.lower()
@@ -2896,11 +2896,10 @@ class RoArmDashboard(App):
             return [l for l in self._all_log_lines if pattern_lower in l.lower()]
 
     def _style_log_line(self, line: str) -> str:
-        """Gibt eine farbcodierte Version der Log-Zeile zurück."""
-        if not line or line.startswith("═══"):
+        """Farbcodierte Log-Zeile."""
+        if not line or "═══" in line:
             return f"[bold bright_white]{line}[/]"
 
-        # Nach Log-Level/Typ farbcodieren
         if "| ERROR" in line or "ERROR" in line.upper()[:50]:
             return f"[bold red]{line}[/]"
         elif "| WARNING" in line or "| TIMEOUT" in line:
@@ -2927,6 +2926,17 @@ class RoArmDashboard(App):
         try:
             viewer = self.query_one("#log-viewer", RichLog)
             viewer.write(msg)
+        except NoMatches:
+            pass
+
+    def _initial_log_load(self):
+        """Initiales Laden der Logs nach Mount-Delay."""
+        self._load_logs()
+        # Nur anzeigen wenn der Logs-Tab gerade aktiv ist
+        try:
+            tabs = self.query_one(TabbedContent)
+            if tabs.active == "logs":
+                self._apply_log_filter()
         except NoMatches:
             pass
 
