@@ -122,6 +122,123 @@ class TUILogHandler(logging.Handler):
         except Exception:
             pass
 
+# ============================================================
+# SIMULATED ARM (when no real robot is connected)
+# ============================================================
+
+class SimulatedArm:
+    """Simulates the RoArm when no physical robot is connected.
+    
+    Provides the same interface as RoArmConnection but moves
+    joints virtually with realistic timing.
+    """
+
+    def __init__(self):
+        self._position = {
+            "b": 0.0,
+            "s": 0.0,
+            "e": 90.0,
+            "h": 180.0,
+        }
+        self._target = None
+        self._torque_on = True
+        self._gripper_open = True
+        self._move_speed = 30.0  # degrees per second base speed
+        self._moving = False
+        self._lock = threading.Lock()
+
+    def read_position_deg(self) -> dict:
+        """Returns current simulated position."""
+        with self._lock:
+            return self._position.copy()
+
+    def read_position_averaged(self, n: int = 10, interval: float = 0.05) -> dict:
+        """Simulates averaged reading (just returns current pos with tiny noise)."""
+        pos = self.read_position_deg()
+        # Add tiny noise to simulate real sensor
+        for j in ["b", "s", "e", "h"]:
+            pos[j] += np.random.normal(0, 0.02)
+        return pos
+
+    def move_to(self, b: float, s: float, e: float, h: float,
+                spd: int = 20, acc: int = 10):
+        """Simulates a move command — instantly updates target, 
+        position interpolates over time."""
+        with self._lock:
+            self._target = {"b": b, "s": s, "e": e, "h": h}
+            self._move_speed = spd * 1.5  # scale speed param to deg/s
+
+    def move_to_fast(self, b: float, s: float, e: float, h: float,
+                     spd: int = 50, acc: int = 30):
+        """Fast move — for streaming playback simulation."""
+        with self._lock:
+            # In simulation, fast moves update position more directly
+            self._target = {"b": b, "s": s, "e": e, "h": h}
+            self._move_speed = spd * 2.0
+
+    def step_simulation(self, dt: float):
+        """Advances the simulation by dt seconds.
+        
+        Call this periodically (e.g., every 20ms) to animate movement.
+        """
+        with self._lock:
+            if self._target is None:
+                return
+            if not self._torque_on:
+                return
+
+            all_arrived = True
+            for j in ["b", "s", "e", "h"]:
+                diff = self._target[j] - self._position[j]
+                if abs(diff) < 0.01:
+                    self._position[j] = self._target[j]
+                else:
+                    all_arrived = False
+                    # Move towards target at _move_speed deg/s
+                    max_step = self._move_speed * dt
+                    step = max(-max_step, min(max_step, diff))
+                    self._position[j] += step
+
+            if all_arrived:
+                self._target = None
+                self._moving = False
+            else:
+                self._moving = True
+
+    def wait_until_settled(self, tolerance_deg: float = 0.2,
+                           stable_count: int = 6):
+        """Simulates waiting for settle — just waits a bit."""
+        # In simulation, we just sleep briefly
+        time.sleep(0.3)
+
+    def torque_on(self):
+        with self._lock:
+            self._torque_on = True
+
+    def torque_off(self):
+        with self._lock:
+            self._torque_on = False
+            self._target = None
+
+    def gripper_open(self):
+        self._gripper_open = True
+
+    def gripper_close(self):
+        self._gripper_open = False
+
+    def close(self):
+        """No-op for simulated arm."""
+        pass
+
+    @property
+    def is_simulated(self) -> bool:
+        return True
+
+    @property
+    def is_moving(self) -> bool:
+        with self._lock:
+            return self._target is not None
+
 class BrailleCanvas:
     """
     Zeichnet auf einem Braille-Raster.
@@ -951,6 +1068,9 @@ class RoArmDashboard(App):
     def __init__(self):
         super().__init__()
         self._arm: Optional[RoArmConnection] = None
+        self._sim_arm: Optional[SimulatedArm] = None
+        self._simulation_mode = False
+        self._sim_timer: Optional[Timer] = None
         self._joint_history = JointHistory()
         self._current_pos = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
 
@@ -974,6 +1094,20 @@ class RoArmDashboard(App):
 
         # Recording elapsed timer
         self._recording_elapsed_timer: Optional[Timer] = None
+
+    @property
+    def _active_arm(self):
+        """Returns the real arm if connected, otherwise the simulated arm."""
+        if self._arm and self.connected:
+            return self._arm
+        if self._simulation_mode and self._sim_arm:
+            return self._sim_arm
+        return None
+
+    @property
+    def _is_sim(self) -> bool:
+        """True if currently using simulated arm."""
+        return self._simulation_mode and not self.connected
 
     @staticmethod
     def _apply_calibration_static(cal_model, target: dict) -> dict:
@@ -1331,7 +1465,7 @@ class RoArmDashboard(App):
         # Robot-Logger in die TUI umleiten
         robot_logger = logging.getLogger("roarm.commands")
         handler = TUILogHandler(self)
-        handler.setLevel(logging.WARNING)  # Nur WARNING+ in der TUI
+        handler.setLevel(logging.WARNING)
         fmt = logging.Formatter(
             '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(message)s',
             datefmt='%H:%M:%S'
@@ -1341,30 +1475,104 @@ class RoArmDashboard(App):
 
         self._refresh_recordings_table()
         self._try_auto_connect()
-        self.set_timer(0.5, self._initial_log_load)
+        self._load_logs()
+        self._apply_log_filter()
 
         # Kalibrierungs-Info im Play-Tab anzeigen
         self._show_calibration_info()
 
-        # Periodischer Position-Poll (wenn verbunden)
+        # If no real robot connected, start simulation mode
+        if not self.connected:
+            self._enable_simulation_mode()
+
+        # Periodischer Position-Poll (wenn verbunden oder simuliert)
         self.set_interval(0.5, self._periodic_position_poll)
         # Log-Refresh
         self.set_interval(2.0, self._periodic_log_refresh)
+
+    def _enable_simulation_mode(self):
+        """Activates simulation mode with a virtual arm."""
+        self._sim_arm = SimulatedArm()
+        self._simulation_mode = True
+
+        # Start simulation step timer (50Hz for smooth animation)
+        self._sim_timer = self.set_interval(0.02, self._sim_step)
+
+        self._log_teach(
+            "[bold cyan]🤖 SIMULATION MODE[/] — Kein Roboter verbunden"
+        )
+        self._log_teach(
+            "[dim]  Alle Bewegungen werden virtuell simuliert.[/]"
+        )
+        self._log_teach(
+            "[dim]  Drücke [c] um einen echten Roboter zu verbinden.[/]"
+        )
+
+        # Update status bar
+        try:
+            label = self.query_one("#status-connection", Label)
+            label.update("🤖 SIMULATION")
+        except NoMatches:
+            pass
+
+        try:
+            mode_label = self.query_one("#status-mode", Label)
+            mode_label.update("🤖 Sim Ready")
+        except NoMatches:
+            pass
+
+        # Show initial position in views
+        pos = self._sim_arm.read_position_deg()
+        self._current_pos = pos
+        self._update_joint_displays(pos)
+        self._update_arm_views(pos)
+
+    def _disable_simulation_mode(self):
+        """Deactivates simulation mode."""
+        self._simulation_mode = False
+        if self._sim_timer:
+            self._sim_timer.stop()
+            self._sim_timer = None
+        self._sim_arm = None
+
+    def _sim_step(self):
+        """Called every 20ms to advance the simulation."""
+        if not self._simulation_mode or not self._sim_arm:
+            return
+        # Advance physics
+        self._sim_arm.step_simulation(0.02)
+
+        # If the sim arm is actively moving, update the display
+        if self._sim_arm.is_moving:
+            pos = self._sim_arm.read_position_deg()
+            self._current_pos = pos
+            self._update_joint_displays(pos)
+            self._update_arm_views(pos)
+            self._update_servo_readouts(pos)
 
     def _try_auto_connect(self):
         """Versucht automatisch den Arm zu finden und zu verbinden."""
         port = find_arm_port()
         if port:
-            self._log_teach(f"[dim]🔍 Port gefunden: {port} – verbinde...[/]")
+            self._log_teach(f"[dim]🔍 Port gefunden: {port} — verbinde...[/]")
             self._do_connect(port)
         else:
-            self._log_teach("[yellow]⚠ Kein Arm-Port gefunden. [c] zum manuellen Verbinden.[/]")
+            self._log_teach(
+                "[yellow]⚠ Kein Arm-Port gefunden. "
+                "Starte im Simulationsmodus. [c] zum Verbinden.[/]"
+            )
 
     def _do_connect(self, port: str):
         """Verbindet synchron mit dem Arm."""
         try:
             self._arm = RoArmConnection(port)
             self.connected = True
+
+            # Disable simulation mode if it was active
+            if self._simulation_mode:
+                self._disable_simulation_mode()
+                self._log_teach("[green]✅ Echte Verbindung hergestellt — Simulation beendet[/]")
+
             self._log_teach(f"[green]✅ Verbunden mit {port}[/]")
             self._update_status_connection(port)
 
@@ -1387,18 +1595,24 @@ class RoArmDashboard(App):
 
     def _periodic_position_poll(self):
         """Pollt die Position wenn verbunden und nicht recording/playing."""
-        if not self.connected or not self._arm:
-            return
         if self.recording or self.playing:
             return
 
+        arm = self._active_arm
+        if arm is None:
+            return
+
+        # In simulation mode, the sim_step timer handles updates during movement
+        # Only poll here for idle state display refresh
+        if self._is_sim and self._sim_arm and self._sim_arm.is_moving:
+            return  # sim_step handles this
+
         try:
-            pos = self._arm.read_position_deg()
+            pos = arm.read_position_deg()
             if pos:
                 self._current_pos = pos
                 self._update_joint_displays(pos)
                 self._update_arm_views(pos)
-                # Servo-Readouts updaten
                 self._update_servo_readouts(pos)
         except Exception:
             pass
@@ -1615,27 +1829,43 @@ class RoArmDashboard(App):
         self._log_teach("[yellow]🔌 Getrennt[/]")
         self._update_status_connection(None)
 
+        # Re-enable simulation mode
+        self._enable_simulation_mode()
+
     def action_torque_release(self) -> None:
         """Torque lösen (Taste t)."""
-        if not self._arm or not self.connected:
-            self._log_teach("[red]Nicht verbunden![/]")
+        arm = self._active_arm
+        if arm is None:
+            self._log_teach("[red]Nicht verbunden und keine Simulation![/]")
             return
-        self._arm.torque_off()
+
+        arm.torque_off()
         self.torque_on_state = False
         self._update_status_torque(False)
-        self._log_teach("[yellow]🔓 Torque AUS – Arm ist frei bewegbar[/]")
+
+        if self._is_sim:
+            self._log_teach("[yellow]🔓 Torque AUS (Sim) — Arm ist frei[/]")
+        else:
+            self._log_teach("[yellow]🔓 Torque AUS — Arm ist frei bewegbar[/]")
         self._log_servo("[yellow]🔓 Torque AUS[/]")
 
     def action_torque_lock(self) -> None:
         """Torque einschalten (Taste T/Shift+t)."""
-        if not self._arm or not self.connected:
-            self._log_teach("[red]Nicht verbunden![/]")
+        arm = self._active_arm
+        if arm is None:
+            self._log_teach("[red]Nicht verbunden und keine Simulation![/]")
             return
-        self._arm.torque_on()
+
+        arm.torque_on()
         self.torque_on_state = True
         self._update_status_torque(True)
-        self._log_teach("[green]🔒 Torque AN – Arm ist fixiert[/]")
+
+        if self._is_sim:
+            self._log_teach("[green]🔒 Torque AN (Sim) — Arm ist fixiert[/]")
+        else:
+            self._log_teach("[green]🔒 Torque AN — Arm ist fixiert[/]")
         self._log_servo("[green]🔒 Torque AN[/]")
+
 
     def action_toggle_action(self) -> None:
         """Start/Stop je nach aktivem Tab."""
@@ -1659,10 +1889,12 @@ class RoArmDashboard(App):
             self._start_calibration()
 
     def action_gripper_toggle(self) -> None:
-        if not self._arm or not self.connected:
+        arm = self._active_arm
+        if arm is None:
             return
+
         if self._gripper_open:
-            self._arm.gripper_close()
+            arm.gripper_close()
             self._gripper_open = False
             self._log_teach("[bold]✊ Gripper ZU[/]")
             if self.recording:
@@ -1671,7 +1903,7 @@ class RoArmDashboard(App):
                     {"t": round(elapsed, 4), "cmd": "GRIPPER_CLOSE"}
                 )
         else:
-            self._arm.gripper_open()
+            arm.gripper_open()
             self._gripper_open = True
             self._log_teach("[bold]✋ Gripper AUF[/]")
             if self.recording:
@@ -1685,17 +1917,20 @@ class RoArmDashboard(App):
 
     def action_read_position(self) -> None:
         """Liest die aktuelle Position und zeigt sie an."""
-        if not self._arm or not self.connected:
-            self._log_servo("[red]Nicht verbunden![/]")
+        arm = self._active_arm
+        if arm is None:
+            self._log_servo("[red]Nicht verbunden und keine Simulation![/]")
             return
-        pos = self._arm.read_position_deg()
+
+        pos = arm.read_position_deg()
         if pos:
             self._current_pos = pos
             self._update_joint_displays(pos)
             self._update_arm_views(pos)
             self._update_servo_readouts(pos)
+            sim_tag = " [dim](sim)[/]" if self._is_sim else ""
             self._log_servo(
-                f"[green]📑 Position:[/] b={pos['b']:+.2f}° "
+                f"[green]📍 Position:{sim_tag}[/] b={pos['b']:+.2f}° "
                 f"s={pos['s']:+.2f}° e={pos['e']:+.2f}° h={pos['h']:+.2f}°"
             )
         else:
@@ -1748,8 +1983,9 @@ class RoArmDashboard(App):
         self.action_gripper_toggle()
 
     def _start_recording(self):
-        if not self.connected or not self._arm:
-            self._log_teach("[red]Nicht verbunden![/]")
+        arm = self._active_arm
+        if arm is None:
+            self._log_teach("[red]Nicht verbunden und keine Simulation![/]")
             return
 
         self.recording = True
@@ -1757,8 +1993,8 @@ class RoArmDashboard(App):
         self._teach_start_time = time.time()
         self._gripper_open = True
 
-        # Torque aus
-        self._arm.torque_off()
+        # Torque aus (in sim mode, allows "virtual free movement")
+        arm.torque_off()
         self.torque_on_state = False
         self._update_status_torque(False)
 
@@ -1775,8 +2011,18 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
 
-        self._log_teach("[bold red]⏺ AUFNAHME LÄUFT[/]")
-        self._log_teach("[dim]Bewege den Arm! [Space]=Stop [g]=Gripper [t]=Torque[/]")
+        if self._is_sim:
+            self._log_teach("[bold red]⏺ AUFNAHME LÄUFT (Simulation)[/]")
+            self._log_teach(
+                "[dim]Simulierte Bewegung: Arm bewegt sich automatisch "
+                "auf einer Demo-Trajektorie.[/]"
+            )
+            self._log_teach("[dim][Space]=Stop [g]=Gripper[/]")
+            # Start simulated movement demo
+            self._sim_recording_start_time = time.time()
+        else:
+            self._log_teach("[bold red]⏺ AUFNAHME LÄUFT[/]")
+            self._log_teach("[dim]Bewege den Arm! [Space]=Stop [g]=Gripper [t]=Torque[/]")
 
         # Start activity indicator
         self._start_activity("Recording", "🔴")
@@ -1789,13 +2035,32 @@ class RoArmDashboard(App):
             1.0 / RECORD_HZ, self._teach_poll_position
         )
 
+
     def _teach_poll_position(self):
-        if not self.recording or not self._arm:
+        if not self.recording:
             return
 
-        pos = self._arm.read_position_deg()
-        if pos is None:
+        arm = self._active_arm
+        if arm is None:
             return
+
+        # In simulation mode, generate a demo trajectory
+        if self._is_sim:
+            elapsed = time.time() - self._teach_start_time
+            # Generate smooth demo movement (figure-8 pattern)
+            pos = {
+                "b": 30.0 * math.sin(elapsed * 0.8),
+                "s": 20.0 * math.sin(elapsed * 0.5) + 10.0,
+                "e": 90.0 + 25.0 * math.sin(elapsed * 0.6),
+                "h": 180.0 + 15.0 * math.sin(elapsed * 0.3),
+            }
+            # Update the sim arm's internal position directly
+            with self._sim_arm._lock:
+                self._sim_arm._position = pos.copy()
+        else:
+            pos = arm.read_position_deg()
+            if pos is None:
+                return
 
         self._current_pos = pos
         elapsed = time.time() - self._teach_start_time
@@ -1829,11 +2094,13 @@ class RoArmDashboard(App):
         # Status-Log (alle 50 Frames)
         move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
         if len(move_wps) % 50 == 0 and len(move_wps) > 0:
+            sim_tag = " (sim)" if self._is_sim else ""
             self._log_teach(
-                f"[dim]  ◆ WP#{len(move_wps)} [{elapsed:.1f}s] "
+                f"[dim]  ◆ WP#{len(move_wps)}{sim_tag} [{elapsed:.1f}s] "
                 f"b={pos['b']:+.1f}° s={pos['s']:+.1f}° "
                 f"e={pos['e']:+.1f}° h={pos['h']:+.1f}°[/]"
             )
+
 
     def _stop_recording(self):
         if not self.recording:
@@ -1845,8 +2112,9 @@ class RoArmDashboard(App):
             self._teach_timer.stop()
             self._teach_timer = None
 
-        if self._arm:
-            self._arm.torque_on()
+        arm = self._active_arm
+        if arm:
+            arm.torque_on()
             self.torque_on_state = True
             self._update_status_torque(True)
 
@@ -1867,8 +2135,10 @@ class RoArmDashboard(App):
             return
 
         duration = move_wps[-1]["t"]
+        sim_tag = " (Simulation)" if self._is_sim else ""
         self._log_teach(
-            f"[green]⏹ Aufnahme gestoppt: {len(move_wps)} WPs, {duration:.1f}s[/]"
+            f"[green]⏹ Aufnahme gestoppt{sim_tag}: "
+            f"{len(move_wps)} WPs, {duration:.1f}s[/]"
         )
 
         filepath = self._save_recording()
@@ -1921,7 +2191,8 @@ class RoArmDashboard(App):
 
     @work(thread=True)
     def _go_home(self):
-        if not self._arm or not self.connected:
+        arm = self._active_arm
+        if arm is None:
             return
 
         # Start activity indicator
@@ -1932,19 +2203,32 @@ class RoArmDashboard(App):
             self._log_teach, "[dim]🏠 Fahre zur Home-Position...[/]"
         )
 
-        self._arm.torque_on()
+        arm.torque_on()
         self.torque_on_state = True
         self.app.call_from_thread(self._update_status_torque, True)
         time.sleep(0.2)
 
-        self._arm.move_to(
+        arm.move_to(
             START_POSITION_DEG["b"], START_POSITION_DEG["s"],
             START_POSITION_DEG["e"], START_POSITION_DEG["h"],
             spd=25, acc=12
         )
-        time.sleep(2.0)
 
-        pos = self._arm.read_position_deg()
+        # Wait for movement to complete
+        if self._is_sim:
+            # In simulation, wait for the sim to reach target
+            for _ in range(100):  # max 2 seconds
+                time.sleep(0.02)
+                self._sim_arm.step_simulation(0.02)
+                pos = self._sim_arm.read_position_deg()
+                self.app.call_from_thread(self._update_joint_displays, pos)
+                self.app.call_from_thread(self._update_arm_views, pos)
+                if not self._sim_arm.is_moving:
+                    break
+        else:
+            time.sleep(2.0)
+
+        pos = arm.read_position_deg()
         if pos:
             self._current_pos = pos
             self.app.call_from_thread(self._update_joint_displays, pos)
@@ -1977,22 +2261,28 @@ class RoArmDashboard(App):
         self._stop_playback()
 
     def _start_playback(self):
-        if not self.connected or not self._arm:
-            self._log_play("[red]Nicht verbunden![/]")
+        arm = self._active_arm
+        if arm is None:
+            self._log_play("[red]Nicht verbunden und keine Simulation![/]")
             return
 
         try:
             table = self.query_one("#recordings-table", DataTable)
 
-            # Check if table has any rows
             if table.row_count == 0:
                 self._log_play("[yellow]⚠ Keine Recordings vorhanden![/]")
-                self._log_play("[dim]  → Nimm zuerst ein Recording im Teach-Tab auf (Tab 1, Space)[/]")
+                self._log_play(
+                    "[dim]  → Nimm zuerst ein Recording im Teach-Tab auf "
+                    "(Tab 1, Space)[/]"
+                )
                 return
 
             row_key = table.cursor_row
             if row_key is None:
-                self._log_play("[yellow]⚠ Kein Recording ausgewählt! Wähle eine Zeile in der Tabelle.[/]")
+                self._log_play(
+                    "[yellow]⚠ Kein Recording ausgewählt! "
+                    "Wähle eine Zeile in der Tabelle.[/]"
+                )
                 return
             row_data = table.get_row_at(row_key)
             filename = row_data[0]
@@ -2032,41 +2322,52 @@ class RoArmDashboard(App):
         # Start activity indicator
         self._start_activity("Starting playback", "▶️")
 
+        sim_tag = " (Simulation)" if self._is_sim else ""
         self._log_play(
-            f"[green]▶ Playback: {len(wps)} WPs, {wps[-1]['t']:.1f}s[/]"
+            f"[green]▶ Playback{sim_tag}: {len(wps)} WPs, {wps[-1]['t']:.1f}s[/]"
         )
 
         self._run_playback(wps)
 
     @work(thread=True)
     def _run_playback(self, waypoints: list):
-        """Flüssiges Playback mit Cubic Spline + Kalibrierung (wie play.py)."""
+        """Flüssiges Playback mit Cubic Spline + Kalibrierung."""
         from scipy.interpolate import CubicSpline
         from safety import RateLimiter
 
+        arm = self._active_arm
+        if arm is None:
+            self.app.call_from_thread(
+                self._log_play, "[red]Kein Arm verfügbar![/]"
+            )
+            self.playing = False
+            return
+
+        is_sim = self._is_sim
+
         # --- Kalibrierungsmodell laden ---
         cal_model = None
-        try:
-            from calibrate import CalibrationModel
-            cal_path = Path("calibration") / "roarm_calibration.cal"
-            if cal_path.exists():
-                cal_model = CalibrationModel.load(str(cal_path))
+        if not is_sim:
+            try:
+                from calibrate import CalibrationModel
+                cal_path = Path("calibration") / "roarm_calibration.cal"
+                if cal_path.exists():
+                    cal_model = CalibrationModel.load(str(cal_path))
+                    self.app.call_from_thread(
+                        self._log_play,
+                        f"[green]📂 Kalibrierung geladen: {cal_path}[/]"
+                    )
+                    res = cal_model.residuals
+                    self.app.call_from_thread(
+                        self._log_play,
+                        f"[dim]  Residuen: b={res.get('b',0):.4f}° "
+                        f"s={res.get('s',0):.4f}° e={res.get('e',0):.4f}°[/]"
+                    )
+            except Exception as e:
                 self.app.call_from_thread(
                     self._log_play,
-                    f"[green]📂 Kalibrierung geladen: {cal_path}[/]"
+                    f"[yellow]⚠ Kalibrierung nicht verfügbar: {e}[/]"
                 )
-                # Zeige Residuen
-                res = cal_model.residuals
-                self.app.call_from_thread(
-                    self._log_play,
-                    f"[dim]  Residuen: b={res.get('b',0):.4f}° "
-                    f"s={res.get('s',0):.4f}° e={res.get('e',0):.4f}°[/]"
-                )
-        except Exception as e:
-            self.app.call_from_thread(
-                self._log_play,
-                f"[yellow]⚠ Kalibrierung nicht verfügbar: {e}[/]"
-            )
 
         # --- Spline aufbauen ---
         times = np.array([wp["t"] for wp in waypoints])
@@ -2079,7 +2380,7 @@ class RoArmDashboard(App):
         stream_hz = STREAM_HZ
         interval = 1.0 / stream_hz
 
-        # --- Rate Limiter (wie play.py) ---
+        # --- Rate Limiter ---
         rate_limiter = RateLimiter(max_hz=stream_hz + 10)
 
         # --- Zur Startposition fahren ---
@@ -2087,27 +2388,40 @@ class RoArmDashboard(App):
             self._start_activity, "Moving to start", "⏳"
         )
 
-        self._arm.torque_on()
+        arm.torque_on()
         time.sleep(0.2)
         start = waypoints[0]
 
-        # Kalibrierung auf Startposition anwenden
+        # Kalibrierung auf Startposition anwenden (nur bei echtem Arm)
         start_corrected = self._apply_calibration_static(cal_model, start)
-        self._arm.move_to(
-            start_corrected["b"], start_corrected["s"],
-            start_corrected["e"], start_corrected["h"],
-            spd=20, acc=10
-        )
-        self.app.call_from_thread(
-            self._log_play, "[dim]  Fahre zur Startposition...[/]"
-        )
-        time.sleep(2.0)
 
-        # --- Switch activity to playing with duration info ---
-        self.app.call_from_thread(
-            self._start_activity, f"Playing ({duration:.1f}s)", "▶️"
-        )
-
+        if is_sim:
+            arm.move_to(
+                start_corrected["b"], start_corrected["s"],
+                start_corrected["e"], start_corrected["h"],
+                spd=20, acc=10
+            )
+            self.app.call_from_thread(
+                self._log_play, "[dim]  Fahre zur Startposition (Sim)...[/]"
+            )
+            # Wait for simulated movement to reach start
+            for _ in range(150):  # max 3 seconds
+                time.sleep(0.02)
+                self._sim_arm.step_simulation(0.02)
+                if not self._sim_arm.is_moving:
+                    break
+                pos = self._sim_arm.read_position_deg()
+                self.app.call_from_thread(self._update_arm_views, pos)
+        else:
+            arm.move_to(
+                start_corrected["b"], start_corrected["s"],
+                start_corrected["e"], start_corrected["h"],
+                spd=20, acc=10
+            )
+            self.app.call_from_thread(
+                self._log_play, "[dim]  Fahre zur Startposition...[/]"
+            )
+            time.sleep(2.0)
 
         # --- Switch activity to playing ---
         self.app.call_from_thread(
@@ -2127,9 +2441,10 @@ class RoArmDashboard(App):
 
         # Info über Kalibrierungsstatus
         cal_active = cal_model is not None and cal_model.is_fitted
+        sim_tag = " (Simulation)" if is_sim else ""
         self.app.call_from_thread(
             self._log_play,
-            f"[bold]▶ Streaming: {stream_hz}Hz, Kalibrierung: "
+            f"[bold]▶ Streaming{sim_tag}: {stream_hz}Hz, Kalibrierung: "
             f"{'✅ AKTIV' if cal_active else '❌ INAKTIV'}[/]"
         )
 
@@ -2145,16 +2460,16 @@ class RoArmDashboard(App):
                 gc = gripper_cmds[gripper_idx]
                 if gc["t"] <= elapsed:
                     if gc["cmd"] == "CLOSE":
-                        self._arm.gripper_close()
+                        arm.gripper_close()
                         self.app.call_from_thread(
                             self._log_play,
-                            f"[bold]  ✂ Gripper ZU [{elapsed:.2f}s][/]"
+                            f"[bold]  ✊ Gripper ZU [{elapsed:.2f}s][/]"
                         )
                     elif gc["cmd"] == "OPEN":
-                        self._arm.gripper_open()
+                        arm.gripper_open()
                         self.app.call_from_thread(
                             self._log_play,
-                            f"[bold]  ✃ Gripper AUF [{elapsed:.2f}s][/]"
+                            f"[bold]  ✋ Gripper AUF [{elapsed:.2f}s][/]"
                         )
                     gripper_idx += 1
                     time.sleep(0.3)
@@ -2178,7 +2493,7 @@ class RoArmDashboard(App):
             # --- Kalibrierung anwenden ---
             corrected = self._apply_calibration_static(cal_model, target)
 
-            # --- Delta-Check (wie play.py) ---
+            # --- Delta-Check ---
             should_send = True
             if last_pos:
                 max_delta = max(
@@ -2192,26 +2507,46 @@ class RoArmDashboard(App):
                 # Rate Limiter
                 rate_limiter.acquire()
 
-                self._arm.move_to_fast(
-                    corrected["b"], corrected["s"],
-                    corrected["e"], corrected["h"],
-                    spd=50, acc=30
-                )
+                if is_sim:
+                    # For simulation: directly update position for smooth playback
+                    arm.move_to_fast(
+                        corrected["b"], corrected["s"],
+                        corrected["e"], corrected["h"],
+                        spd=50, acc=30
+                    )
+                    # Step the simulation to move towards target
+                    self._sim_arm.step_simulation(interval)
+                else:
+                    arm.move_to_fast(
+                        corrected["b"], corrected["s"],
+                        corrected["e"], corrected["h"],
+                        spd=50, acc=30
+                    )
+
                 last_pos = corrected.copy()
                 commands_sent += 1
 
+            # --- In simulation mode, always step physics ---
+            if is_sim:
+                self._sim_arm.step_simulation(interval * 0.5)
+
             # --- UI updaten (nur alle 200ms, NICHT blockierend) ---
             if commands_sent % max(1, stream_hz // 5) == 0:
-                self.app.call_from_thread(self._update_arm_views, corrected)
+                if is_sim:
+                    sim_pos = self._sim_arm.read_position_deg()
+                    self.app.call_from_thread(self._update_arm_views, sim_pos)
+                    self.app.call_from_thread(self._update_joint_displays, sim_pos)
+                else:
+                    self.app.call_from_thread(self._update_arm_views, corrected)
                 self.app.call_from_thread(self._update_play_timeline, elapsed)
 
-            # --- Timing (wie play.py) ---
+            # --- Timing ---
             loop_elapsed = time.time() - loop_start
             sleep_time = interval - loop_elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        # --- Precision Endpoint (wie play.py) ---
+        # --- Precision Endpoint ---
         if self.playing:
             self.app.call_from_thread(
                 self._start_activity, "Precision settle", "🎯"
@@ -2222,29 +2557,43 @@ class RoArmDashboard(App):
                 final_target[joint] = round(float(splines[joint](times[-1])), 2)
             final_corrected = self._apply_calibration_static(cal_model, final_target)
 
-            for spd, acc in [(8, 4), (5, 2), (3, 1)]:
-                self._arm.move_to(
+            if is_sim:
+                # In simulation, just move directly to final position
+                arm.move_to(
                     final_corrected["b"], final_corrected["s"],
                     final_corrected["e"], final_corrected["h"],
-                    spd=spd, acc=acc
+                    spd=5, acc=2
                 )
-                time.sleep(0.8)
+                for _ in range(100):
+                    time.sleep(0.02)
+                    self._sim_arm.step_simulation(0.02)
+                    if not self._sim_arm.is_moving:
+                        break
+                pos = self._sim_arm.read_position_deg()
+                self.app.call_from_thread(self._update_arm_views, pos)
+                self.app.call_from_thread(self._update_joint_displays, pos)
+            else:
+                for spd, acc in [(8, 4), (5, 2), (3, 1)]:
+                    arm.move_to(
+                        final_corrected["b"], final_corrected["s"],
+                        final_corrected["e"], final_corrected["h"],
+                        spd=spd, acc=acc
+                    )
+                    time.sleep(0.8)
 
         # --- Ende ---
         self.playing = False
 
         # Kalibrierungs-Info im Summary
         cal_info = ""
-        if cal_active:
-            # Zeige die Korrektur am Endpunkt als Beispiel
-            if 'final_target' in dir() and 'final_corrected' in dir():
-                delta_b = final_corrected["b"] - final_target["b"]
-                delta_s = final_corrected["s"] - final_target["s"]
-                delta_e = final_corrected["e"] - final_target["e"]
-                cal_info = (
-                    f"\n  [dim]Kalibrierung (Endpunkt-Korrektur): "
-                    f"Δb={delta_b:+.2f}° Δs={delta_s:+.2f}° Δe={delta_e:+.2f}°[/]"
-                )
+        if cal_active and 'final_target' in dir() and 'final_corrected' in dir():
+            delta_b = final_corrected["b"] - final_target["b"]
+            delta_s = final_corrected["s"] - final_target["s"]
+            delta_e = final_corrected["e"] - final_target["e"]
+            cal_info = (
+                f"\n  [dim]Kalibrierung (Endpunkt-Korrektur): "
+                f"Δb={delta_b:+.2f}° Δs={delta_s:+.2f}° Δe={delta_e:+.2f}°[/]"
+            )
 
         # Stop activity indicator
         self.app.call_from_thread(
@@ -2253,21 +2602,13 @@ class RoArmDashboard(App):
 
         self.app.call_from_thread(
             self._log_play,
-            f"[green]✅ Playback beendet: {commands_sent} Cmds, "
+            f"[green]✅ Playback beendet{sim_tag}: {commands_sent} Cmds, "
             f"{skipped} übersprungen, {rate_limiter.violations} Rate-Limit-Eingriffe"
             f"{cal_info}[/]"
         )
         self.app.call_from_thread(self._playback_finished)
 
         # Clear success message after 3 seconds
-        self.app.call_from_thread(
-            self.set_timer, 3.0, lambda: self._stop_activity()
-        )
-
-        # Stop activity indicator
-        self.app.call_from_thread(
-            self._stop_activity, "✅ Playback complete"
-        )
         self.app.call_from_thread(
             self.set_timer, 3.0, lambda: self._stop_activity()
         )
@@ -2319,6 +2660,20 @@ class RoArmDashboard(App):
 
     def _start_calibration(self):
         """Startet die Kalibrierung."""
+        arm = self._active_arm
+        if arm is None:
+            self._log_calibrate("[red]Nicht verbunden und keine Simulation![/]")
+            return
+
+        if self._is_sim:
+            self._log_calibrate(
+                "[yellow]⚠ Kalibrierung im Simulationsmodus nicht sinnvoll![/]"
+            )
+            self._log_calibrate(
+                "[dim]  Verbinde einen echten Roboter für die Kalibrierung.[/]"
+            )
+            return
+
         if not self.connected or not self._arm:
             self._log_calibrate("[red]Nicht verbunden![/]")
             return
@@ -2583,8 +2938,9 @@ class RoArmDashboard(App):
 
     def _servo_go(self, joint: str):
         """Fährt einen einzelnen Servo zur eingegebenen Position."""
-        if not self._arm or not self.connected:
-            self._log_servo("[red]Nicht verbunden![/]")
+        arm = self._active_arm
+        if arm is None:
+            self._log_servo("[red]Nicht verbunden und keine Simulation![/]")
             return
 
         try:
@@ -2598,7 +2954,7 @@ class RoArmDashboard(App):
         pos = self._current_pos.copy()
         pos[joint] = angle
 
-        self._arm.torque_on()
+        arm.torque_on()
         self.torque_on_state = True
         self._update_status_torque(True)
         time.sleep(0.1)
@@ -2608,13 +2964,14 @@ class RoArmDashboard(App):
         # Start activity indicator
         self._start_activity(f"Moving {joint_names[joint]}", "🎯")
 
-        self._arm.move_to(
+        arm.move_to(
             pos["b"], pos["s"], pos["e"], pos["h"],
             spd=15, acc=8
         )
 
+        sim_tag = " (sim)" if self._is_sim else ""
         self._log_servo(
-            f"[green]→ {joint_names[joint]} → {angle:.2f}°[/]"
+            f"[green]→ {joint_names[joint]} → {angle:.2f}°{sim_tag}[/]"
         )
 
         # Nach kurzer Wartezeit Position lesen und activity stoppen
@@ -2622,10 +2979,11 @@ class RoArmDashboard(App):
 
     def _servo_read_after_move(self):
         """Liest Position nach einem Servo-Move."""
-        if not self._arm or not self.connected:
+        arm = self._active_arm
+        if arm is None:
             self._stop_activity()
             return
-        pos = self._arm.read_position_deg()
+        pos = arm.read_position_deg()
         if pos:
             self._current_pos = pos
             self._update_joint_displays(pos)
@@ -2949,6 +3307,8 @@ class RoArmDashboard(App):
             mode_label = self.query_one("#status-mode", Label)
             if connected:
                 mode_label.update("⏱️ Ready")
+            elif self._simulation_mode:
+                mode_label.update("🤖 Sim Ready")
             else:
                 mode_label.update("⏱️ --")
         except NoMatches:
