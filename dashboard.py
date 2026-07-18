@@ -1423,13 +1423,16 @@ class RoArmDashboard(App):
         )
 
     def _teach_read_position(self, arm) -> Optional[dict]:
-        """Reads position during teach, using gravity comp if enabled."""
         if self._gravity_comp_enabled and not self._is_sim:
-            return self._read_with_gravity_comp(arm)
+            elapsed = time.time() - self._teach_start_time
+            # Nur alle 2s einen Gravity-Comp-Puls
+            if int(elapsed * 0.5) != getattr(self, '_last_grav_pulse', -1):
+                self._last_grav_pulse = int(elapsed * 0.5)
+                return self._read_with_gravity_comp(arm)
+        # Normales Lesen ohne Torque-Toggle
         if hasattr(arm, 'read_position_deg_single'):
             return arm.read_position_deg_single()
         return arm.read_position_deg()
-
 
     def _read_with_gravity_comp(self, arm) -> Optional[dict]:
         """Reads position with brief torque pulse to counter gravity drift."""
