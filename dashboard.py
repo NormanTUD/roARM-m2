@@ -770,6 +770,10 @@ class Arm3DWidget(Static):
         self._cam_elevation = 25.0
         self._cam_distance = 600.0
 
+    def on_resize(self, event) -> None:
+        """Re-render bei Terminal-Resize für korrekte Proportionen."""
+        self._refresh_display()
+
     def update_pose(self, b: float, s: float, e: float, target: dict = None):
         self.b = b
         self.s = s
