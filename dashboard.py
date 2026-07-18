@@ -20,7 +20,6 @@ Auto-Connect wenn USB-Port gefunden.
 #     "textual>=0.79.0",
 #     "matplotlib",
 #     "rich",
-#     "rich_pixels",
 #     "Pillow",
 #     "pyyaml",
 # ]
@@ -37,6 +36,7 @@ ensure_uv()
 
 import rich
 from rich.console import Console
+from rich.text import Text
 
 ci_env: bool = os.getenv("CI", "false").lower() == "true"
 
@@ -58,56 +58,59 @@ console = Console(
 def spinner(text: str):
     return console.status(f"[bold green]{text}", speed=0.2, refresh_per_second=6)
 
-with spinner("Importing json..."):
+with spinner("Importing base modules..."):
     import json
-with spinner("Importing time..."):
     import time
+    import math
+    import threading
+    import asyncio
+    import io
+    import base64
+    import subprocess
+    import tempfile
+    import math
+    from pathlib import Path
+    from datetime import datetime
+    from typing import Optional
 
-import math
-import threading
-import asyncio
-import io
-import base64
-import subprocess
-import tempfile
-from pathlib import Path
-from datetime import datetime
-from typing import Optional
+with spinner("Importing numpy..."):
+    import numpy as np
 
-import numpy as np
+with spinner("Importing textual..."):
+    from textual import on, work
+    from textual.app import App, ComposeResult
+    from textual.containers import (
+        Container, Horizontal, Vertical, ScrollableContainer,
+        VerticalScroll,
+    )
+    from textual.widgets import (
+        Header, Footer, Static, Button, Label, Input,
+        TabbedContent, TabPane, DataTable, ProgressBar,
+        Switch, Select, ListView, ListItem, RichLog,
+        Rule,
+    )
+    from textual.reactive import reactive
+    from textual.timer import Timer
+    from textual.message import Message
+    from textual.binding import Binding
+    from textual.css.query import NoMatches
+    from textual.widgets import Static
+    from textual.strip import Strip
 
-from textual import on, work
-from textual.app import App, ComposeResult
-from textual.containers import (
-    Container, Horizontal, Vertical, ScrollableContainer,
-    VerticalScroll,
-)
-from textual.widgets import (
-    Header, Footer, Static, Button, Label, Input,
-    TabbedContent, TabPane, DataTable, ProgressBar,
-    Switch, Select, ListView, ListItem, RichLog,
-    Rule,
-)
-from textual.reactive import reactive
-from textual.timer import Timer
-from textual.message import Message
-from textual.binding import Binding
-from textual.css.query import NoMatches
+with spinner("Importing robot..."):
+    from robot import (
+        RoArmConnection, find_arm_port, rad_to_deg, deg_to_rad,
+        START_POSITION_DEG, POSITION_TOLERANCE, BAUDRATE,
+    )
 
-from robot import (
-    RoArmConnection, find_arm_port, rad_to_deg, deg_to_rad,
-    START_POSITION_DEG, POSITION_TOLERANCE, BAUDRATE,
-)
-from safety import SafeArm, SafetyLimits
-from visualize import RobotVisualizer, forward_kinematics
+with spinner("Importing safety..."):
+    from safety import SafeArm, SafetyLimits
 
-from rich_pixels import Pixels
-from PIL import Image
+with spinner("Importing visualize..."):
+    from visualize import RobotVisualizer, forward_kinematics
 
-from textual.widgets import Static
-from textual.strip import Strip
-from rich.text import Text
-import math
+with spinner("Importing Pillow..."):
+    from PIL import Image
 
 # ============================================================
 # KONFIGURATION
