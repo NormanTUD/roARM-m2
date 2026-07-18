@@ -106,11 +106,17 @@ with spinner("Importing robot..."):
 with spinner("Importing safety..."):
     from safety import SafeArm, SafetyLimits
 
-with spinner("Importing visualize..."):
-    from visualize import RobotVisualizer, forward_kinematics
-
 with spinner("Importing Pillow..."):
     from PIL import Image
+
+# ============================================================
+# KINEMATIK-KONSTANTEN
+# ============================================================
+
+BASE_HEIGHT = 75.0       # Höhe Basis bis Shoulder-Gelenk
+UPPER_ARM = 206.0        # Oberarm: Shoulder → Elbow
+FOREARM = 206.0          # Unterarm: Elbow → Gripper-Ansatz
+GRIPPER_LENGTH = 80.0    # Gripper-Länge (Teil des Unterarm-Segments)
 
 # ============================================================
 # KONFIGURATION
@@ -128,6 +134,52 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 import logging
+
+def forward_kinematics(b_deg: float, s_deg: float, e_deg: float) -> dict:
+    """
+    Kinematik für RoArm-M2-S (ohne Wrist-Gelenk).
+    
+    Gelenke:
+    - b: Base-Rotation um Z-Achse. b=0 → +X (nach vorne)
+    - s: Shoulder. s=0 → Oberarm HORIZONTAL nach vorne.
+         s>0 → nach oben, s<0 → nach unten.
+    - e: Elbow. Innenwinkel zwischen Ober- und Unterarm.
+         e=180° → gestreckt
+         e=90° → Unterarm steht 90° zum Oberarm
+    """
+    b_rad = math.radians(b_deg)
+    s_rad = math.radians(90.0 - s_deg)
+
+    base = np.array([0.0, 0.0, 0.0])
+    shoulder = np.array([0.0, 0.0, BASE_HEIGHT])
+
+    # Oberarm
+    elbow_local_x = UPPER_ARM * math.cos(s_rad)
+    elbow_local_z = BASE_HEIGHT + UPPER_ARM * math.sin(s_rad)
+
+    # Unterarm: absoluter Winkel
+    forearm_abs_angle = s_rad - math.radians(e_deg)
+
+    # Gripper-Spitze (Unterarm + Gripper als ein Segment)
+    total_forearm = FOREARM + GRIPPER_LENGTH
+    gripper_local_x = elbow_local_x + total_forearm * math.cos(forearm_abs_angle)
+    gripper_local_z = elbow_local_z + total_forearm * math.sin(forearm_abs_angle)
+
+    # Base-Rotation um Z-Achse
+    cos_b = math.cos(b_rad)
+    sin_b = math.sin(b_rad)
+
+    def rotate_base(x, z):
+        return np.array([x * cos_b, x * sin_b, z])
+
+    return {
+        "base": base,
+        "shoulder": np.array([0.0, 0.0, BASE_HEIGHT]),
+        "elbow": rotate_base(elbow_local_x, elbow_local_z),
+        "gripper": rotate_base(gripper_local_x, gripper_local_z),
+    }
+
+
 
 class TUILogHandler(logging.Handler):
     """Leitet robot.py Warnungen ins Teach-Log der TUI."""
