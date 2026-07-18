@@ -353,6 +353,56 @@ class JointHistory:
         self.data = {"b": [], "s": [], "e": [], "h": []}
 
 # ============================================================
+# ANIMATED STATUS INDICATOR
+# ============================================================
+
+class ActivityIndicator:
+    """Manages animated spinner states for the status bar."""
+
+    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    DOTS_FRAMES = [".", "..", "...", ".."]
+
+    def __init__(self):
+        self._active = False
+        self._message = ""
+        self._icon = ""
+        self._frame_index = 0
+        self._start_time = 0.0
+
+    def start(self, message: str, icon: str = "⏳"):
+        self._active = True
+        self._message = message
+        self._icon = icon
+        self._frame_index = 0
+        self._start_time = time.time()
+
+    def stop(self):
+        self._active = False
+        self._message = ""
+        self._icon = ""
+        self._frame_index = 0
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    @property
+    def elapsed(self) -> float:
+        if not self._active:
+            return 0.0
+        return time.time() - self._start_time
+
+    def next_frame(self) -> str:
+        """Returns the next animated status string."""
+        if not self._active:
+            return ""
+        spinner = self.SPINNER_FRAMES[self._frame_index % len(self.SPINNER_FRAMES)]
+        dots = self.DOTS_FRAMES[self._frame_index % len(self.DOTS_FRAMES)]
+        elapsed = self.elapsed
+        self._frame_index += 1
+        return f"{self._icon} {spinner} {self._message}{dots} [{elapsed:.1f}s]"
+
+# ============================================================
 # CSS STYLESHEET
 # ============================================================
 
@@ -406,6 +456,19 @@ TabPane {
 .status-bar Label {
     width: auto;
     margin: 0 1;
+}
+
+#status-activity {
+    width: auto;
+    min-width: 35;
+    margin: 0 1;
+    color: $warning;
+}
+
+.recording-timer {
+    height: 1;
+    margin: 0 1;
+    color: $error;
 }
 
 .joint-display {
@@ -905,6 +968,13 @@ class RoArmDashboard(App):
         self._all_log_lines = []
         self._log_filter_pattern = ""
 
+        # Activity indicator state
+        self._activity = ActivityIndicator()
+        self._activity_timer: Optional[Timer] = None
+
+        # Recording elapsed timer
+        self._recording_elapsed_timer: Optional[Timer] = None
+
     @staticmethod
     def _apply_calibration_static(cal_model, target: dict) -> dict:
         """Wendet Kalibrierungskorrektur an (identisch zu play.py Logik)."""
@@ -1037,6 +1107,11 @@ class RoArmDashboard(App):
                                         "✊/✋ Gripper [g]", id="btn-gripper",
                                         variant="default"
                                     )
+                                # Recording elapsed timer display
+                                yield Label(
+                                    "", id="teach-recording-timer",
+                                    classes="recording-timer"
+                                )
 
                             with Vertical(id="teach-right"):
                                 yield JointSparklineWidget(
@@ -1236,12 +1311,14 @@ class RoArmDashboard(App):
         # Status-Bar
         with Horizontal(classes="status-bar"):
             yield Label("🔌 Disconnected", id="status-connection")
-            yield Label("│", id="status-sep1")
+            yield Label("┊", id="status-sep1")
             yield Label("🔒 Torque ON", id="status-torque")
-            yield Label("│", id="status-sep2")
+            yield Label("┊", id="status-sep2")
             yield Label("🛡️ Safety OK", id="status-safety")
-            yield Label("│", id="status-sep3")
+            yield Label("┊", id="status-sep3")
             yield Label("⏱️ --", id="status-mode")
+            yield Label("┊", id="status-sep4")
+            yield Label("", id="status-activity")
 
         yield Footer()
 
@@ -1437,6 +1514,84 @@ class RoArmDashboard(App):
                 pass
 
     # ============================================================
+    # ACTIVITY INDICATOR METHODS
+    # ============================================================
+
+    def _start_activity(self, message: str, icon: str = "⏳"):
+        """Starts the animated activity indicator in the status bar."""
+        self._activity.start(message, icon)
+        # Start the animation timer (updates every 100ms for smooth animation)
+        if self._activity_timer is not None:
+            self._activity_timer.stop()
+        self._activity_timer = self.set_interval(0.1, self._tick_activity)
+
+    def _stop_activity(self, final_message: str = ""):
+        """Stops the animated activity indicator."""
+        self._activity.stop()
+        if self._activity_timer is not None:
+            self._activity_timer.stop()
+            self._activity_timer = None
+        try:
+            label = self.query_one("#status-activity", Label)
+            if final_message:
+                label.update(final_message)
+            else:
+                label.update("")
+        except NoMatches:
+            pass
+
+    def _tick_activity(self):
+        """Called by timer to animate the activity indicator."""
+        if not self._activity.is_active:
+            return
+        try:
+            label = self.query_one("#status-activity", Label)
+            label.update(self._activity.next_frame())
+        except NoMatches:
+            pass
+
+    def _start_recording_timer(self):
+        """Starts the recording elapsed time display."""
+        self._update_recording_timer_display()
+        if self._recording_elapsed_timer is not None:
+            self._recording_elapsed_timer.stop()
+        self._recording_elapsed_timer = self.set_interval(
+            0.5, self._update_recording_timer_display
+        )
+
+    def _stop_recording_timer(self):
+        """Stops the recording elapsed time display."""
+        if self._recording_elapsed_timer is not None:
+            self._recording_elapsed_timer.stop()
+            self._recording_elapsed_timer = None
+        try:
+            label = self.query_one("#teach-recording-timer", Label)
+            label.update("")
+        except NoMatches:
+            pass
+
+    def _update_recording_timer_display(self):
+        """Updates the recording timer label with elapsed time and waypoint count."""
+        if not self.recording:
+            return
+        elapsed = time.time() - self._teach_start_time
+        move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
+        wp_count = len(move_wps)
+
+        # Pulsing dot animation
+        dots = "●" if int(elapsed * 2) % 2 == 0 else "○"
+
+        try:
+            label = self.query_one("#teach-recording-timer", Label)
+            label.update(
+                f"[bold red]{dots} REC[/] "
+                f"[white]{elapsed:.1f}s[/] "
+                f"[dim]| {wp_count} WPs | {RECORD_HZ}Hz[/]"
+            )
+        except NoMatches:
+            pass
+
+    # ============================================================
     # ACTIONS (Keyboard Shortcuts)
     # ============================================================
 
@@ -1628,6 +1783,12 @@ class RoArmDashboard(App):
         self._log_teach("[bold red]⏺ AUFNAHME LÄUFT[/]")
         self._log_teach("[dim]Bewege den Arm! [Space]=Stop [g]=Gripper [t]=Torque[/]")
 
+        # Start activity indicator
+        self._start_activity("Recording", "🔴")
+
+        # Start recording elapsed timer
+        self._start_recording_timer()
+
         # Timer starten
         self._teach_timer = self.set_interval(
             1.0 / RECORD_HZ, self._teach_poll_position
@@ -1700,9 +1861,14 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
 
+        # Stop activity indicator and recording timer
+        self._stop_activity("✅ Recording saved")
+        self._stop_recording_timer()
+
         move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
         if not move_wps:
             self._log_teach("[yellow]Keine Wegpunkte aufgezeichnet![/]")
+            self._stop_activity()
             return
 
         duration = move_wps[-1]["t"]
@@ -1714,6 +1880,9 @@ class RoArmDashboard(App):
         if filepath:
             self._log_teach(f"[green]💾 Gespeichert: {filepath}[/]")
             self._refresh_recordings_table()
+
+        # Clear the final message after 3 seconds
+        self.set_timer(3.0, lambda: self._stop_activity())
 
     def _save_recording(self) -> Optional[str]:
         move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
@@ -1760,6 +1929,10 @@ class RoArmDashboard(App):
         if not self._arm or not self.connected:
             return
 
+        # Start activity indicator
+        self.app.call_from_thread(
+            self._start_activity, "Homing", "🏠"
+        )
         self.app.call_from_thread(
             self._log_teach, "[dim]🏠 Fahre zur Home-Position...[/]"
         )
@@ -1782,9 +1955,19 @@ class RoArmDashboard(App):
             self.app.call_from_thread(self._update_joint_displays, pos)
             self.app.call_from_thread(self._update_arm_views, pos)
 
+        # Stop activity indicator with success message
+        self.app.call_from_thread(
+            self._stop_activity, "✅ Home reached"
+        )
         self.app.call_from_thread(
             self._log_teach, "[green]✅ Home-Position erreicht[/]"
         )
+
+        # Clear the success message after 3 seconds
+        self.app.call_from_thread(
+            self.set_timer, 3.0, lambda: self._stop_activity()
+        )
+
 
     # ============================================================
     # PLAY MODE
@@ -1841,6 +2024,9 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
 
+        # Start activity indicator
+        self._start_activity("Starting playback", "▶️")
+
         self._log_play(
             f"[green]▶ Playback: {len(wps)} WPs, {wps[-1]['t']:.1f}s[/]"
         )
@@ -1892,6 +2078,10 @@ class RoArmDashboard(App):
         rate_limiter = RateLimiter(max_hz=stream_hz + 10)
 
         # --- Zur Startposition fahren ---
+        self.app.call_from_thread(
+            self._start_activity, "Moving to start", "⏳"
+        )
+
         self._arm.torque_on()
         time.sleep(0.2)
         start = waypoints[0]
@@ -1907,6 +2097,17 @@ class RoArmDashboard(App):
             self._log_play, "[dim]  Fahre zur Startposition...[/]"
         )
         time.sleep(2.0)
+
+        # --- Switch activity to playing with duration info ---
+        self.app.call_from_thread(
+            self._start_activity, f"Playing ({duration:.1f}s)", "▶️"
+        )
+
+
+        # --- Switch activity to playing ---
+        self.app.call_from_thread(
+            self._start_activity, f"Playing ({duration:.1f}s)", "▶️"
+        )
 
         # --- Streaming ---
         self._play_start_time = time.time()
@@ -2007,6 +2208,10 @@ class RoArmDashboard(App):
 
         # --- Precision Endpoint (wie play.py) ---
         if self.playing:
+            self.app.call_from_thread(
+                self._start_activity, "Precision settle", "🎯"
+            )
+
             final_target = {}
             for joint in ["b", "s", "e", "h"]:
                 final_target[joint] = round(float(splines[joint](times[-1])), 2)
@@ -2036,6 +2241,11 @@ class RoArmDashboard(App):
                     f"Δb={delta_b:+.2f}° Δs={delta_s:+.2f}° Δe={delta_e:+.2f}°[/]"
                 )
 
+        # Stop activity indicator
+        self.app.call_from_thread(
+            self._stop_activity, "✅ Playback complete"
+        )
+
         self.app.call_from_thread(
             self._log_play,
             f"[green]✅ Playback beendet: {commands_sent} Cmds, "
@@ -2043,6 +2253,19 @@ class RoArmDashboard(App):
             f"{cal_info}[/]"
         )
         self.app.call_from_thread(self._playback_finished)
+
+        # Clear success message after 3 seconds
+        self.app.call_from_thread(
+            self.set_timer, 3.0, lambda: self._stop_activity()
+        )
+
+        # Stop activity indicator
+        self.app.call_from_thread(
+            self._stop_activity, "✅ Playback complete"
+        )
+        self.app.call_from_thread(
+            self.set_timer, 3.0, lambda: self._stop_activity()
+        )
 
     def _update_play_timeline(self, elapsed: float):
         """Aktualisiert die Timeline-Position."""
@@ -2063,12 +2286,15 @@ class RoArmDashboard(App):
     def _stop_playback(self):
         """Stoppt das Playback."""
         self.playing = False
+        self._stop_activity("⏹ Stopped")
         self._log_play("[yellow]⏹ Playback gestoppt[/]")
         try:
             self.query_one("#btn-play-start", Button).disabled = False
             self.query_one("#btn-play-stop", Button).disabled = True
         except NoMatches:
             pass
+        # Clear stop message after 3 seconds
+        self.set_timer(3.0, lambda: self._stop_activity())
 
     # ============================================================
     # CALIBRATE MODE
@@ -2117,6 +2343,9 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
 
+        # Start activity indicator
+        self._start_activity("Calibrating", "🎯")
+
         self._log_calibrate(
             f"[bold green]🎯 Kalibrierung gestartet[/]\n"
             f"  Pose-Set: {pose_set}\n"
@@ -2125,6 +2354,7 @@ class RoArmDashboard(App):
         )
 
         self._run_calibration_worker(pose_set, repeats, auto_accept)
+
 
     @work(thread=True)
     def _run_calibration_worker(self, pose_set: str, repeats: int,
@@ -2167,10 +2397,17 @@ class RoArmDashboard(App):
                 measurement_count += 1
                 pct = measurement_count / total * 100
 
-                self.app.call_from_thread(
-                    self._update_cal_status,
+                status_text = (
                     f"Pose {i+1}/{len(valid_poses)} · Rep {rep+1}/{repeats} "
                     f"· {pct:.0f}%"
+                )
+                self.app.call_from_thread(
+                    self._update_cal_status, status_text
+                )
+                # Update activity indicator with progress
+                self.app.call_from_thread(
+                    self._start_activity,
+                    f"Cal {pct:.0f}% P{i+1}/{len(valid_poses)}", "🎯"
                 )
 
                 # Safe-UP zwischen Posen
@@ -2249,6 +2486,14 @@ class RoArmDashboard(App):
         # Buttons zurücksetzen
         self.app.call_from_thread(self._cal_finished)
 
+        # Stop activity indicator
+        self.app.call_from_thread(
+            self._stop_activity, "✅ Calibration complete"
+        )
+        self.app.call_from_thread(
+            self.set_timer, 5.0, lambda: self._stop_activity()
+        )
+
         # Zurück zu Safe-UP
         current = self._arm.read_position_deg()
         if current:
@@ -2271,12 +2516,14 @@ class RoArmDashboard(App):
 
     def _abort_calibration(self):
         """Bricht die Kalibrierung ab."""
+        self._stop_activity("⚠ Calibration aborted")
         self._log_calibrate("[yellow]⚠ Kalibrierung abgebrochen![/]")
         try:
             self.query_one("#btn-cal-start", Button).disabled = False
             self.query_one("#btn-cal-abort", Button).disabled = True
         except NoMatches:
             pass
+        self.set_timer(3.0, lambda: self._stop_activity())
 
     def _load_calibration(self):
         """Lädt eine bestehende Kalibrierungsdatei."""
@@ -2351,22 +2598,27 @@ class RoArmDashboard(App):
         self._update_status_torque(True)
         time.sleep(0.1)
 
+        joint_names = {"b": "Base", "s": "Shoulder", "e": "Elbow", "h": "Hand"}
+
+        # Start activity indicator
+        self._start_activity(f"Moving {joint_names[joint]}", "🎯")
+
         self._arm.move_to(
             pos["b"], pos["s"], pos["e"], pos["h"],
             spd=15, acc=8
         )
 
-        joint_names = {"b": "Base", "s": "Shoulder", "e": "Elbow", "h": "Hand"}
         self._log_servo(
             f"[green]→ {joint_names[joint]} → {angle:.2f}°[/]"
         )
 
-        # Nach kurzer Wartezeit Position lesen
+        # Nach kurzer Wartezeit Position lesen und activity stoppen
         self.set_timer(1.5, self._servo_read_after_move)
 
     def _servo_read_after_move(self):
         """Liest Position nach einem Servo-Move."""
         if not self._arm or not self.connected:
+            self._stop_activity()
             return
         pos = self._arm.read_position_deg()
         if pos:
@@ -2374,6 +2626,10 @@ class RoArmDashboard(App):
             self._update_joint_displays(pos)
             self._update_arm_views(pos)
             self._update_servo_readouts(pos)
+
+        # Stop activity indicator
+        self._stop_activity("✅ Move complete")
+        self.set_timer(3.0, lambda: self._stop_activity())
 
     # ============================================================
     # LOGS TAB
