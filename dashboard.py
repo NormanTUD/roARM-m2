@@ -318,7 +318,6 @@ class SmoothTrajectory:
 
     def _compute_adaptive_timing(self):
         """Computes time reparameterization based on curvature."""
-        from scipy.interpolate import CubicSpline
         n_samples = 500
         t_original = np.linspace(0, self._original_duration, n_samples)
         curvature = self._compute_curvature(t_original)
