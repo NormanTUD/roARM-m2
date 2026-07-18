@@ -1578,21 +1578,21 @@ class RoArmDashboard(App):
         cmd = event["cmd"]
         if cmd == "CLOSE":
             arm.gripper_close()
-            self.app.call_from_thread(
+            self.call_from_thread(
                 self._log_play, f"[bold]  ✊ Gripper ZU [{elapsed:.2f}s][/]")
         elif cmd == "OPEN":
             arm.gripper_open()
-            self.app.call_from_thread(
+            self.call_from_thread(
                 self._log_play, f"[bold]  ✋ Gripper AUF [{elapsed:.2f}s][/]")
         elif cmd == "LED_ON":
             if hasattr(arm, 'send_cmd'):
                 arm.send_cmd({"T": 114, "led": 255})
-            self.app.call_from_thread(
+            self.call_from_thread(
                 self._log_play, f"[bold]  💡 LED AN [{elapsed:.2f}s][/]")
         elif cmd == "LED_OFF":
             if hasattr(arm, 'send_cmd'):
                 arm.send_cmd({"T": 114, "led": 0})
-            self.app.call_from_thread(
+            self.call_from_thread(
                 self._log_play, f"[bold]  💡 LED AUS [{elapsed:.2f}s][/]")
 
     def _process_pending_events(self, arm, events: list, event_idx: int,
@@ -1716,10 +1716,10 @@ class RoArmDashboard(App):
                                         variant="default"
                                     )
 
-                                    yield Input(value="0", id="play-loop-pause-input", type="number")
-                                    yield Label("Speed:", classes="joint-label")
-                                    yield Input(value="1.0", id="play-speed-input", type="number")
-                                    yield Label("Loop Pause (s):", classes="joint-label")
+                                yield Input(value="0", id="play-loop-pause-input", type="number")
+                                yield Label("Speed:", classes="joint-label")
+                                yield Input(value="1.0", id="play-speed-input", type="number")
+                                yield Label("Loop Pause (s):", classes="joint-label")
 
                             with Vertical():
                                 yield Label("📁 Recordings:", classes="joint-label")
@@ -2644,58 +2644,36 @@ class RoArmDashboard(App):
         arm = self._active_arm
         if arm is None:
             return
-
-        # Start activity indicator
-        self.app.call_from_thread(
-            self._start_activity, "Homing", "🏠"
-        )
-        self.app.call_from_thread(
-            self._log_teach, "[dim]🏠 Fahre zur Home-Position...[/]"
-        )
-
+        self.call_from_thread(self._start_activity, "Homing", "🏠")
+        self.call_from_thread(self._log_teach, "[dim]🏠 Fahre zur Home-Position...[/]")
         arm.torque_on()
         self.torque_on_state = True
-        self.app.call_from_thread(self._update_status_torque, True)
+        self.call_from_thread(self._update_status_torque, True)
         time.sleep(0.2)
-
         arm.move_to(
             START_POSITION_DEG["b"], START_POSITION_DEG["s"],
             START_POSITION_DEG["e"], START_POSITION_DEG["h"],
             spd=25, acc=12
         )
-
-        # Wait for movement to complete
         if self._is_sim:
-            # In simulation, wait for the sim to reach target
-            for _ in range(100):  # max 2 seconds
+            for _ in range(100):
                 time.sleep(0.02)
                 self._sim_arm.step_simulation(0.02)
                 pos = self._sim_arm.read_position_deg()
-                self.app.call_from_thread(self._update_joint_displays, pos)
-                self.app.call_from_thread(self._update_arm_views, pos)
+                self.call_from_thread(self._update_joint_displays, pos)
+                self.call_from_thread(self._update_arm_views, pos)
                 if not self._sim_arm.is_moving:
                     break
         else:
             time.sleep(2.0)
-
         pos = arm.read_position_deg()
         if pos:
             self._current_pos = pos
-            self.app.call_from_thread(self._update_joint_displays, pos)
-            self.app.call_from_thread(self._update_arm_views, pos)
-
-        # Stop activity indicator with success message
-        self.app.call_from_thread(
-            self._stop_activity, "✅ Home reached"
-        )
-        self.app.call_from_thread(
-            self._log_teach, "[green]✅ Home-Position erreicht[/]"
-        )
-
-        # Clear the success message after 3 seconds
-        self.app.call_from_thread(
-            self.set_timer, 3.0, lambda: self._stop_activity()
-        )
+            self.call_from_thread(self._update_joint_displays, pos)
+            self.call_from_thread(self._update_arm_views, pos)
+        self.call_from_thread(self._stop_activity, "✅ Home reached")
+        self.call_from_thread(self._log_teach, "[green]✅ Home-Position erreicht[/]")
+        self.call_from_thread(self.set_timer, 3.0, lambda: self._stop_activity())
 
 
     # ============================================================
@@ -2788,12 +2766,12 @@ class RoArmDashboard(App):
             cal_path = Path("calibration") / "roarm_calibration.cal"
             if cal_path.exists():
                 model = CalibrationModel.load(str(cal_path))
-                self.app.call_from_thread(
+                self.call_from_thread(
                     self._log_play, f"[green]📂 Kalibrierung geladen: {cal_path}[/]"
                 )
                 return model
         except Exception as e:
-            self.app.call_from_thread(
+            self.call_from_thread(
                 self._log_play, f"[yellow]⚠ Kalibrierung nicht verfügbar: {e}[/]"
             )
         return None
@@ -2820,25 +2798,24 @@ class RoArmDashboard(App):
         """Updates UI during playback (called from worker thread)."""
         if is_sim:
             pos = self._sim_arm.read_position_deg()
-            self.app.call_from_thread(self._update_arm_views, pos)
-            self.app.call_from_thread(self._update_joint_displays, pos)
+            self.call_from_thread(self._update_arm_views, pos)
+            self.call_from_thread(self._update_joint_displays, pos)
         else:
-            self.app.call_from_thread(self._update_arm_views, corrected)
-        self.app.call_from_thread(self._update_play_timeline, elapsed)
+            self.call_from_thread(self._update_arm_views, corrected)
+        self.call_from_thread(self._update_play_timeline, elapsed)
 
     def _finalize_playback(self, arm, is_sim: bool, cal_model, duration: float):
         """Finalizes playback: verify endpoint, log summary, reset UI."""
         self.playing = False
-        # Endpoint verification (real arm only)
         if not is_sim and self._last_play_commanded:
             final_target = self._last_play_commanded
             err = self._verify_endpoint(arm, final_target)
-        # Stop activity
-        self.app.call_from_thread(self._stop_activity, "✅ Playback complete")
-        self.app.call_from_thread(self._playback_finished)
-        self.app.call_from_thread(
+        self.call_from_thread(self._stop_activity, "✅ Playback complete")
+        self.call_from_thread(self._playback_finished)
+        self.call_from_thread(
             self.set_timer, 3.0, lambda: self._stop_activity()
         )
+
 
     def _arm_is_estopped(self) -> bool:
         """Checks if the safety layer has triggered an emergency stop."""
@@ -2862,7 +2839,7 @@ class RoArmDashboard(App):
         pause_s = self._get_loop_pause()
         while self._is_loop_enabled() and not self._arm_is_estopped():
             if pause_s > 0:
-                self.app.call_from_thread(
+                self.call_from_thread(
                     self._log_play, f"[dim]⏸ Loop-Pause: {pause_s:.1f}s[/]")
                 time.sleep(pause_s)
             self.playing = True
@@ -2880,7 +2857,7 @@ class RoArmDashboard(App):
     def _do_precision_endpoint(self, arm, trajectory: 'SmoothTrajectory',
                                duration: float, cal_model, is_sim: bool):
         """Executes precision endpoint after streaming completes."""
-        self.app.call_from_thread(self._start_activity, "Precision settle", "🎯")
+        self.call_from_thread(self._start_activity, "Precision settle", "🎯")
         final_target = trajectory.sample(duration)
         final_corrected = self._apply_calibration_static(cal_model, final_target)
         if is_sim:
@@ -3041,12 +3018,13 @@ class RoArmDashboard(App):
         if pos is None:
             return None
         err = max(abs(pos[j] - final_target[j]) for j in ["b", "s", "e", "h"])
-        self.app.call_from_thread(
+        self.call_from_thread(
             self._log_play,
             f"[dim]  Endposition: Fehler={err:.3f}° "
             f"(b={pos['b']:.2f} s={pos['s']:.2f} e={pos['e']:.2f})[/]"
         )
         return err
+
 
     def _graceful_stop(self, arm_raw, last_commanded: dict):
         """Executes a graceful stop instead of hard torque-off."""
@@ -3422,9 +3400,9 @@ class RoArmDashboard(App):
         current = self._arm.read_position_deg()
         if current:
             move_to_safe_up(self._arm, current_pose=current)
-        self.app.call_from_thread(self._cal_finished)
-        self.app.call_from_thread(self._stop_activity, "✅ Calibration complete")
-        self.app.call_from_thread(self.set_timer, 5.0, lambda: self._stop_activity())
+        self.call_from_thread(self._cal_finished)
+        self.call_from_thread(self._stop_activity, "✅ Calibration complete")
+        self.call_from_thread(self.set_timer, 5.0, lambda: self._stop_activity())
 
 
     def _update_cal_status(self, text: str):
