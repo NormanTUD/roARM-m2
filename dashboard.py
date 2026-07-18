@@ -118,6 +118,9 @@ UPPER_ARM = 206.0        # Oberarm: Shoulder → Elbow
 FOREARM = 206.0          # Unterarm: Elbow → Gripper-Ansatz
 GRIPPER_LENGTH = 80.0    # Gripper-Länge (Teil des Unterarm-Segments)
 
+ENDPOINT_SPEEDS = [(8, 4), (5, 2), (3, 1)]
+ENDPOINT_SETTLE_WAIT = 0.8
+
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
 # ============================================================
@@ -1244,9 +1247,6 @@ class RoArmDashboard(App):
     TITLE = "RoArm-M2-S Dashboard"
     SUB_TITLE = "Teach · Play · Calibrate · Servo · Logs"
     CSS = CSS
-
-    ENDPOINT_SPEEDS = [(8, 4), (5, 2), (3, 1)]
-    ENDPOINT_SETTLE_WAIT = 0.8
 
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
