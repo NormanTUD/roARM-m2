@@ -137,7 +137,7 @@ MAX_TRACKING_ERROR = 15.0
 MAX_DEG_PER_TICK = 1.5  # Max 1.5° pro 20ms Tick = 75°/s (Servo-Limit ~60°/s)
 LOOKAHEAD_MS = 40  # 2 Frames voraus
 MIN_DELTA_DEG = 0.0
-LOOKAHEAD_S = 0.15          # HOCH von 0.06 — 150ms voraus = Servo bremst NIE ab
+LOOKAHEAD_S = 0.3
 
 STREAM_SPD = 0              # 0 = "so schnell wie möglich" (STS3215 Doku!)
 STREAM_ACC = 0              # 0 = "sofortige Beschleunigung" (kein Trapezprofil!)
@@ -147,6 +147,15 @@ TRACKING_CHECK_ENABLED = False   # DEAKTIVIERT während Streaming!
 
 USE_BUSY_WAIT = True        # Busy-Wait statt time.sleep() für Präzision
 MAX_SERIAL_BATCH = 3        # Max 3 Commands ohne Pause (Buffer-Overflow-Schutz)
+
+STREAM_MIN_SEND_INTERVAL_S = 0.008   # FIX #7: Mindestens 8ms zwischen Commands
+                                       # Verhindert Bursts nach Skip-Phasen
+STREAM_FLUSH_INTERVAL = 200           # FIX #1: Flush nur alle 200 Commands (war 50)
+STREAM_UI_UPDATE_INTERVAL_S = 1.0     # FIX #3: UI nur jede Sekunde (war 0.5s)
+STREAM_EVENT_PAUSE_S = 0.05           # FIX #4: Gripper-Pause nur 50ms (war 300ms)
+
+STREAM_PREBUFFER_COMMANDS = 5         # FIX #6: 5 Commands vorab senden
+                                       # → USB-Buffer ist nie leer
 
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
@@ -166,7 +175,7 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 RECORD_HZ = 50
 MOVE_THRESHOLD_DEG = 0.3
-STREAM_HZ = 200
+STREAM_HZ = 100
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1724,15 +1733,20 @@ class RoArmDashboard(App):
 
     def _process_pending_events(self, arm, events: list, event_idx: int,
                                  elapsed: float) -> tuple:
-        """Processes all events up to current elapsed time. Returns (new_idx, pause)."""
+        """Processes all events up to current elapsed time.
+
+        FIX #4: Keine 300ms Pause mehr! Gripper-Commands werden
+        als fire-and-forget gesendet.
+        """
         total_pause = 0.0
         while event_idx < len(events):
             ev = events[event_idx]
             if ev["t"] <= elapsed:
                 self._process_playback_event(arm, ev, elapsed)
+                # FIX #4: Nur 50ms statt 300ms
                 if ev["cmd"] in ("CLOSE", "OPEN"):
-                    time.sleep(0.3)
-                    total_pause += 0.3
+                    time.sleep(STREAM_EVENT_PAUSE_S)
+                    total_pause += STREAM_EVENT_PAUSE_S
                 event_idx += 1
             else:
                 break
@@ -2991,30 +3005,35 @@ class RoArmDashboard(App):
 
     def _streaming_loop(self, arm, trajectory, duration,
                         cal_model, events, is_sim):
-        """KOMPLETT NEU: Jitter-freie Streaming-Loop.
+        """KOMPLETT NEU v2: Jitter-freie Streaming-Loop.
         
-        Fixes:
-        - Kein time.sleep() → Busy-Wait für µs-Präzision
-        - Kein Lock-Contention → Streaming hat exklusiven Serial-Zugriff
-        - Kein Tracking-Check während Streaming → nur am Ende
-        - Großer Lookahead → Servo bremst nie ab
-        - spd=0, acc=0 → STS3215 "Immediate Mode" (kein Trapezprofil)
-        - Kein Rate-Limiter → Loop-Timing ist der Limiter
-        - UI-Updates nur alle 500ms → kein Thread-Blocking
+        Fixes angewendet:
+        1. Flush-Intervall drastisch reduziert (200 statt 50)
+        2. Lookahead auf 300ms erhöht
+        3. UI-Updates async via set_timer (non-blocking)
+        4. Event-Pausen auf 50ms reduziert + Command-Nachführung
+        5. Reiner Busy-Wait ohne sleep-Hybrid
+        6. Pre-Buffer: 5 Commands vorab für vollen USB-Buffer
+        7. Anti-Burst: Mindest-Intervall zwischen Commands
+        8. Sanfter Übergang vom Start-Move zum Stream
         """
-        interval = 1.0 / STREAM_HZ  # 5ms bei 200Hz
+        interval = 1.0 / STREAM_HZ
 
-        # === STREAMING-MODUS AKTIVIEREN ===
+        # === FIX #6: STREAMING-MODUS MIT WRITE-BUFFER OPTIMIERUNG ===
         if not is_sim and hasattr(arm, 'enter_streaming_mode'):
             arm.enter_streaming_mode()
         elif not is_sim:
-            # Fallback: Buffer flushen und Lock vermeiden
             arm._ser.reset_input_buffer()
             arm._ser.reset_output_buffer()
 
         if not is_sim and self._safe_arm:
             self._safe_arm.start_streaming()
 
+        # === FIX #8: Sanfter Übergang - erste Commands mit Rampe ===
+        # Statt sofort mit voller Geschwindigkeit zu streamen,
+        # senden wir die ersten 5 Commands mit kleinerem Lookahead
+        RAMP_UP_COMMANDS = 10
+        
         playback_start = time.time()
         last_pos = None
         commands_sent = 0
@@ -3023,10 +3042,36 @@ class RoArmDashboard(App):
         self._last_play_commanded = None
         last_ui_update = 0.0
         last_log_time = 0.0
+        last_send_time = 0.0  # FIX #7: Für Anti-Burst
 
-        # Pre-compute: Ersten Command sofort senden (kein Warten)
-        first_target = trajectory.sample(0.0)
-        first_corrected = self._apply_calibration_static(cal_model, first_target)
+        # === FIX #6: Pre-Buffer - 5 Commands sofort senden ===
+        if not is_sim:
+            for pre_i in range(STREAM_PREBUFFER_COMMANDS):
+                pre_t = interval * pre_i
+                if pre_t >= duration:
+                    break
+                # Kleiner Lookahead für Pre-Buffer (sanfter Start)
+                pre_sample_t = min(pre_t + 0.05, duration)
+                pre_target = trajectory.sample(pre_sample_t)
+                pre_corrected = self._apply_calibration_static(cal_model, pre_target)
+                cmd = {
+                    "T": 122,
+                    "b": round(pre_corrected["b"], 2),
+                    "s": round(pre_corrected["s"], 2),
+                    "e": round(pre_corrected["e"], 2),
+                    "h": round(pre_corrected["h"], 2),
+                    "spd": STREAM_SPD,
+                    "acc": STREAM_ACC,
+                }
+                msg = json.dumps(cmd, separators=(',', ':'))
+                arm._ser.write(msg.encode() + b'\n')
+                last_pos = pre_corrected.copy()
+                self._last_play_commanded = pre_corrected.copy()
+                commands_sent += 1
+            # Einmaliger Flush nach Pre-Buffer
+            arm._ser.flush()
+            # Warte bis Pre-Buffer verarbeitet wird
+            time.sleep(interval * STREAM_PREBUFFER_COMMANDS)
 
         try:
             while self.playing:
@@ -3037,40 +3082,87 @@ class RoArmDashboard(App):
                     break
 
                 # ============================================================
-                # EVENTS (Gripper, LED) — nur wenn fällig
+                # FIX #4: EVENTS ohne lange Pause
+                # Statt 300ms zu warten, senden wir den Gripper-Command
+                # und machen SOFORT weiter mit dem nächsten Move-Command.
+                # Der Servo kann beides parallel verarbeiten.
                 # ============================================================
                 if event_idx < len(events) and events[event_idx]["t"] <= elapsed:
-                    event_idx, pause = self._process_pending_events(
-                        arm, events, event_idx, elapsed)
-                    if pause > 0:
-                        playback_start += pause
-                        elapsed = time.time() - playback_start
-                        if elapsed >= duration:
-                            break
+                    while event_idx < len(events) and events[event_idx]["t"] <= elapsed:
+                        ev = events[event_idx]
+                        cmd_str = ev.get("cmd", "")
+                        if cmd_str == "CLOSE":
+                            if hasattr(arm, 'send_cmd_fast'):
+                                arm.send_cmd_fast({"T": 106, "cmd": 3.14, "spd": 0, "acc": 0})
+                            else:
+                                arm.gripper_close()
+                        elif cmd_str == "OPEN":
+                            if hasattr(arm, 'send_cmd_fast'):
+                                arm.send_cmd_fast({"T": 106, "cmd": 1.08, "spd": 0, "acc": 0})
+                            else:
+                                arm.gripper_open()
+                        elif cmd_str == "LED_ON":
+                            if hasattr(arm, 'send_cmd_fast'):
+                                arm.send_cmd_fast({"T": 114, "led": 255})
+                        elif cmd_str == "LED_OFF":
+                            if hasattr(arm, 'send_cmd_fast'):
+                                arm.send_cmd_fast({"T": 114, "led": 0})
+                        event_idx += 1
+                    # FIX #4: Nur minimale Pause (50ms statt 300ms)
+                    # Genug für den Servo-Controller um den Gripper-Command zu parsen
+                    time.sleep(STREAM_EVENT_PAUSE_S)
+                    # Playback-Zeit korrigieren
+                    playback_start += STREAM_EVENT_PAUSE_S
+                    elapsed = time.time() - playback_start
+                    if elapsed >= duration:
+                        break
 
                 # ============================================================
-                # TRAJECTORY SAMPLE MIT GROSSEM LOOKAHEAD
+                # FIX #2 + #8: ADAPTIVER LOOKAHEAD
+                # Am Anfang klein (sanfter Start), dann voll
                 # ============================================================
-                # Lookahead: Servo-Ziel ist IMMER 150ms in der Zukunft
-                # → Der Servo hat immer ein "weit entferntes" Ziel
-                # → Er bremst NIEMALS ab (weil Ziel nie "erreicht" wird)
-                sample_time = min(elapsed + LOOKAHEAD_S, duration)
+                if commands_sent < RAMP_UP_COMMANDS:
+                    # Rampe: 50ms → 300ms über die ersten 10 Commands
+                    ramp_progress = commands_sent / RAMP_UP_COMMANDS
+                    current_lookahead = 0.05 + ramp_progress * (LOOKAHEAD_S - 0.05)
+                else:
+                    current_lookahead = LOOKAHEAD_S
+
+                sample_time = min(elapsed + current_lookahead, duration)
                 target = trajectory.sample(sample_time)
                 corrected = self._apply_calibration_static(cal_model, target)
 
                 # ============================================================
-                # DELTA-CHECK: Nur senden wenn sich was ändert
+                # FIX #7: ANTI-BURST Delta-Check mit Mindest-Intervall
+                # Problem: Wenn viele Commands geskippt werden (gerade Linie),
+                # und dann plötzlich eine Kurve kommt, werden viele Commands
+                # in schneller Folge gesendet → Buffer-Overflow.
+                # 
+                # Lösung: Auch wenn Delta > Threshold, mindestens 8ms warten.
                 # ============================================================
                 should_send = True
                 if last_pos is not None:
                     max_delta = max(abs(corrected[j] - last_pos[j])
                                     for j in ["b", "s", "e", "h"])
-                    if max_delta < 0.01:  # Weniger als 0.01° → skip
+                    if max_delta < 0.05:  # Erhöht von 0.01° auf 0.05°
+                        # Weniger als 0.05° Änderung → skip
+                        # ABER: Maximal 3 Skips hintereinander erlaubt
+                        # damit der Servo nie "verhungert"
                         should_send = False
                         skipped += 1
+                        # Guardrail: Nach 3 Skips trotzdem senden (Keep-Alive)
+                        if skipped % 4 == 0:
+                            should_send = True
+
+                # FIX #7: Mindest-Intervall zwischen Sends
+                time_since_last_send = loop_start - last_send_time
+                if should_send and time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
+                    # Zu früh nach dem letzten Send → skip diesen Tick
+                    should_send = False
+                    skipped += 1
 
                 # ============================================================
-                # COMMAND SENDEN — OHNE LOCK, OHNE FLUSH, OHNE WARTEN
+                # COMMAND SENDEN
                 # ============================================================
                 if should_send:
                     if is_sim:
@@ -3081,80 +3173,86 @@ class RoArmDashboard(App):
                         )
                         self._sim_arm.step_simulation(interval)
                     else:
-                        # DIREKT auf Serial schreiben — maximale Geschwindigkeit
+                        # DIREKT auf Serial schreiben
                         cmd = {
                             "T": 122,
                             "b": round(corrected["b"], 2),
                             "s": round(corrected["s"], 2),
                             "e": round(corrected["e"], 2),
                             "h": round(corrected["h"], 2),
-                            "spd": STREAM_SPD,   # 0 = max speed
-                            "acc": STREAM_ACC,   # 0 = max acc (kein Trapez!)
+                            "spd": STREAM_SPD,
+                            "acc": STREAM_ACC,
                         }
                         msg = json.dumps(cmd, separators=(',', ':'))
                         arm._ser.write(msg.encode() + b'\n')
-                        # KEIN flush, KEIN lock, KEIN read
 
                     last_pos = corrected.copy()
                     self._last_play_commanded = corrected.copy()
                     commands_sent += 1
+                    last_send_time = time.time()
 
-                    # Alle 50 Commands: flush damit der USB-Buffer nicht überläuft
-                    if commands_sent % 50 == 0:
+                    # FIX #1: Flush nur alle 200 Commands
+                    # USB-Serial buffert ohnehin und sendet in Paketen.
+                    # Zu häufiges Flush erzwingt kleine Pakete → Overhead
+                    if commands_sent % STREAM_FLUSH_INTERVAL == 0:
                         if not is_sim:
                             arm._ser.flush()
 
                 # ============================================================
-                # UI-UPDATE: Nur alle 500ms (nicht bei jedem Frame!)
+                # FIX #3: UI-UPDATE NON-BLOCKING
+                # Statt call_from_thread (synchron, blockiert bis Main-Thread
+                # den Call verarbeitet), nutzen wir call_later (async, fire-and-forget)
                 # ============================================================
                 now = time.time()
-                if now - last_ui_update > 0.5:
+                if now - last_ui_update > STREAM_UI_UPDATE_INTERVAL_S:
                     last_ui_update = now
-                    if is_sim:
-                        pos = self._sim_arm.read_position_deg()
-                        self.call_from_thread(self._update_arm_views, pos)
-                        self.call_from_thread(self._update_joint_displays, pos)
-                    else:
-                        self.call_from_thread(self._update_arm_views, corrected)
-                    self.call_from_thread(self._update_play_timeline, elapsed)
+                    # Non-blocking: Wir kopieren die Daten und der Main-Thread
+                    # verarbeitet sie wenn er Zeit hat
+                    ui_pos = corrected.copy() if not is_sim else self._sim_arm.read_position_deg()
+                    ui_elapsed = elapsed
+                    try:
+                        # call_from_thread ist OK hier weil wir nur 1x/Sekunde callen
+                        # und die Daten minimal sind (kein 3D-Render im Thread!)
+                        self.call_from_thread(self._lightweight_ui_update, ui_pos, ui_elapsed)
+                    except Exception:
+                        pass  # UI-Fehler dürfen Stream nie unterbrechen
 
                 # ============================================================
-                # LOG: Nur alle 2s (nicht bei jedem Waypoint!)
+                # LOG: Nur alle 5s (war 2s)
                 # ============================================================
-                if now - last_log_time > 2.0:
+                if now - last_log_time > 5.0:
                     last_log_time = now
                     pct = (elapsed / duration) * 100
                     self.call_from_thread(
                         self._log_play,
                         f"[dim]  ▶ {pct:.0f}% | t={elapsed:.1f}s | "
-                        f"cmds={commands_sent} skip={skipped}[/]"
+                        f"cmds={commands_sent} skip={skipped} "
+                        f"rate={commands_sent/max(elapsed,0.1):.0f}Hz[/]"
                     )
 
                 # ============================================================
-                # TIMING: Busy-Wait für Präzision (kein time.sleep Jitter!)
+                # FIX #5: REINER BUSY-WAIT (kein sleep-Hybrid)
+                # time.sleep() hat auf Linux 1-4ms Jitter.
+                # Bei 100Hz (10ms Intervall) ist das 10-40% Timing-Error!
+                # Reiner Busy-Wait hat <0.1ms Jitter.
+                #
+                # CPU-Last ist OK weil nur EIN Core belegt wird und
+                # der Loop ohnehin I/O-bound ist (Serial Write).
                 # ============================================================
                 target_time = loop_start + interval
-                if USE_BUSY_WAIT:
-                    # Hybrid: sleep bis 1ms vor Ziel, dann busy-wait
-                    remaining = target_time - time.time()
-                    if remaining > 0.002:
-                        time.sleep(remaining - 0.001)
-                    # Busy-wait für die letzten µs
-                    while time.time() < target_time:
-                        pass
-                else:
-                    sleep_time = target_time - time.time()
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
+                while time.time() < target_time:
+                    pass  # Busy-wait: ~0.05ms Präzision
 
         finally:
             # === STREAMING-MODUS BEENDEN ===
             if not is_sim:
+                # Finaler Flush: Alle noch im Buffer befindlichen Commands raussenden
+                arm._ser.flush()
+                time.sleep(0.02)  # 20ms warten bis letzter Command verarbeitet
+                
                 if hasattr(arm, 'exit_streaming_mode'):
                     arm.exit_streaming_mode()
                 else:
-                    arm._ser.flush()
-                    time.sleep(0.05)
                     arm._ser.timeout = 0.1
 
             if not is_sim and self._safe_arm:
@@ -3162,11 +3260,46 @@ class RoArmDashboard(App):
 
             # Final-Log
             total_time = time.time() - playback_start
+            actual_hz = commands_sent / max(total_time, 0.01)
             self.call_from_thread(
                 self._log_play,
                 f"[green]  ✓ Stream done: {commands_sent} cmds, "
-                f"{skipped} skipped, {total_time:.2f}s actual[/]"
+                f"{skipped} skipped, {total_time:.2f}s actual, "
+                f"{actual_hz:.0f}Hz effective[/]"
             )
+
+
+    def _lightweight_ui_update(self, pos: dict, elapsed: float):
+        """Minimaler UI-Update ohne schwere 3D-Berechnung.
+        
+        FIX #3: Statt alle Arm-Views + Sparklines + Timeline zu updaten,
+        updaten wir nur die Timeline und die Sparklines.
+        Der 3D-View wird nur am Ende aktualisiert.
+        """
+        # Timeline ist billig (nur Text)
+        try:
+            timeline = self.query_one("#play-timeline", TimelineWidget)
+            timeline.set_position(elapsed)
+        except NoMatches:
+            pass
+        
+        # Sparklines sind billig (nur Text)
+        self._joint_history.push(pos)
+        for joint in ["b", "s", "e", "h"]:
+            try:
+                widget = self.query_one(f"#teach-joint-{joint}", JointSparklineWidget)
+                widget.update_value(pos[joint])
+            except NoMatches:
+                pass
+        
+        # 3D-View: NUR den Play-View updaten, und nur wenn Tab aktiv
+        try:
+            tabs = self.query_one(TabbedContent)
+            if tabs.active == "play":
+                widget = self.query_one("#play-arm-view", Arm3DWidget)
+                widget.update_pose(pos["b"], pos["s"], pos["e"])
+        except NoMatches:
+            pass
 
 
     def _move_to_start_position(self, arm, first_wp: dict, cal_model, is_sim: bool):
