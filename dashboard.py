@@ -119,6 +119,15 @@ FOREARM = 206.0          # Unterarm: Elbow → Gripper-Ansatz
 GRIPPER_LENGTH = 80.0    # Gripper-Länge (Teil des Unterarm-Segments)
 
 # ============================================================
+# ADAPTIVE TIMING CONSTANTS
+# ============================================================
+
+MIN_SPEED_FACTOR = 0.5
+MAX_SPEED_FACTOR = 1.2
+END_RAMP_PERCENT = 0.05
+START_RAMP_PERCENT = 0.03
+
+# ============================================================
 # KONFIGURATION
 # ============================================================
 
@@ -134,6 +143,100 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 import logging
+
+def _init_safety_state(self):
+    """Initializes safety-related state variables."""
+    self._safe_arm: Optional['SafeArm'] = None
+    self._watchdog: Optional['SafetyWatchdog'] = None
+    self._current_monitor: Optional['CurrentMonitor'] = None
+    self._rate_limiter = None
+
+
+def _setup_safety_layer(self, arm: RoArmConnection):
+    """Wraps the raw arm connection in safety layers."""
+    from safety import SafeArm, SafetyLimits, SafetyWatchdog, CurrentMonitor, RateLimiter
+    limits = SafetyLimits(
+        max_delta_per_cmd=20.0,
+        max_continuous_move_s=90.0,
+        max_plausible_error=5.0,
+    )
+    self._safe_arm = SafeArm(arm, limits=limits)
+    self._watchdog = SafetyWatchdog(self._safe_arm)
+    self._watchdog.start()
+    self._current_monitor = CurrentMonitor(
+        self._safe_arm, max_load_percent=85.0, max_stall_duration_s=3.0
+    )
+    self._rate_limiter = RateLimiter(max_hz=STREAM_HZ + 10)
+
+def _teardown_safety_layer(self):
+    """Stops and cleans up safety layers."""
+    if self._watchdog:
+        self._watchdog.stop()
+        self._watchdog = None
+    self._safe_arm = None
+    self._current_monitor = None
+    self._rate_limiter = None
+
+def _validate_trajectory(self, trajectory: 'SmoothTrajectory') -> tuple:
+    """Validates trajectory for acceleration violations. Returns (ok, violations)."""
+    from safety import TrajectoryValidator, SafetyLimits
+    validator = TrajectoryValidator(SafetyLimits())
+    return validator.validate_full_trajectory(trajectory)
+
+def _attempt_trajectory_repair(self, trajectory: 'SmoothTrajectory',
+                                violations: list) -> Optional['SmoothTrajectory']:
+    """Attempts to repair a trajectory by local time-stretching."""
+    from safety import TrajectorySmoother, SafetyLimits, TrajectoryValidator
+    smoother = TrajectorySmoother(SafetyLimits())
+    new_wps, n_fixed, added_time = smoother.smooth_trajectory(trajectory)
+    if new_wps is None:
+        return None
+    repaired = SmoothTrajectory(new_wps, self._speed_factor)
+    ok, _ = TrajectoryValidator(SafetyLimits()).validate_full_trajectory(repaired)
+    if not ok:
+        return None
+    self._log_play(
+        f"[yellow]⚠ Repariert: {n_fixed} Verletzungen, +{added_time:.2f}s[/]"
+    )
+    return repaired
+
+def _check_tracking_error(self, arm_raw, corrected: dict,
+                           commands_sent: int) -> Optional[float]:
+    """Periodically checks tracking error. Returns error or None."""
+    FEEDBACK_INTERVAL = max(1, STREAM_HZ // 2)
+    MAX_TRACKING_ERROR = 8.0
+    if commands_sent % FEEDBACK_INTERVAL != 0 or commands_sent <= FEEDBACK_INTERVAL:
+        return None
+    try:
+        actual = arm_raw.read_position_deg()
+        if actual is None:
+            return None
+        err = max(abs(actual[j] - corrected[j]) for j in ["b", "s", "e", "h"])
+        if err > MAX_TRACKING_ERROR:
+            self._trigger_playback_estop(
+                f"Tracking Error {err:.1f}° > {MAX_TRACKING_ERROR}°")
+        return err
+    except Exception:
+        return None
+
+def _check_stall_detection(self, actual_deg: dict) -> bool:
+    """Checks for stalled servos. Returns True if stall detected."""
+    if self._current_monitor is None:
+        return False
+    ok, reason = self._current_monitor.check(actual_deg)
+    if not ok:
+        self._trigger_playback_estop(reason)
+        return True
+    return False
+
+def _trigger_playback_estop(self, reason: str):
+    """Triggers emergency stop during playback."""
+    self.playing = False
+    if self._arm:
+        self._arm.torque_off()
+    self.app.call_from_thread(
+        self._log_play, f"[bold red]🚨 E-STOP: {reason}[/]"
+    )
 
 def forward_kinematics(b_deg: float, s_deg: float, e_deg: float) -> dict:
     """
@@ -203,6 +306,100 @@ class TUILogHandler(logging.Handler):
                 self.app.call_from_thread(self.app._log_teach, styled)
         except Exception:
             pass
+
+class SmoothTrajectory:
+    """Smooth time-continuous trajectory from discrete waypoints."""
+
+    def __init__(self, waypoints: list, speed_factor: float = 1.0):
+        self._waypoints = waypoints
+        self._speed_factor = speed_factor
+        self._splines = {}
+        self._time_map = None
+        self._t_new = None
+        self._speed_profile = None
+        self._total_duration = 0.0
+        self._original_duration = 0.0
+        self._build_splines()
+        self._compute_adaptive_timing()
+
+    def _build_splines(self):
+        """Creates clamped cubic splines for each joint."""
+        from scipy.interpolate import CubicSpline
+        times = np.array([wp["t"] for wp in self._waypoints])
+        if times[0] > 0.01:
+            times = np.concatenate([[0.0, times[0] * 0.5], times])
+        for joint in ["b", "s", "e", "h"]:
+            values = np.array([wp[joint] for wp in self._waypoints])
+            if len(times) > len(values):
+                pad = np.array([values[0], values[0]])
+                values = np.concatenate([pad, values])
+            self._splines[joint] = CubicSpline(times, values, bc_type='clamped')
+        self._original_duration = times[-1]
+
+    def _compute_curvature(self, t_original: np.ndarray) -> np.ndarray:
+        """Computes smoothed curvature magnitude along the trajectory."""
+        curvature = np.zeros(len(t_original))
+        for joint in ["b", "s", "e", "h"]:
+            d2 = self._splines[joint](t_original, 2)
+            curvature += d2 ** 2
+        curvature = np.sqrt(curvature)
+        kernel = np.ones(20) / 20
+        return np.convolve(curvature, kernel, mode='same')
+
+    def _curvature_to_speed_profile(self, curvature: np.ndarray) -> np.ndarray:
+        """Converts curvature to a speed profile (inverse relationship)."""
+        max_curv = np.percentile(curvature, 95) if curvature.max() > 0 else 1.0
+        norm = np.clip(curvature / max(max_curv, 1e-6), 0, 1)
+        return MAX_SPEED_FACTOR - norm * (MAX_SPEED_FACTOR - MIN_SPEED_FACTOR)
+
+    def _apply_ramps(self, speed_profile: np.ndarray) -> np.ndarray:
+        """Applies start and end ramps to the speed profile."""
+        n = len(speed_profile)
+        end_start = int(n * (1.0 - END_RAMP_PERCENT))
+        for i in range(end_start, n):
+            progress = (i - end_start) / (n - end_start)
+            speed_profile[i] = min(speed_profile[i],
+                MIN_SPEED_FACTOR + (1.0 - progress) * (speed_profile[i] - MIN_SPEED_FACTOR))
+        start_end = int(n * START_RAMP_PERCENT)
+        for i in range(start_end):
+            progress = i / max(start_end, 1)
+            speed_profile[i] = MIN_SPEED_FACTOR + progress * (speed_profile[i] - MIN_SPEED_FACTOR)
+        return speed_profile
+
+    def _compute_adaptive_timing(self):
+        """Computes time reparameterization based on curvature."""
+        from scipy.interpolate import CubicSpline
+        n_samples = 500
+        t_original = np.linspace(0, self._original_duration, n_samples)
+        curvature = self._compute_curvature(t_original)
+        speed_profile = self._curvature_to_speed_profile(curvature)
+        speed_profile = self._apply_ramps(speed_profile)
+        dt = t_original[1] - t_original[0]
+        dt_new = dt / (speed_profile * self._speed_factor)
+        t_new = np.cumsum(dt_new)
+        t_new = np.insert(t_new, 0, 0.0)[:-1]
+        self._total_duration = t_new[-1]
+        self._t_new = t_new
+        self._speed_profile = speed_profile
+        self._time_map = CubicSpline(t_new, t_original, bc_type='natural')
+
+    def get_duration(self) -> float:
+        """Returns total duration of the smoothed trajectory."""
+        return self._total_duration
+
+    def sample(self, t_playback: float) -> dict:
+        """Samples joint angles at the given playback time."""
+        t_playback = np.clip(t_playback, 0, self._total_duration)
+        t_orig = float(self._time_map(t_playback))
+        t_orig = np.clip(t_orig, 0, self._original_duration)
+        return {j: round(float(self._splines[j](t_orig)), 2)
+                for j in ["b", "s", "e", "h"]}
+
+    def get_speed_at(self, t_playback: float) -> float:
+        """Returns the speed factor at the given playback time."""
+        idx = np.searchsorted(self._t_new, t_playback)
+        idx = min(idx, len(self._speed_profile) - 1)
+        return self._speed_profile[idx]
 
 # ============================================================
 # SIMULATED ARM (when no real robot is connected)
@@ -1719,29 +1916,20 @@ class RoArmDashboard(App):
             )
 
     def _do_connect(self, port: str):
-        """Verbindet synchron mit dem Arm."""
+        """Connects to the arm and sets up safety layers."""
         try:
             self._arm = RoArmConnection(port)
             self.connected = True
-
-            # Disable simulation mode if it was active
             if self._simulation_mode:
                 self._disable_simulation_mode()
-                self._log_teach("[green]✅ Echte Verbindung hergestellt — Simulation beendet[/]")
-
-            self._log_teach(f"[green]✅ Verbunden mit {port}[/]")
+            self._setup_safety_layer(self._arm)
+            self._log_teach(f"[green]✅ Verbunden mit {port} (Safety aktiv)[/]")
             self._update_status_connection(port)
-
-            # Position lesen
             pos = self._arm.read_position_deg()
             if pos:
                 self._current_pos = pos
                 self._update_joint_displays(pos)
                 self._update_arm_views(pos)
-                self._log_teach(
-                    f"[dim]  Pos: b={pos['b']:.1f}° s={pos['s']:.1f}° "
-                    f"e={pos['e']:.1f}° h={pos['h']:.1f}°[/]"
-                )
         except Exception as e:
             self._log_teach(f"[red]❌ Fehler: {e}[/]")
 
