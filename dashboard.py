@@ -1390,7 +1390,7 @@ class RoArmDashboard(App):
 
     def _check_tracking_error(self, arm_raw, corrected: dict,
                                commands_sent: int) -> Optional[float]:
-        """Periodically checks tracking error. More tolerant at start."""
+        """Periodically checks tracking error with plausibility validation."""
         FEEDBACK_INTERVAL = max(1, STREAM_HZ // 2)
         # Erst nach 2 Sekunden (100 commands) anfangen zu checken
         if commands_sent < STREAM_HZ * 2:
@@ -1401,18 +1401,69 @@ class RoArmDashboard(App):
             actual = arm_raw.read_position_deg()
             if actual is None:
                 return None
+
+            # ============================================================
+            # PLAUSIBILITÄTS-CHECK: Werte müssen im physischen Bereich sein
+            # ============================================================
+            JOINT_LIMITS = {
+                "b": (-135, 135),
+                "s": (-90, 90),
+                "e": (0, 180),
+                "h": (0, 360),
+            }
+            for j in ["b", "s", "e", "h"]:
+                lo, hi = JOINT_LIMITS[j]
+                if actual[j] < lo - 10 or actual[j] > hi + 10:
+                    # Wert ist physisch unmöglich → Serial-Garbage, ignorieren
+                    self.call_from_thread(
+                        self._log_play,
+                        f"[dim yellow]  ⚠ Implausible Lesung ignoriert: "
+                        f"{j}={actual[j]:.1f}° (Limit: {lo}..{hi})[/]"
+                    )
+                    return None
+
             err = max(abs(actual[j] - corrected[j]) for j in ["b", "s", "e", "h"])
+
+            # Zweiter Plausibilitäts-Check: Fehler > 90° ist IMMER ein Lesefehler
+            if err > 90.0:
+                self.call_from_thread(
+                    self._log_play,
+                    f"[dim yellow]  ⚠ Unrealistischer Error {err:.1f}° ignoriert "
+                    f"(actual: b={actual['b']:.1f} s={actual['s']:.1f} "
+                    f"e={actual['e']:.1f} h={actual['h']:.1f})[/]"
+                )
+                return None
+
             # Dynamischer Threshold: am Anfang toleranter
             threshold = MAX_TRACKING_ERROR
             if commands_sent < STREAM_HZ * 5:  # Erste 5 Sekunden
                 threshold = MAX_TRACKING_ERROR * 2  # Doppelt so tolerant
+
             if err > threshold:
-                self._trigger_playback_estop(
-                    f"Tracking Error {err:.1f}° > {threshold:.1f}°")
+                # ZUSÄTZLICH: Zweite Lesung zur Bestätigung (kein False-Positive!)
+                time.sleep(0.05)
+                actual2 = arm_raw.read_position_deg()
+                if actual2 is None:
+                    return None
+                err2 = max(abs(actual2[j] - corrected[j]) for j in ["b", "s", "e", "h"])
+                if err2 > 90.0:
+                    # Zweite Lesung auch Müll → ignorieren
+                    return None
+                if err2 > threshold:
+                    # Bestätigt! Echter Tracking Error
+                    self._trigger_playback_estop(
+                        f"Tracking Error {err2:.1f}° > {threshold:.1f}°")
+                else:
+                    # Erste Lesung war Ausreißer, zweite OK
+                    self.call_from_thread(
+                        self._log_play,
+                        f"[dim yellow]  ⚠ Transient Error {err:.1f}° → "
+                        f"re-read OK: {err2:.1f}°[/]"
+                    )
+                    return err2
             return err
         except Exception:
             return None
-
 
     def _check_stall_detection(self, actual_deg: dict) -> bool:
         """Checks for stalled servos. Returns True if stall detected."""
