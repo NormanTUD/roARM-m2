@@ -144,100 +144,6 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 import logging
 
-def _init_safety_state(self):
-    """Initializes safety-related state variables."""
-    self._safe_arm: Optional['SafeArm'] = None
-    self._watchdog: Optional['SafetyWatchdog'] = None
-    self._current_monitor: Optional['CurrentMonitor'] = None
-    self._rate_limiter = None
-
-
-def _setup_safety_layer(self, arm: RoArmConnection):
-    """Wraps the raw arm connection in safety layers."""
-    from safety import SafeArm, SafetyLimits, SafetyWatchdog, CurrentMonitor, RateLimiter
-    limits = SafetyLimits(
-        max_delta_per_cmd=20.0,
-        max_continuous_move_s=90.0,
-        max_plausible_error=5.0,
-    )
-    self._safe_arm = SafeArm(arm, limits=limits)
-    self._watchdog = SafetyWatchdog(self._safe_arm)
-    self._watchdog.start()
-    self._current_monitor = CurrentMonitor(
-        self._safe_arm, max_load_percent=85.0, max_stall_duration_s=3.0
-    )
-    self._rate_limiter = RateLimiter(max_hz=STREAM_HZ + 10)
-
-def _teardown_safety_layer(self):
-    """Stops and cleans up safety layers."""
-    if self._watchdog:
-        self._watchdog.stop()
-        self._watchdog = None
-    self._safe_arm = None
-    self._current_monitor = None
-    self._rate_limiter = None
-
-def _validate_trajectory(self, trajectory: 'SmoothTrajectory') -> tuple:
-    """Validates trajectory for acceleration violations. Returns (ok, violations)."""
-    from safety import TrajectoryValidator, SafetyLimits
-    validator = TrajectoryValidator(SafetyLimits())
-    return validator.validate_full_trajectory(trajectory)
-
-def _attempt_trajectory_repair(self, trajectory: 'SmoothTrajectory',
-                                violations: list) -> Optional['SmoothTrajectory']:
-    """Attempts to repair a trajectory by local time-stretching."""
-    from safety import TrajectorySmoother, SafetyLimits, TrajectoryValidator
-    smoother = TrajectorySmoother(SafetyLimits())
-    new_wps, n_fixed, added_time = smoother.smooth_trajectory(trajectory)
-    if new_wps is None:
-        return None
-    repaired = SmoothTrajectory(new_wps, self._speed_factor)
-    ok, _ = TrajectoryValidator(SafetyLimits()).validate_full_trajectory(repaired)
-    if not ok:
-        return None
-    self._log_play(
-        f"[yellow]⚠ Repariert: {n_fixed} Verletzungen, +{added_time:.2f}s[/]"
-    )
-    return repaired
-
-def _check_tracking_error(self, arm_raw, corrected: dict,
-                           commands_sent: int) -> Optional[float]:
-    """Periodically checks tracking error. Returns error or None."""
-    FEEDBACK_INTERVAL = max(1, STREAM_HZ // 2)
-    MAX_TRACKING_ERROR = 8.0
-    if commands_sent % FEEDBACK_INTERVAL != 0 or commands_sent <= FEEDBACK_INTERVAL:
-        return None
-    try:
-        actual = arm_raw.read_position_deg()
-        if actual is None:
-            return None
-        err = max(abs(actual[j] - corrected[j]) for j in ["b", "s", "e", "h"])
-        if err > MAX_TRACKING_ERROR:
-            self._trigger_playback_estop(
-                f"Tracking Error {err:.1f}° > {MAX_TRACKING_ERROR}°")
-        return err
-    except Exception:
-        return None
-
-def _check_stall_detection(self, actual_deg: dict) -> bool:
-    """Checks for stalled servos. Returns True if stall detected."""
-    if self._current_monitor is None:
-        return False
-    ok, reason = self._current_monitor.check(actual_deg)
-    if not ok:
-        self._trigger_playback_estop(reason)
-        return True
-    return False
-
-def _trigger_playback_estop(self, reason: str):
-    """Triggers emergency stop during playback."""
-    self.playing = False
-    if self._arm:
-        self._arm.torque_off()
-    self.app.call_from_thread(
-        self._log_play, f"[bold red]🚨 E-STOP: {reason}[/]"
-    )
-
 def forward_kinematics(b_deg: float, s_deg: float, e_deg: float) -> dict:
     """
     Kinematik für RoArm-M2-S (ohne Wrist-Gelenk).
@@ -1407,6 +1313,100 @@ class RoArmDashboard(App):
         self._speed_factor = 1.0
         self._loop_enabled = False
         self._loop_pause_s = 0.0
+
+    def _init_safety_state(self):
+        """Initializes safety-related state variables."""
+        self._safe_arm: Optional['SafeArm'] = None
+        self._watchdog: Optional['SafetyWatchdog'] = None
+        self._current_monitor: Optional['CurrentMonitor'] = None
+        self._rate_limiter = None
+
+
+    def _setup_safety_layer(self, arm: RoArmConnection):
+        """Wraps the raw arm connection in safety layers."""
+        from safety import SafeArm, SafetyLimits, SafetyWatchdog, CurrentMonitor, RateLimiter
+        limits = SafetyLimits(
+            max_delta_per_cmd=20.0,
+            max_continuous_move_s=90.0,
+            max_plausible_error=5.0,
+        )
+        self._safe_arm = SafeArm(arm, limits=limits)
+        self._watchdog = SafetyWatchdog(self._safe_arm)
+        self._watchdog.start()
+        self._current_monitor = CurrentMonitor(
+            self._safe_arm, max_load_percent=85.0, max_stall_duration_s=3.0
+        )
+        self._rate_limiter = RateLimiter(max_hz=STREAM_HZ + 10)
+
+    def _teardown_safety_layer(self):
+        """Stops and cleans up safety layers."""
+        if self._watchdog:
+            self._watchdog.stop()
+            self._watchdog = None
+        self._safe_arm = None
+        self._current_monitor = None
+        self._rate_limiter = None
+
+    def _validate_trajectory(self, trajectory: 'SmoothTrajectory') -> tuple:
+        """Validates trajectory for acceleration violations. Returns (ok, violations)."""
+        from safety import TrajectoryValidator, SafetyLimits
+        validator = TrajectoryValidator(SafetyLimits())
+        return validator.validate_full_trajectory(trajectory)
+
+    def _attempt_trajectory_repair(self, trajectory: 'SmoothTrajectory',
+                                    violations: list) -> Optional['SmoothTrajectory']:
+        """Attempts to repair a trajectory by local time-stretching."""
+        from safety import TrajectorySmoother, SafetyLimits, TrajectoryValidator
+        smoother = TrajectorySmoother(SafetyLimits())
+        new_wps, n_fixed, added_time = smoother.smooth_trajectory(trajectory)
+        if new_wps is None:
+            return None
+        repaired = SmoothTrajectory(new_wps, self._speed_factor)
+        ok, _ = TrajectoryValidator(SafetyLimits()).validate_full_trajectory(repaired)
+        if not ok:
+            return None
+        self._log_play(
+            f"[yellow]⚠ Repariert: {n_fixed} Verletzungen, +{added_time:.2f}s[/]"
+        )
+        return repaired
+
+    def _check_tracking_error(self, arm_raw, corrected: dict,
+                               commands_sent: int) -> Optional[float]:
+        """Periodically checks tracking error. Returns error or None."""
+        FEEDBACK_INTERVAL = max(1, STREAM_HZ // 2)
+        MAX_TRACKING_ERROR = 8.0
+        if commands_sent % FEEDBACK_INTERVAL != 0 or commands_sent <= FEEDBACK_INTERVAL:
+            return None
+        try:
+            actual = arm_raw.read_position_deg()
+            if actual is None:
+                return None
+            err = max(abs(actual[j] - corrected[j]) for j in ["b", "s", "e", "h"])
+            if err > MAX_TRACKING_ERROR:
+                self._trigger_playback_estop(
+                    f"Tracking Error {err:.1f}° > {MAX_TRACKING_ERROR}°")
+            return err
+        except Exception:
+            return None
+
+    def _check_stall_detection(self, actual_deg: dict) -> bool:
+        """Checks for stalled servos. Returns True if stall detected."""
+        if self._current_monitor is None:
+            return False
+        ok, reason = self._current_monitor.check(actual_deg)
+        if not ok:
+            self._trigger_playback_estop(reason)
+            return True
+        return False
+
+    def _trigger_playback_estop(self, reason: str):
+        """Triggers emergency stop during playback."""
+        self.playing = False
+        if self._arm:
+            self._arm.torque_off()
+        self.app.call_from_thread(
+            self._log_play, f"[bold red]🚨 E-STOP: {reason}[/]"
+        )
 
     def action_led_toggle(self) -> None:
         """Toggles the LED on/off and records the event."""
