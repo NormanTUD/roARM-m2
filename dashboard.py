@@ -1560,6 +1560,86 @@ class RoArmDashboard(App):
         except Exception as e:
             self._log_play(f"[red]Fehler beim Laden der Kalibrierung: {e}[/]")
 
+    def _get_play_speed(self) -> float:
+        """Reads the speed factor from the UI input."""
+        try:
+            inp = self.query_one("#play-speed-input", Input)
+            return max(0.1, min(5.0, float(inp.value)))
+        except (NoMatches, ValueError):
+            return 1.0
+
+    def _get_loop_pause(self) -> float:
+        """Reads the loop pause duration from the UI input."""
+        try:
+            inp = self.query_one("#play-loop-pause-input", Input)
+            return max(0.0, float(inp.value))
+        except (NoMatches, ValueError):
+            return 0.0
+
+
+    def _is_loop_enabled(self) -> bool:
+        """Checks if loop mode is enabled via the button state."""
+        try:
+            btn = self.query_one("#btn-play-loop", Button)
+            return btn.variant == "success"
+        except NoMatches:
+            return False
+
+    def _process_playback_event(self, arm, event: dict, elapsed: float):
+        """Processes a single playback event (gripper or LED)."""
+        cmd = event["cmd"]
+        if cmd == "CLOSE":
+            arm.gripper_close()
+            self.app.call_from_thread(
+                self._log_play, f"[bold]  ✊ Gripper ZU [{elapsed:.2f}s][/]")
+        elif cmd == "OPEN":
+            arm.gripper_open()
+            self.app.call_from_thread(
+                self._log_play, f"[bold]  ✋ Gripper AUF [{elapsed:.2f}s][/]")
+        elif cmd == "LED_ON":
+            if hasattr(arm, 'send_cmd'):
+                arm.send_cmd({"T": 114, "led": 255})
+            self.app.call_from_thread(
+                self._log_play, f"[bold]  💡 LED AN [{elapsed:.2f}s][/]")
+        elif cmd == "LED_OFF":
+            if hasattr(arm, 'send_cmd'):
+                arm.send_cmd({"T": 114, "led": 0})
+            self.app.call_from_thread(
+                self._log_play, f"[bold]  💡 LED AUS [{elapsed:.2f}s][/]")
+
+    def _process_pending_events(self, arm, events: list, event_idx: int,
+                                 elapsed: float) -> tuple:
+        """Processes all events up to current elapsed time. Returns (new_idx, pause)."""
+        total_pause = 0.0
+        while event_idx < len(events):
+            ev = events[event_idx]
+            if ev["t"] <= elapsed:
+                self._process_playback_event(arm, ev, elapsed)
+                if ev["cmd"] in ("CLOSE", "OPEN"):
+                    time.sleep(0.3)
+                    total_pause += 0.3
+                event_idx += 1
+            else:
+                break
+        return event_idx, total_pause
+
+
+    @on(Button.Pressed, "#btn-play-loop")
+    def on_play_loop_toggle(self) -> None:
+        """Toggles loop mode on/off."""
+        try:
+            btn = self.query_one("#btn-play-loop", Button)
+            if btn.variant == "success":
+                btn.variant = "default"
+                btn.label = "🔁 Loop"
+                self._log_play("[dim]Loop deaktiviert[/]")
+            else:
+                btn.variant = "success"
+                btn.label = "🔁 Loop ✓"
+                self._log_play("[green]Loop aktiviert[/]")
+        except NoMatches:
+            pass
+
 
     # ============================================================
     # COMPOSE (Layout)
@@ -1647,6 +1727,9 @@ class RoArmDashboard(App):
                                         "🔁 Loop", id="btn-play-loop",
                                         variant="default"
                                     )
+
+                                    yield Input(value="1.0", id="play-speed-input", type="number")
+                                    yield Input(value="0", id="play-loop-pause-input", type="number")
 
                             with Vertical():
                                 yield Label("📁 Recordings:", classes="joint-label")
@@ -2693,289 +2776,221 @@ class RoArmDashboard(App):
 
         self._run_playback(wps)
 
-    @work(thread=True)
-    def _run_playback(self, waypoints: list):
-        """Flüssiges Playback mit Cubic Spline + Kalibrierung."""
-        from scipy.interpolate import CubicSpline
-        from safety import RateLimiter
-
-        arm = self._active_arm
-        if arm is None:
-            self.app.call_from_thread(
-                self._log_play, "[red]Kein Arm verfügbar![/]"
-            )
-            self.playing = False
-            return
-
-        is_sim = self._is_sim
-
-        # --- Kalibrierungsmodell laden ---
-        cal_model = None
-        if not is_sim:
-            try:
-                from calibrate import CalibrationModel
-                cal_path = Path("calibration") / "roarm_calibration.cal"
-                if cal_path.exists():
-                    cal_model = CalibrationModel.load(str(cal_path))
-                    self.app.call_from_thread(
-                        self._log_play,
-                        f"[green]📂 Kalibrierung geladen: {cal_path}[/]"
-                    )
-                    res = cal_model.residuals
-                    self.app.call_from_thread(
-                        self._log_play,
-                        f"[dim]  Residuen: b={res.get('b',0):.4f}° "
-                        f"s={res.get('s',0):.4f}° e={res.get('e',0):.4f}°[/]"
-                    )
-            except Exception as e:
+    def _load_calibration_model(self, is_sim: bool):
+        """Loads calibration model if available."""
+        if is_sim:
+            return None
+        try:
+            from calibrate import CalibrationModel
+            cal_path = Path("calibration") / "roarm_calibration.cal"
+            if cal_path.exists():
+                model = CalibrationModel.load(str(cal_path))
                 self.app.call_from_thread(
-                    self._log_play,
-                    f"[yellow]⚠ Kalibrierung nicht verfügbar: {e}[/]"
+                    self._log_play, f"[green]📂 Kalibrierung geladen: {cal_path}[/]"
                 )
+                return model
+        except Exception as e:
+            self.app.call_from_thread(
+                self._log_play, f"[yellow]⚠ Kalibrierung nicht verfügbar: {e}[/]"
+            )
+        return None
 
-        # --- Spline aufbauen ---
-        times = np.array([wp["t"] for wp in waypoints])
-        splines = {}
-        for joint in ["b", "s", "e", "h"]:
-            values = np.array([wp[joint] for wp in waypoints])
-            splines[joint] = CubicSpline(times, values, bc_type='clamped')
+    def _send_if_changed(self, arm, corrected: dict, last_pos: Optional[dict],
+                         commands_sent: int, skipped: int,
+                         rate_limiter, is_sim: bool, interval: float) -> tuple:
+        """Sends command only if position changed enough. Returns (sent, cmds, skips)."""
+        if last_pos:
+            max_delta = max(abs(corrected[j] - last_pos[j]) for j in ["b", "s", "e", "h"])
+            if max_delta < MIN_DELTA_DEG:
+                return False, commands_sent, skipped + 1
+        rate_limiter.acquire()
+        arm.move_to_fast(
+            corrected["b"], corrected["s"],
+            corrected["e"], corrected["h"],
+            spd=50, acc=30
+        )
+        if is_sim:
+            self._sim_arm.step_simulation(interval)
+        return True, commands_sent + 1, skipped
 
-        duration = times[-1]
-        stream_hz = STREAM_HZ
-        interval = 1.0 / stream_hz
+    def _update_playback_ui(self, arm, corrected: dict, elapsed: float, is_sim: bool):
+        """Updates UI during playback (called from worker thread)."""
+        if is_sim:
+            pos = self._sim_arm.read_position_deg()
+            self.app.call_from_thread(self._update_arm_views, pos)
+            self.app.call_from_thread(self._update_joint_displays, pos)
+        else:
+            self.app.call_from_thread(self._update_arm_views, corrected)
+        self.app.call_from_thread(self._update_play_timeline, elapsed)
 
-        # --- Rate Limiter ---
-        rate_limiter = RateLimiter(max_hz=stream_hz + 10)
-
-        # --- Zur Startposition fahren ---
+    def _finalize_playback(self, arm, is_sim: bool, cal_model, duration: float):
+        """Finalizes playback: verify endpoint, log summary, reset UI."""
+        self.playing = False
+        # Endpoint verification (real arm only)
+        if not is_sim and self._last_play_commanded:
+            final_target = self._last_play_commanded
+            err = self._verify_endpoint(arm, final_target)
+        # Stop activity
+        self.app.call_from_thread(self._stop_activity, "✅ Playback complete")
+        self.app.call_from_thread(self._playback_finished)
         self.app.call_from_thread(
-            self._start_activity, "Moving to start", "⏳"
+            self.set_timer, 3.0, lambda: self._stop_activity()
         )
 
+    def _arm_is_estopped(self) -> bool:
+        """Checks if the safety layer has triggered an emergency stop."""
+        if self._safe_arm and hasattr(self._safe_arm, 'is_emergency_stopped'):
+            return self._safe_arm.is_emergency_stopped
+        return False
+
+    def _move_via_safe_up(self, arm, target_pose: dict):
+        """Moves arm to target via safe-up position (collision avoidance)."""
+        from calibrate import move_to_safe_up, move_from_safe_up_to_pose
+        current = arm.read_position_deg()
+        if current:
+            move_to_safe_up(arm, current_pose=current)
+        else:
+            move_to_safe_up(arm, current_pose=None)
+        move_from_safe_up_to_pose(arm, target_pose)
+
+
+    def _run_loop(self, waypoints: list, arm, is_sim: bool):
+        """Runs playback in loop mode with configurable pause."""
+        pause_s = self._get_loop_pause()
+        while self._is_loop_enabled() and not self._arm_is_estopped():
+            if pause_s > 0:
+                self.app.call_from_thread(
+                    self._log_play, f"[dim]⏸ Loop-Pause: {pause_s:.1f}s[/]")
+                time.sleep(pause_s)
+            self.playing = True
+            cal_model = self._load_calibration_model(is_sim)
+            trajectory = SmoothTrajectory(waypoints, self._get_play_speed())
+            duration = trajectory.get_duration()
+            self._move_to_start_position(arm, waypoints[0], cal_model, is_sim)
+            events = sorted(self._play_data.get("events", []), key=lambda x: x["t"])
+            self._streaming_loop(arm, trajectory, duration, cal_model, events, is_sim)
+            if self.playing:
+                self._do_precision_endpoint(arm, trajectory, duration, cal_model, is_sim)
+            self.playing = False
+
+
+    def _do_precision_endpoint(self, arm, trajectory: 'SmoothTrajectory',
+                               duration: float, cal_model, is_sim: bool):
+        """Executes precision endpoint after streaming completes."""
+        self.app.call_from_thread(self._start_activity, "Precision settle", "🎯")
+        final_target = trajectory.sample(duration)
+        final_corrected = self._apply_calibration_static(cal_model, final_target)
+        if is_sim:
+            self._precision_endpoint_sim(arm, final_corrected)
+        else:
+            self._precision_endpoint_real(arm, final_corrected)
+
+    def _streaming_loop(self, arm, trajectory: 'SmoothTrajectory',
+                        duration: float, cal_model, events: list, is_sim: bool):
+        """Main streaming loop: samples trajectory and sends commands."""
+        from safety import RateLimiter
+        interval = 1.0 / STREAM_HZ
+        rate_limiter = RateLimiter(max_hz=STREAM_HZ + 10)
+        playback_start = time.time()
+        last_pos = None
+        commands_sent = 0
+        skipped = 0
+        event_idx = 0
+        self._last_play_commanded = None
+
+        while self.playing:
+            loop_start = time.time()
+            elapsed = loop_start - playback_start
+            if elapsed >= duration:
+                break
+            # Events (gripper, LED)
+            event_idx, pause = self._process_pending_events(
+                arm, events, event_idx, elapsed)
+            if pause > 0:
+                playback_start += pause
+                elapsed = time.time() - playback_start
+                if elapsed >= duration:
+                    break
+            # Safety checks (real arm only)
+            if not is_sim and self._current_monitor:
+                target = trajectory.sample(elapsed)
+                corrected = self._apply_calibration_static(cal_model, target)
+                err = self._check_tracking_error(arm, corrected, commands_sent)
+                if not self.playing:
+                    break
+            # Sample + send
+            target = trajectory.sample(elapsed)
+            corrected = self._apply_calibration_static(cal_model, target)
+            sent, commands_sent, skipped = self._send_if_changed(
+                arm, corrected, last_pos, commands_sent, skipped,
+                rate_limiter, is_sim, interval
+            )
+            if sent:
+                last_pos = corrected.copy()
+                self._last_play_commanded = corrected.copy()
+            # UI update (every 200ms)
+            if commands_sent % max(1, STREAM_HZ // 5) == 0:
+                self._update_playback_ui(arm, corrected, elapsed, is_sim)
+            # Timing
+            sleep_time = interval - (time.time() - loop_start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+
+    def _move_to_start_position(self, arm, first_wp: dict, cal_model, is_sim: bool):
+        """Moves arm to the first waypoint before playback starts."""
+        start_corrected = self._apply_calibration_static(cal_model, first_wp)
         arm.torque_on()
         time.sleep(0.2)
-        start = waypoints[0]
-
-        # Kalibrierung auf Startposition anwenden (nur bei echtem Arm)
-        start_corrected = self._apply_calibration_static(cal_model, start)
-
+        arm.move_to(
+            start_corrected["b"], start_corrected["s"],
+            start_corrected["e"], start_corrected["h"],
+            spd=20, acc=10
+        )
         if is_sim:
-            arm.move_to(
-                start_corrected["b"], start_corrected["s"],
-                start_corrected["e"], start_corrected["h"],
-                spd=20, acc=10
-            )
-            self.app.call_from_thread(
-                self._log_play, "[dim]  Fahre zur Startposition (Sim)...[/]"
-            )
-            # Wait for simulated movement to reach start
-            for _ in range(150):  # max 3 seconds
+            for _ in range(150):
                 time.sleep(0.02)
                 self._sim_arm.step_simulation(0.02)
                 if not self._sim_arm.is_moving:
                     break
-                pos = self._sim_arm.read_position_deg()
-                self.app.call_from_thread(self._update_arm_views, pos)
         else:
-            arm.move_to(
-                start_corrected["b"], start_corrected["s"],
-                start_corrected["e"], start_corrected["h"],
-                spd=20, acc=10
-            )
-            self.app.call_from_thread(
-                self._log_play, "[dim]  Fahre zur Startposition...[/]"
-            )
             time.sleep(2.0)
 
-        # --- Switch activity to playing ---
+
+    @work(thread=True)
+    def _run_playback(self, waypoints: list):
+        """Full playback with SmoothTrajectory, safety, tracking, precision endpoint."""
+        arm = self._active_arm
+        if arm is None:
+            self.app.call_from_thread(self._log_play, "[red]Kein Arm![/]")
+            self.playing = False
+            return
+        is_sim = self._is_sim
+        speed = self._get_play_speed()
+        cal_model = self._load_calibration_model(is_sim)
+        trajectory = SmoothTrajectory(waypoints, speed)
+        # Pre-flight check
+        if not is_sim:
+            ok, violations = self._validate_trajectory(trajectory)
+            if not ok:
+                trajectory = self._attempt_trajectory_repair(trajectory, violations)
+                if trajectory is None:
+                    self.app.call_from_thread(
+                        self._log_play, "[red]❌ Trajektorie unsicher![/]")
+                    self.playing = False
+                    return
+        duration = trajectory.get_duration()
+        self._move_to_start_position(arm, waypoints[0], cal_model, is_sim)
         self.app.call_from_thread(
-            self._start_activity, f"Playing ({duration:.1f}s)", "▶️"
-        )
-
-        # --- Streaming ---
-        self._play_start_time = time.time()
-        last_pos = None
-        commands_sent = 0
-        skipped = 0
-
-        gripper_cmds = sorted(
-            self._play_data.get("gripper_cmds", []), key=lambda x: x["t"]
-        )
-        gripper_idx = 0
-
-        # Info über Kalibrierungsstatus
-        cal_active = cal_model is not None and cal_model.is_fitted
-        sim_tag = " (Simulation)" if is_sim else ""
-        self.app.call_from_thread(
-            self._log_play,
-            f"[bold]▶ Streaming{sim_tag}: {stream_hz}Hz, Kalibrierung: "
-            f"{'✅ AKTIV' if cal_active else '❌ INAKTIV'}[/]"
-        )
-
-        while self.playing:
-            loop_start = time.time()
-            elapsed = loop_start - self._play_start_time
-
-            if elapsed >= duration:
-                break
-
-            # --- Gripper-Events ---
-            while gripper_idx < len(gripper_cmds):
-                gc = gripper_cmds[gripper_idx]
-                if gc["t"] <= elapsed:
-                    if gc["cmd"] == "CLOSE":
-                        arm.gripper_close()
-                        self.app.call_from_thread(
-                            self._log_play,
-                            f"[bold]  ✊ Gripper ZU [{elapsed:.2f}s][/]"
-                        )
-                    elif gc["cmd"] == "OPEN":
-                        arm.gripper_open()
-                        self.app.call_from_thread(
-                            self._log_play,
-                            f"[bold]  ✋ Gripper AUF [{elapsed:.2f}s][/]"
-                        )
-                    gripper_idx += 1
-                    time.sleep(0.3)
-                    # Kompensiere Gripper-Pause
-                    self._play_start_time += 0.3
-                else:
-                    break
-
-            # Re-read elapsed nach Gripper-Pause
-            elapsed = time.time() - self._play_start_time
-            if elapsed >= duration:
-                break
-
-            # --- Sample Spline ---
-            target = {}
-            for joint in ["b", "s", "e", "h"]:
-                target[joint] = round(float(splines[joint](
-                    np.clip(elapsed, times[0], times[-1])
-                )), 2)
-
-            # --- Kalibrierung anwenden ---
-            corrected = self._apply_calibration_static(cal_model, target)
-
-            # --- Delta-Check ---
-            should_send = True
-            if last_pos:
-                max_delta = max(
-                    abs(corrected[j] - last_pos[j]) for j in ["b", "s", "e", "h"]
-                )
-                if max_delta < MIN_DELTA_DEG:
-                    should_send = False
-                    skipped += 1
-
-            if should_send:
-                # Rate Limiter
-                rate_limiter.acquire()
-
-                if is_sim:
-                    # For simulation: directly update position for smooth playback
-                    arm.move_to_fast(
-                        corrected["b"], corrected["s"],
-                        corrected["e"], corrected["h"],
-                        spd=50, acc=30
-                    )
-                    # Step the simulation to move towards target
-                    self._sim_arm.step_simulation(interval)
-                else:
-                    arm.move_to_fast(
-                        corrected["b"], corrected["s"],
-                        corrected["e"], corrected["h"],
-                        spd=50, acc=30
-                    )
-
-                last_pos = corrected.copy()
-                commands_sent += 1
-
-            # --- In simulation mode, always step physics ---
-            if is_sim:
-                self._sim_arm.step_simulation(interval * 0.5)
-
-            # --- UI updaten (nur alle 200ms, NICHT blockierend) ---
-            if commands_sent % max(1, stream_hz // 5) == 0:
-                if is_sim:
-                    sim_pos = self._sim_arm.read_position_deg()
-                    self.app.call_from_thread(self._update_arm_views, sim_pos)
-                    self.app.call_from_thread(self._update_joint_displays, sim_pos)
-                else:
-                    self.app.call_from_thread(self._update_arm_views, corrected)
-                self.app.call_from_thread(self._update_play_timeline, elapsed)
-
-            # --- Timing ---
-            loop_elapsed = time.time() - loop_start
-            sleep_time = interval - loop_elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        # --- Precision Endpoint ---
+            self._start_activity, f"Playing ({duration:.1f}s)", "▶️")
+        events = sorted(self._play_data.get("events", []), key=lambda x: x["t"])
+        self._streaming_loop(arm, trajectory, duration, cal_model, events, is_sim)
         if self.playing:
-            self.app.call_from_thread(
-                self._start_activity, "Precision settle", "🎯"
-            )
-
-            final_target = {}
-            for joint in ["b", "s", "e", "h"]:
-                final_target[joint] = round(float(splines[joint](times[-1])), 2)
-            final_corrected = self._apply_calibration_static(cal_model, final_target)
-
-            if is_sim:
-                # In simulation, just move directly to final position
-                arm.move_to(
-                    final_corrected["b"], final_corrected["s"],
-                    final_corrected["e"], final_corrected["h"],
-                    spd=5, acc=2
-                )
-                for _ in range(100):
-                    time.sleep(0.02)
-                    self._sim_arm.step_simulation(0.02)
-                    if not self._sim_arm.is_moving:
-                        break
-                pos = self._sim_arm.read_position_deg()
-                self.app.call_from_thread(self._update_arm_views, pos)
-                self.app.call_from_thread(self._update_joint_displays, pos)
-            else:
-                for spd, acc in [(8, 4), (5, 2), (3, 1)]:
-                    arm.move_to(
-                        final_corrected["b"], final_corrected["s"],
-                        final_corrected["e"], final_corrected["h"],
-                        spd=spd, acc=acc
-                    )
-                    time.sleep(0.8)
-
-        # --- Ende ---
-        self.playing = False
-
-        # Kalibrierungs-Info im Summary
-        cal_info = ""
-        if cal_active and 'final_target' in dir() and 'final_corrected' in dir():
-            delta_b = final_corrected["b"] - final_target["b"]
-            delta_s = final_corrected["s"] - final_target["s"]
-            delta_e = final_corrected["e"] - final_target["e"]
-            cal_info = (
-                f"\n  [dim]Kalibrierung (Endpunkt-Korrektur): "
-                f"Δb={delta_b:+.2f}° Δs={delta_s:+.2f}° Δe={delta_e:+.2f}°[/]"
-            )
-
-        # Stop activity indicator
-        self.app.call_from_thread(
-            self._stop_activity, "✅ Playback complete"
-        )
-
-        self.app.call_from_thread(
-            self._log_play,
-            f"[green]✅ Playback beendet{sim_tag}: {commands_sent} Cmds, "
-            f"{skipped} übersprungen, {rate_limiter.violations} Rate-Limit-Eingriffe"
-            f"{cal_info}[/]"
-        )
-        self.app.call_from_thread(self._playback_finished)
-
-        # Clear success message after 3 seconds
-        self.app.call_from_thread(
-            self.set_timer, 3.0, lambda: self._stop_activity()
-        )
+            self._do_precision_endpoint(arm, trajectory, duration, cal_model, is_sim)
+        self._finalize_playback(arm, is_sim, cal_model, duration)
+        # Loop handling
+        if self._is_loop_enabled():
+            self._run_loop(waypoints, arm, is_sim)
 
     def _update_play_timeline(self, elapsed: float):
         """Aktualisiert die Timeline-Position."""
@@ -3124,149 +3139,250 @@ class RoArmDashboard(App):
 
         self._run_calibration_worker(pose_set, repeats, auto_accept)
 
+    def _init_calibration_diagnostics(self, repeats: int, pose_set: str) -> dict:
+        """Initializes the diagnostics dict for calibration."""
+        return {
+            "settle_times_s": [],
+            "overshoot_deg": [],
+            "noise_std_deg": [],
+            "per_pose": [],
+            "repeats_per_pose": repeats,
+            "pose_set": pose_set,
+            "total_measurements": 0,
+            "repeatability_per_pose": [],
+        }
+
+    def _cal_log(self, msg: str):
+        """Thread-safe calibration log."""
+        self.app.call_from_thread(self._log_calibrate, msg)
+
+    def _log_cal_pose_validation(self, valid: list, all_poses: list):
+        """Logs pose validation results."""
+        skipped = len(all_poses) - len(valid)
+        if skipped > 0:
+            self._cal_log(f"[yellow]⚠ {skipped} Posen übersprungen (außerhalb Grenzen)[/]")
+        if len(valid) < 10:
+            self._cal_log(f"[yellow]⚠ Nur {len(valid)} gültige Posen![/]")
+
+    def _cal_safe_up_between(self):
+        """Moves to safe-up between calibration poses."""
+        from calibrate import move_to_safe_up
+        current = self._arm.read_position_deg()
+        if current:
+            move_to_safe_up(self._arm, current_pose=current)
+        else:
+            move_to_safe_up(self._arm, current_pose=None)
+
+    def _cal_show_diagnostics(self, diagnostics: dict, residuals: dict,
+                              poses: list, repeats: int):
+        """Shows calibration diagnostics tables in the log."""
+        from calibrate import JOINTS
+        # Residuals
+        self._cal_log("\n[bold cyan]📊 Kalibrierungs-Ergebnis:[/]")
+        for j in JOINTS:
+            r = residuals.get(j, 0)
+            q = "✅" if r < 0.3 else "⚠️" if r < 1.0 else "❌"
+            self._cal_log(f"  {j.upper()}: RMS={r:.4f}° {q}")
+        # Settle times
+        if diagnostics["settle_times_s"]:
+            arr = np.array(diagnostics["settle_times_s"])
+            self._cal_log(
+                f"  Settle: min={arr.min():.2f}s max={arr.max():.2f}s "
+                f"avg={arr.mean():.2f}s"
+            )
+        # Overshoot
+        if diagnostics["overshoot_deg"]:
+            arr = np.array(diagnostics["overshoot_deg"])
+            self._cal_log(f"  Overshoot: max={arr.max():.3f}° avg={arr.mean():.3f}°")
+        # Repeatability
+        if diagnostics["repeatability_per_pose"]:
+            for j in JOINTS:
+                vals = [r["repeat_std_deg"][j] for r in diagnostics["repeatability_per_pose"]]
+                self._cal_log(f"  Repeatability {j.upper()}: σ={np.mean(vals):.4f}°")
+
+
+    def _cal_save_results(self, model, diagnostics: dict, residuals: dict,
+                          measurement_count: int, poses: list, repeats: int):
+        """Saves calibration model and diagnostics JSON."""
+        cal_path = Path("calibration") / "roarm_calibration.cal"
+        cal_path.parent.mkdir(exist_ok=True)
+        diagnostics["total_measurements"] = measurement_count
+        model.save(str(cal_path), diagnostics=diagnostics)
+        # Save diagnostics JSON
+        diag_path = Path("calibration") / "roarm_diagnostics.json"
+        with open(diag_path, 'w') as f:
+            json.dump(diagnostics, f, indent=2)
+        self._cal_log(f"[green]✅ Kalibrierung gespeichert: {cal_path}[/]")
+        self._cal_log(f"[green]✅ Diagnostik gespeichert: {diag_path}[/]")
+
+
+    def _cal_fit_model(self, commanded: list, errors: list, repeats: int) -> tuple:
+        """Fits the calibration model. Returns (model, residuals)."""
+        from calibrate import CalibrationModel
+        self._cal_log("\n[bold]📊 Fitte Kalibrierungsmodell...[/]")
+        model = CalibrationModel()
+        residuals = model.fit(commanded, errors)
+        return model, residuals
+
+
+    def _cal_repeatability_test(self, poses: list, diagnostics: dict):
+        """Runs final repeatability test (home → ... → home)."""
+        from calibrate import move_from_safe_up_to_pose, JOINTS
+        self._cal_log("[dim]  🔄 Repeatability-Test (Home nochmal)...[/]")
+        move_from_safe_up_to_pose(self._arm, poses[0])
+        self._arm.move_to(poses[0]["b"], poses[0]["s"], poses[0]["e"], poses[0]["h"], spd=5, acc=3)
+        self._arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
+        repeat_pos = self._arm.read_position_averaged(n=10, interval=0.05)
+        if repeat_pos and diagnostics["per_pose"]:
+            first_measured = diagnostics["per_pose"][0].get("measured", {}) if diagnostics["per_pose"] else {}
+            if first_measured:
+                repeat_err = {j: abs(repeat_pos[j] - first_measured.get(j, repeat_pos[j]))
+                              for j in JOINTS}
+                diagnostics["repeatability_deg"] = repeat_err
+                self._cal_log(
+                    f"[dim]  🔄 Home→...→Home: Δb={repeat_err['b']:.3f}° "
+                    f"Δs={repeat_err['s']:.3f}° Δe={repeat_err['e']:.3f}°[/]"
+                )
+
+
+    def _cal_aggregate_pose(self, pose: dict, measurements: list,
+                            commanded: list, errors: list,
+                            diagnostics: dict, repeats: int):
+        """Aggregates measurements for a single pose into commanded/errors."""
+        from calibrate import JOINTS
+        if not measurements:
+            return
+        avg_error = {j: float(np.mean([m["error"][j] for m in measurements]))
+                     for j in JOINTS}
+        commanded.append(pose)
+        errors.append(avg_error)
+        # Repeatability
+        if repeats > 1:
+            repeat_std = {j: float(np.std([m["measured"][j] for m in measurements]))
+                          for j in JOINTS}
+            diagnostics["repeatability_per_pose"].append({
+                "pose_index": len(commanded) - 1,
+                "repeat_std_deg": repeat_std,
+            })
+
+
+    def _cal_compute_overshoot(self, settle_result: dict) -> float:
+        """Computes max overshoot from settle readings."""
+        from calibrate import JOINTS
+        readings = settle_result.get("readings", [])
+        final_pos = settle_result.get("pos")
+        if not readings or not final_pos:
+            return 0.0
+        max_overshoot = 0.0
+        for reading in readings:
+            for j in JOINTS:
+                if j in reading:
+                    overshoot = abs(reading[j] - final_pos[j])
+                    max_overshoot = max(max_overshoot, overshoot)
+        return round(max_overshoot, 3)
+
+
+    def _cal_measure_single_pose(self, pose: dict, pose_idx: int,
+                                 rep: int, repeats: int, diagnostics: dict) -> Optional[dict]:
+        """Measures a single pose. Returns error dict or None."""
+        from calibrate import move_from_safe_up_to_pose, JOINTS
+        move_start = time.time()
+        move_from_safe_up_to_pose(self._arm, pose)
+        # Precision settle
+        self._arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
+        result = self._arm.wait_until_settled(tolerance_deg=0.2, stable_count=6)
+        settle_time = time.time() - move_start
+        diagnostics["settle_times_s"].append(settle_time)
+        # Overshoot
+        overshoot = self._cal_compute_overshoot(result)
+        diagnostics["overshoot_deg"].append(overshoot)
+        # Read averaged position
+        servo_avg = self._arm.read_position_averaged(n=10, interval=0.05)
+        if not servo_avg:
+            return None
+        # Noise
+        diagnostics["noise_std_deg"].append({
+            j: servo_avg.get(f"{j}_std", 0) for j in JOINTS
+        })
+        error = {j: servo_avg[j] - pose[j] for j in JOINTS}
+        # Update arm view
+        self.app.call_from_thread(self._update_arm_views, {
+            "b": servo_avg["b"], "s": servo_avg["s"],
+            "e": servo_avg["e"], "h": servo_avg.get("h", 180.0)
+        })
+        self._cal_log(
+            f"[dim]  ✓ Pose {pose_idx+1} Rep {rep+1}: "
+            f"Δb={error['b']:+.2f}° Δs={error['s']:+.2f}° Δe={error['e']:+.2f}°[/]"
+        )
+        return {"error": error, "measured": {j: servo_avg[j] for j in JOINTS}}
+
+
+    def _cal_update_progress(self, pose_idx: int, n_poses: int,
+                             rep: int, repeats: int, count: int, total: int):
+        """Updates calibration progress in UI."""
+        pct = count / total * 100
+        self.app.call_from_thread(
+            self._update_cal_status,
+            f"Pose {pose_idx+1}/{n_poses} · Rep {rep+1}/{repeats} · {pct:.0f}%"
+        )
+        self.app.call_from_thread(
+            self._start_activity,
+            f"Cal {pct:.0f}% P{pose_idx+1}/{n_poses}", "🎯"
+        )
+
 
     @work(thread=True)
     def _run_calibration_worker(self, pose_set: str, repeats: int,
                                 auto_accept: bool):
-        """Führt die Kalibrierung im Hintergrund aus."""
+        """Full calibration with diagnostics, repeatability, overshoot."""
         from calibrate import (
             CalibrationModel, POSE_SETS, JOINTS,
             move_to_safe_up, move_from_safe_up_to_pose, validate_pose,
+            run_manual_verification, integrate_manual_points,
         )
-
         poses = POSE_SETS.get(pose_set, POSE_SETS["standard"])
-
-        # Validieren
         valid_poses = [p for p in poses if validate_pose(p)]
-        if len(valid_poses) < 10:
-            self.app.call_from_thread(
-                self._log_calibrate,
-                f"[yellow]⚠ Nur {len(valid_poses)} gültige Posen![/]"
-            )
-
+        self._log_cal_pose_validation(valid_poses, poses)
         total = len(valid_poses) * repeats
-        commanded = []
-        errors = []
-
+        commanded, errors = [], []
+        diagnostics = self._init_calibration_diagnostics(repeats, pose_set)
         self._arm.torque_on()
         time.sleep(0.2)
-
-        # Safe-UP
-        self.app.call_from_thread(
-            self._log_calibrate, "[dim]  Fahre zu Safe-UP...[/]"
-        )
+        self._cal_log("[dim]  Fahre zu Safe-UP...[/]")
         move_to_safe_up(self._arm, current_pose=None)
-
         measurement_count = 0
-
         for i, pose in enumerate(valid_poses):
-            pose_errors = []
-
+            pose_measurements = []
             for rep in range(repeats):
                 measurement_count += 1
-                pct = measurement_count / total * 100
-
-                status_text = (
-                    f"Pose {i+1}/{len(valid_poses)} · Rep {rep+1}/{repeats} "
-                    f"· {pct:.0f}%"
-                )
-                self.app.call_from_thread(
-                    self._update_cal_status, status_text
-                )
-                # Update activity indicator with progress
-                self.app.call_from_thread(
-                    self._start_activity,
-                    f"Cal {pct:.0f}% P{i+1}/{len(valid_poses)}", "🎯"
-                )
-
-                # Safe-UP zwischen Posen
+                self._cal_update_progress(i, len(valid_poses), rep, repeats, measurement_count, total)
                 if rep > 0 or i > 0:
-                    current = self._arm.read_position_deg()
-                    if current:
-                        move_to_safe_up(self._arm, current_pose=current)
-                    else:
-                        move_to_safe_up(self._arm, current_pose=None)
+                    self._cal_safe_up_between()
+                result = self._cal_measure_single_pose(pose, i, rep, repeats, diagnostics)
+                if result:
+                    pose_measurements.append(result)
+            self._cal_aggregate_pose(pose, pose_measurements, commanded, errors, diagnostics, repeats)
+        # Repeatability test
+        self._cal_repeatability_test(valid_poses, diagnostics)
+        # Fit model
+        model, residuals = self._cal_fit_model(commanded, errors, repeats)
+        # Save
+        self._cal_save_results(model, diagnostics, residuals, measurement_count, valid_poses, repeats)
+        # Show diagnostics tables
+        self._cal_show_diagnostics(diagnostics, residuals, valid_poses, repeats)
+        # Cleanup
+        self._cal_cleanup()
 
-                # Zur Pose fahren
-                move_from_safe_up_to_pose(self._arm, pose)
-
-                # Präzisions-Nachfahrt
-                self._arm.move_to(
-                    pose["b"], pose["s"], pose["e"], pose["h"],
-                    spd=5, acc=3
-                )
-                self._arm.wait_until_settled(
-                    tolerance_deg=0.2, stable_count=6
-                )
-
-                # Position lesen
-                servo_avg = self._arm.read_position_averaged(n=10, interval=0.05)
-                if servo_avg:
-                    error = {j: servo_avg[j] - pose[j] for j in JOINTS}
-                    pose_errors.append(error)
-
-                    # Arm-View updaten
-                    self.app.call_from_thread(
-                        self._update_arm_views,
-                        {"b": servo_avg["b"], "s": servo_avg["s"],
-                         "e": servo_avg["e"], "h": servo_avg.get("h", 180.0)}
-                    )
-
-                    self.app.call_from_thread(
-                        self._log_calibrate,
-                        f"[dim]  ✓ Pose {i+1} Rep {rep+1}: "
-                        f"Δb={error['b']:+.2f}° Δs={error['s']:+.2f}° "
-                        f"Δe={error['e']:+.2f}°[/]"
-                    )
-
-            # Mittelwert für diese Pose
-            if pose_errors:
-                avg_error = {}
-                for j in JOINTS:
-                    avg_error[j] = float(
-                        np.mean([e[j] for e in pose_errors])
-                    )
-                commanded.append(pose)
-                errors.append(avg_error)
-
-        # Modell fitten
-        self.app.call_from_thread(
-            self._log_calibrate, "\n[bold]📊 Fitte Kalibrierungsmodell...[/]"
-        )
-
-        model = CalibrationModel()
-        residuals = model.fit(commanded, errors)
-
-        # Speichern
-        cal_path = Path("calibration") / "roarm_calibration.cal"
-        cal_path.parent.mkdir(exist_ok=True)
-        model.save(str(cal_path))
-
-        # Ergebnis anzeigen
-        result_msg = (
-            f"[bold green]✅ Kalibrierung abgeschlossen![/]\n"
-            f"  Residuen: b={residuals['b']:.4f}° "
-            f"s={residuals['s']:.4f}° e={residuals['e']:.4f}°\n"
-            f"  Gespeichert: {cal_path}\n"
-            f"  Messungen: {measurement_count}"
-        )
-        self.app.call_from_thread(self._log_calibrate, result_msg)
-
-        # Buttons zurücksetzen
-        self.app.call_from_thread(self._cal_finished)
-
-        # Stop activity indicator
-        self.app.call_from_thread(
-            self._stop_activity, "✅ Calibration complete"
-        )
-        self.app.call_from_thread(
-            self.set_timer, 5.0, lambda: self._stop_activity()
-        )
-
-        # Zurück zu Safe-UP
+    def _cal_cleanup(self):
+        """Cleanup after calibration: safe-up, reset buttons."""
+        from calibrate import move_to_safe_up
         current = self._arm.read_position_deg()
         if current:
             move_to_safe_up(self._arm, current_pose=current)
+        self.app.call_from_thread(self._cal_finished)
+        self.app.call_from_thread(self._stop_activity, "✅ Calibration complete")
+        self.app.call_from_thread(self.set_timer, 5.0, lambda: self._stop_activity())
+
 
     def _update_cal_status(self, text: str):
         """Aktualisiert das Calibration-Status-Panel."""
