@@ -111,8 +111,12 @@ with spinner("Importing Pillow..."):
     from PIL import Image
 
 with spinner("Importing CalibrationModel..."):
-    from calibrate import CalibrationModel
-
+        from calibrate import (
+            CalibrationModel, POSE_SETS, JOINTS,
+            move_to_safe_up, move_from_safe_up_to_pose, validate_pose,
+            run_manual_verification, integrate_manual_points,
+            CalibrationModel, JOINTS
+        )
 
 with spinner("Importing CubicSpline..."):
     from scipy.interpolate import CubicSpline
@@ -2904,7 +2908,6 @@ class RoArmDashboard(App):
         if is_sim:
             return None
         try:
-            from calibrate import CalibrationModel
             cal_path = Path("calibration") / "roarm_calibration.cal"
             if cal_path.exists():
                 model = CalibrationModel.load(str(cal_path))
@@ -2967,7 +2970,6 @@ class RoArmDashboard(App):
 
     def _move_via_safe_up(self, arm, target_pose: dict):
         """Moves arm to target via safe-up position (collision avoidance)."""
-        from calibrate import move_to_safe_up, move_from_safe_up_to_pose
         current = arm.read_position_deg()
         if current:
             move_to_safe_up(arm, current_pose=current)
@@ -3665,7 +3667,6 @@ class RoArmDashboard(App):
 
     def _cal_safe_up_between(self):
         """Moves to safe-up between calibration poses."""
-        from calibrate import move_to_safe_up
         current = self._arm.read_position_deg()
         if current:
             move_to_safe_up(self._arm, current_pose=current)
@@ -3675,7 +3676,6 @@ class RoArmDashboard(App):
     def _cal_show_diagnostics(self, diagnostics: dict, residuals: dict,
                               poses: list, repeats: int):
         """Shows calibration diagnostics tables in the log."""
-        from calibrate import JOINTS
         # Residuals
         self._cal_log("\n[bold cyan]📊 Kalibrierungs-Ergebnis:[/]")
         for j in JOINTS:
@@ -3717,7 +3717,6 @@ class RoArmDashboard(App):
 
     def _cal_fit_model(self, commanded: list, errors: list, repeats: int) -> tuple:
         """Fits the calibration model. Returns (model, residuals)."""
-        from calibrate import CalibrationModel
         self._cal_log("\n[bold]📊 Fitte Kalibrierungsmodell...[/]")
         model = CalibrationModel()
         residuals = model.fit(commanded, errors)
@@ -3726,7 +3725,6 @@ class RoArmDashboard(App):
 
     def _cal_repeatability_test(self, poses: list, diagnostics: dict):
         """Runs final repeatability test (home → ... → home)."""
-        from calibrate import move_from_safe_up_to_pose, JOINTS
         self._cal_log("[dim]  🔄 Repeatability-Test (Home nochmal)...[/]")
         move_from_safe_up_to_pose(self._arm, poses[0])
         self._arm.move_to(poses[0]["b"], poses[0]["s"], poses[0]["e"], poses[0]["h"], spd=5, acc=3)
@@ -3746,7 +3744,6 @@ class RoArmDashboard(App):
     def _cal_run_manual_verification(self, arm, commanded: list,
                                       errors: list, diagnostics: dict) -> tuple:
         """Runs manual verification if manual points were previously collected."""
-        from calibrate import integrate_manual_points
         manual_path = Path("calibration") / "manual_points.json"
         if not manual_path.exists():
             return commanded, errors
@@ -3775,7 +3772,6 @@ class RoArmDashboard(App):
                             commanded: list, errors: list,
                             diagnostics: dict, repeats: int):
         """Aggregates measurements for a single pose into commanded/errors."""
-        from calibrate import JOINTS
         if not measurements:
             return
         avg_error = {j: float(np.mean([m["error"][j] for m in measurements]))
@@ -3794,7 +3790,6 @@ class RoArmDashboard(App):
 
     def _cal_compute_overshoot(self, settle_result: dict) -> float:
         """Computes max overshoot from settle readings."""
-        from calibrate import JOINTS
         readings = settle_result.get("readings", [])
         final_pos = settle_result.get("pos")
         if not readings or not final_pos:
@@ -3811,7 +3806,6 @@ class RoArmDashboard(App):
     def _cal_measure_single_pose(self, pose: dict, pose_idx: int,
                                  rep: int, repeats: int, diagnostics: dict) -> Optional[dict]:
         """Measures a single pose. Returns error dict or None."""
-        from calibrate import move_from_safe_up_to_pose, JOINTS
         move_start = time.time()
         move_from_safe_up_to_pose(self._arm, pose)
         self._arm.move_to(pose["b"], pose["s"], pose["e"], pose["h"], spd=5, acc=3)
@@ -3866,11 +3860,7 @@ class RoArmDashboard(App):
     def _run_calibration_worker(self, pose_set: str, repeats: int,
                                 auto_accept: bool):
         """Full calibration with diagnostics, repeatability, overshoot."""
-        from calibrate import (
-            CalibrationModel, POSE_SETS, JOINTS,
-            move_to_safe_up, move_from_safe_up_to_pose, validate_pose,
-            run_manual_verification, integrate_manual_points,
-        )
+
         poses = POSE_SETS.get(pose_set, POSE_SETS["standard"])
         valid_poses = [p for p in poses if validate_pose(p)]
         self._log_cal_pose_validation(valid_poses, poses)
@@ -3912,7 +3902,6 @@ class RoArmDashboard(App):
 
     def _cal_cleanup(self):
         """Cleanup after calibration: safe-up, reset buttons."""
-        from calibrate import move_to_safe_up
         current = self._arm.read_position_deg()
         if current:
             move_to_safe_up(self._arm, current_pose=current)
