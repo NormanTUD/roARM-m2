@@ -72,6 +72,7 @@ with spinner("Importing base modules..."):
     from pathlib import Path
     from datetime import datetime
     from typing import Optional
+    import argparse
 
 with spinner("Importing numpy..."):
     import numpy as np
@@ -97,16 +98,6 @@ with spinner("Importing textual..."):
     from textual.widgets import Static
     from textual.strip import Strip
 
-parser = argparse.ArgumentParser(description="Robot Control Script")
-
-parser.add_argument(
-    '--enable-gravity-comp',
-    action='store_true',
-    help="Enable gravity compensation (default: False)"
-)
-
-args = parser.parse_args()
-
 with spinner("Importing robot..."):
     from robot import (
         RoArmConnection, find_arm_port, rad_to_deg, deg_to_rad,
@@ -118,6 +109,16 @@ with spinner("Importing safety..."):
 
 with spinner("Importing Pillow..."):
     from PIL import Image
+
+parser = argparse.ArgumentParser(description="Robot Control Script")
+
+parser.add_argument(
+    '--enable-gravity-comp',
+    action='store_true',
+    help="Enable gravity compensation (default: False)"
+)
+
+args = parser.parse_args()
 
 # ============================================================
 # KINEMATIK-KONSTANTEN
