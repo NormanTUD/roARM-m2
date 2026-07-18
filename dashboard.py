@@ -137,6 +137,7 @@ MAX_TRACKING_ERROR = 15.0
 MAX_DEG_PER_TICK = 1.5  # Max 1.5° pro 20ms Tick = 75°/s (Servo-Limit ~60°/s)
 LOOKAHEAD_MS = 40  # 2 Frames voraus
 MIN_DELTA_DEG = 0.0  # Jeden Frame senden, auch wenn kaum Bewegung
+LOOKAHEAD_S = 0.06  # 60ms voraus (3 Frames bei 50Hz)
 
 # ============================================================
 # ADAPTIVE TIMING CONSTANTS
@@ -154,9 +155,9 @@ START_RAMP_PERCENT = 0.03
 RECORDINGS_DIR = Path("recordings")
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-RECORD_HZ = 50
+RECORD_HZ = 100
 MOVE_THRESHOLD_DEG = 0.1
-STREAM_HZ = 50
+STREAM_HZ = 100
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2887,11 +2888,9 @@ class RoArmDashboard(App):
             if max_delta < MIN_DELTA_DEG:
                 return False, commands_sent, skipped + 1
 
-        # FIX: Konstant hohe Speed/Acc damit der Servo NICHT zwischen
-        # Wegpunkten abbremst. Der Servo soll das Ziel "überschießen"
-        # wollen, bevor der nächste Command kommt.
-        spd = 0  # 0 = maximale Geschwindigkeit (bei vielen Servo-Controllern)
-        acc = 0  # 0 = maximale Beschleunigung
+        # Hohe aber GÜLTIGE Werte — nicht 0!
+        spd = 80
+        acc = 254  # STS3215 max acceleration
 
         if rate_limiter:
             rate_limiter.acquire()
@@ -2903,7 +2902,6 @@ class RoArmDashboard(App):
         if is_sim:
             self._sim_arm.step_simulation(interval)
         return True, commands_sent + 1, skipped
-
 
     def _update_playback_ui(self, arm, corrected: dict, elapsed: float, is_sim: bool):
         """Updates UI during playback (called from worker thread)."""
@@ -3061,7 +3059,7 @@ class RoArmDashboard(App):
                 # ============================================================
                 # Trajectory samplen und senden
                 # ============================================================
-                target = trajectory.sample(elapsed)
+                target = trajectory.sample(min(elapsed + LOOKAHEAD_S, duration))
                 corrected = self._apply_calibration_static(cal_model, target)
 
                 if not is_sim and self._current_monitor:
