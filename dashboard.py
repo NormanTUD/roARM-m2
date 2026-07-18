@@ -1418,8 +1418,6 @@ class RoArmDashboard(App):
     def _trigger_playback_estop(self, reason: str):
         """Triggers emergency stop during playback."""
         self.playing = False
-        if self._arm:
-            self._arm.torque_off()
         self.call_from_thread(
             self._log_play, f"[bold red]🚨 E-STOP: {reason}[/]"
         )
