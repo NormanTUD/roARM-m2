@@ -1404,10 +1404,6 @@ class RoArmDashboard(App):
         except Exception:
             pass
 
-    def _periodic_log_refresh(self):
-        """Lädt neue Log-Zeilen."""
-        self._load_logs()
-
     # ============================================================
     # TABLE SETUP
     # ============================================================
@@ -2645,118 +2641,289 @@ class RoArmDashboard(App):
     # LOGS TAB
     # ============================================================
 
-    def _load_logs(self):
-        """Lädt die neuesten Log-Dateien."""
+    def _load_logs(self) -> bool:
+        """Lädt die neuesten Log-Dateien.
+
+        Returns:
+            True wenn neue Zeilen geladen wurden.
+        """
         log_files = sorted(LOGS_DIR.glob("robot_commands_*.log"), reverse=True)
+
         if not log_files:
-            return
+            # Auch andere Log-Patterns suchen
+            log_files = sorted(LOGS_DIR.glob("*.log"), reverse=True)
 
-        # Neueste Log-Datei laden
-        latest = log_files[0]
-        try:
-            with open(latest, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-            self._all_log_lines = lines[-500:]  # Letzte 500 Zeilen
-        except Exception:
-            self._all_log_lines = []
+        if not log_files:
+            if not self._all_log_lines:
+                self._all_log_lines = []
+            return False
 
-        # Beim ersten Laden auch direkt anzeigen
-        if self._all_log_lines:
-            self._apply_log_filter()
+        new_lines = []
+        # Die neuesten 3 Log-Dateien laden (für mehr Kontext)
+        for log_file in log_files[:3]:
+            try:
+                with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()
+                # Dateiname als Header einfügen
+                if lines:
+                    new_lines.append(f"═══ {log_file.name} ═══\n")
+                    new_lines.extend(lines)
+            except (OSError, PermissionError) as e:
+                new_lines.append(f"[FEHLER beim Lesen: {log_file.name}: {e}]\n")
+
+        # Nur die letzten 1000 Zeilen behalten
+        old_count = len(self._all_log_lines)
+        self._all_log_lines = new_lines[-1000:]
+
+        return len(self._all_log_lines) != old_count
+
+    def _periodic_log_refresh(self):
+        """Lädt neue Log-Zeilen und aktualisiert die Anzeige."""
+        had_lines = len(self._all_log_lines)
+        self._load_logs()
+        # Nur neu rendern wenn sich was geändert hat
+        if len(self._all_log_lines) != had_lines:
+            self._apply_log_filter(auto_scroll=True)
 
     @on(Button.Pressed, "#btn-log-filter")
     def on_log_filter(self) -> None:
+        """Filter-Button gedrückt."""
         self._apply_log_filter()
 
     @on(Button.Pressed, "#btn-log-refresh")
     def on_log_refresh(self) -> None:
+        """Refresh-Button: Logs neu laden und anzeigen."""
         self._load_logs()
         self._apply_log_filter()
-        self._log_to_viewer("[green]↻ Logs aktualisiert[/]")
+        # Bestätigungsmeldung am Ende
+        try:
+            viewer = self.query_one("#log-viewer", RichLog)
+            viewer.write(
+                f"[bold green]─── ↻ Aktualisiert: "
+                f"{len(self._all_log_lines)} Zeilen geladen "
+                f"({datetime.now().strftime('%H:%M:%S')}) ───[/]"
+            )
+        except NoMatches:
+            pass
 
     @on(Button.Pressed, "#btn-log-clear")
     def on_log_clear(self) -> None:
+        """Clear-Button: Viewer leeren (nicht die Quelldaten)."""
         try:
             viewer = self.query_one("#log-viewer", RichLog)
             viewer.clear()
+            viewer.write("[dim]Log-Anzeige geleert. [↻ Refresh] zum Neuladen.[/]")
         except NoMatches:
             pass
 
     @on(Input.Submitted, "#log-search-input")
     def on_log_search_submit(self, event: Input.Submitted) -> None:
+        """Enter im Suchfeld: Filter anwenden."""
         self._apply_log_filter()
 
-    def _apply_log_filter(self):
-        """Filtert die Logs nach dem Suchbegriff (Text oder Regex)."""
+    @on(Input.Changed, "#log-search-input")
+    def on_log_search_changed(self, event: Input.Changed) -> None:
+        """Live-Filterung bei Eingabe (mit Debounce via Timer)."""
+        # Debounce: Nur alle 300ms filtern
+        if hasattr(self, '_log_search_timer') and self._log_search_timer:
+            self._log_search_timer.stop()
+        self._log_search_timer = self.set_timer(
+            0.3, self._apply_log_filter
+        )
+
+    def _apply_log_filter(self, auto_scroll: bool = True):
+        """Filtert und zeigt die Logs an.
+
+        Unterstützt:
+        - Leerer Filter: Alle Zeilen anzeigen
+        - Text: Case-insensitive Suche
+        - /regex/: Regex-Suche
+        - Mehrere Begriffe mit | trennen: OR-Suche
+        - Prefix ! für Negation: !SEND_FAST zeigt alles OHNE SEND_FAST
+        """
+        # Filter-Pattern lesen
         try:
             search_input = self.query_one("#log-search-input", Input)
             pattern = search_input.value.strip()
         except NoMatches:
             pattern = ""
 
+        # Viewer holen
         try:
             viewer = self.query_one("#log-viewer", RichLog)
-            viewer.clear()
         except NoMatches:
             return
 
+        # Viewer leeren für neuen Inhalt
+        viewer.clear()
+
+        # Keine Daten?
         if not self._all_log_lines:
-            self._log_to_viewer("[dim]Keine Log-Dateien gefunden.[/]")
+            viewer.write("[bold yellow]⚠ Keine Log-Dateien gefunden.[/]")
+            viewer.write("")
+            viewer.write(f"[dim]Suchpfad: {LOGS_DIR.absolute()}[/]")
+            viewer.write(f"[dim]Erwartetes Pattern: robot_commands_*.log[/]")
+            viewer.write("")
+            viewer.write(
+                "[dim]Logs werden automatisch erstellt wenn der Arm "
+                "verbunden wird.[/]"
+            )
+            # Vorhandene Dateien im Verzeichnis auflisten
+            if LOGS_DIR.exists():
+                all_files = list(LOGS_DIR.iterdir())
+                if all_files:
+                    viewer.write(f"\n[dim]Dateien in {LOGS_DIR}/:[/]")
+                    for f in sorted(all_files)[:20]:
+                        viewer.write(f"[dim]  • {f.name} ({f.stat().st_size} bytes)[/]")
+                else:
+                    viewer.write(f"\n[dim]Verzeichnis {LOGS_DIR}/ ist leer.[/]")
             return
 
-        filtered = []
+        # --- Filtern ---
+        filtered = self._filter_log_lines(pattern)
 
-        if not pattern:
-            filtered = self._all_log_lines
-        elif pattern.startswith("/") and pattern.endswith("/"):
-            # Regex-Modus
-            regex_str = pattern[1:-1]
-            try:
-                regex = re.compile(regex_str, re.IGNORECASE)
-                filtered = [
-                    line for line in self._all_log_lines
-                    if regex.search(line)
-                ]
-            except re.error as e:
-                self._log_to_viewer(f"[red]Regex-Fehler: {e}[/]")
-                return
-        else:
-            # Einfache Textsuche (case-insensitive)
-            pattern_lower = pattern.lower()
-            filtered = [
-                line for line in self._all_log_lines
-                if pattern_lower in line.lower()
-            ]
+        # --- Header mit Statistik ---
+        total = len(self._all_log_lines)
+        shown = len(filtered)
 
-        # Ergebnisse anzeigen
         if pattern:
-            self._log_to_viewer(
-                f"[dim]🔍 Filter: '{pattern}' → {len(filtered)}/{len(self._all_log_lines)} Zeilen[/]"
+            viewer.write(
+                f"[bold]🔍 Filter:[/] [cyan]'{pattern}'[/] → "
+                f"[bold]{shown}[/]/{total} Zeilen"
             )
+            viewer.write("─" * 60)
+        else:
+            viewer.write(
+                f"[dim]📋 {total} Zeilen geladen | "
+                f"Filter: Text, /regex/, !negation, term1|term2[/]"
+            )
+            viewer.write("─" * 60)
 
-        for line in filtered[-200:]:  # Max 200 Zeilen anzeigen
-            line = line.rstrip()
-            # Farbcodierung nach Log-Level
-            if "| WARNING" in line or "| TIMEOUT" in line:
-                self._log_to_viewer(f"[yellow]{line}[/]")
-            elif "| ERROR" in line:
-                self._log_to_viewer(f"[red]{line}[/]")
-            elif "SEND_FAST" in line:
-                self._log_to_viewer(f"[dim]{line}[/]")
-            elif "| SEND" in line:
-                self._log_to_viewer(f"[bright_blue]{line}[/]")
-            elif "| RECV" in line:
-                self._log_to_viewer(f"[bright_green]{line}[/]")
-            elif "NOTE" in line:
-                self._log_to_viewer(f"[bright_cyan]{line}[/]")
-            else:
-                self._log_to_viewer(line)
+        # --- Zeilen anzeigen (max 500 für Performance) ---
+        display_lines = filtered[-500:] if len(filtered) > 500 else filtered
 
+        if len(filtered) > 500:
+            viewer.write(
+                f"[yellow]⚠ Zeige nur die letzten 500 von {len(filtered)} "
+                f"Treffern[/]"
+            )
+            viewer.write("")
+
+        for line in display_lines:
+            styled = self._style_log_line(line.rstrip())
+            viewer.write(styled)
+
+        # --- Keine Treffer ---
         if not filtered and pattern:
-            self._log_to_viewer(f"[yellow]Keine Treffer für '{pattern}'[/]")
+            viewer.write("")
+            viewer.write(f"[bold yellow]Keine Treffer für '{pattern}'[/]")
+            viewer.write("")
+            viewer.write("[dim]Tipps:[/]")
+            viewer.write("[dim]  • Text-Suche ist case-insensitive[/]")
+            viewer.write("[dim]  • /regex/ für reguläre Ausdrücke[/]")
+            viewer.write("[dim]  • SEND, RECV, NOTE, TIMEOUT als Keywords[/]")
+            viewer.write("[dim]  • !SEND_FAST um Fast-Sends auszublenden[/]")
+            viewer.write("[dim]  • SEND|RECV für OR-Suche[/]")
+
+    def _filter_log_lines(self, pattern: str) -> list:
+        """Filtert Log-Zeilen nach Pattern.
+
+        Unterstützte Formate:
+        - "": Alle Zeilen
+        - "text": Case-insensitive Textsuche
+        - "/regex/": Regex-Suche
+        - "/regex/i": Regex case-insensitive (default)
+        - "!text": Negation (alles OHNE text)
+        - "term1|term2": OR-Suche
+        - "!SEND_FAST|DEBUG": Negation mit OR
+        """
+        if not pattern:
+            return list(self._all_log_lines)
+
+        # Negation?
+        negate = False
+        if pattern.startswith("!"):
+            negate = True
+            pattern = pattern[1:]
+
+        # Regex-Modus?
+        if pattern.startswith("/") and "/" in pattern[1:]:
+            # Finde das schließende /
+            end_idx = pattern.rindex("/")
+            if end_idx > 0:
+                regex_str = pattern[1:end_idx]
+                flags_str = pattern[end_idx+1:]
+
+                flags = re.IGNORECASE  # Default
+                if 's' in flags_str:
+                    flags |= re.DOTALL
+                if 'm' in flags_str:
+                    flags |= re.MULTILINE
+                # Explizit case-sensitive mit 'c' flag
+                if 'c' in flags_str:
+                    flags &= ~re.IGNORECASE
+
+                try:
+                    regex = re.compile(regex_str, flags)
+                except re.error as e:
+                    # Bei Regex-Fehler: Fehlermeldung als einzige Zeile
+                    return [f"[REGEX-FEHLER: {e}]\n"]
+
+                if negate:
+                    return [l for l in self._all_log_lines if not regex.search(l)]
+                else:
+                    return [l for l in self._all_log_lines if regex.search(l)]
+
+        # OR-Suche mit |
+        if "|" in pattern:
+            terms = [t.strip().lower() for t in pattern.split("|") if t.strip()]
+            if negate:
+                return [
+                    l for l in self._all_log_lines
+                    if not any(t in l.lower() for t in terms)
+                ]
+            else:
+                return [
+                    l for l in self._all_log_lines
+                    if any(t in l.lower() for t in terms)
+                ]
+
+        # Einfache Textsuche
+        pattern_lower = pattern.lower()
+        if negate:
+            return [l for l in self._all_log_lines if pattern_lower not in l.lower()]
+        else:
+            return [l for l in self._all_log_lines if pattern_lower in l.lower()]
+
+    def _style_log_line(self, line: str) -> str:
+        """Gibt eine farbcodierte Version der Log-Zeile zurück."""
+        if not line or line.startswith("═══"):
+            return f"[bold bright_white]{line}[/]"
+
+        # Nach Log-Level/Typ farbcodieren
+        if "| ERROR" in line or "ERROR" in line.upper()[:50]:
+            return f"[bold red]{line}[/]"
+        elif "| WARNING" in line or "| TIMEOUT" in line:
+            return f"[yellow]{line}[/]"
+        elif "SEND_FAST" in line:
+            return f"[dim bright_black]{line}[/]"
+        elif "| SEND" in line:
+            return f"[bright_blue]{line}[/]"
+        elif "| RECV" in line:
+            return f"[bright_green]{line}[/]"
+        elif "NOTE" in line:
+            return f"[bold bright_cyan]{line}[/]"
+        elif "SESSION START" in line or "CONNECTED" in line:
+            return f"[bold bright_magenta]{line}[/]"
+        elif "DISCONNECTED" in line:
+            return f"[bold yellow]{line}[/]"
+        elif line.startswith("─") or line.startswith("═"):
+            return f"[dim]{line}[/]"
+        else:
+            return line
 
     def _log_to_viewer(self, msg: str):
-        """Schreibt in den Log-Viewer."""
+        """Schreibt eine einzelne Nachricht in den Log-Viewer."""
         try:
             viewer = self.query_one("#log-viewer", RichLog)
             viewer.write(msg)
