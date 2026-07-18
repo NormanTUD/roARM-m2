@@ -19,6 +19,7 @@ Auto-Connect wenn USB-Port gefunden.
 #     "scipy",
 #     "textual>=0.79.0",
 #     "matplotlib",
+#     "rich",
 #     "rich_pixels",
 #     "Pillow",
 #     "pyyaml",
@@ -34,8 +35,34 @@ import re
 from bootstrap import ensure_uv
 ensure_uv()
 
-import json
-import time
+import rich
+from rich.console import Console
+
+ci_env: bool = os.getenv("CI", "false").lower() == "true"
+
+terminal_width = 150
+
+try:
+    terminal_width = os.get_terminal_size().columns
+except OSError:
+    pass
+
+console = Console(
+    force_interactive=True,
+    soft_wrap=True,
+    color_system="256",
+    force_terminal=not ci_env,
+    width=max(200, terminal_width)
+)
+
+def spinner(text: str):
+    return console.status(f"[bold green]{text}", speed=0.2, refresh_per_second=6)
+
+with spinner("Importing json..."):
+    import json
+with spinner("Importing time..."):
+    import time
+
 import math
 import threading
 import asyncio
