@@ -97,6 +97,16 @@ with spinner("Importing textual..."):
     from textual.widgets import Static
     from textual.strip import Strip
 
+parser = argparse.ArgumentParser(description="Robot Control Script")
+
+parser.add_argument(
+    '--enable-gravity-comp',
+    action='store_true',
+    help="Enable gravity compensation (default: False)"
+)
+
+args = parser.parse_args()
+
 with spinner("Importing robot..."):
     from robot import (
         RoArmConnection, find_arm_port, rad_to_deg, deg_to_rad,
@@ -1313,7 +1323,7 @@ class RoArmDashboard(App):
         self._recording_elapsed_timer: Optional[Timer] = None
 
         self._led_on = False
-        self._gravity_comp_enabled = True
+        self._gravity_comp_enabled = args.gravity_comp
         self._speed_factor = 1.0
         self._loop_enabled = False
         self._loop_pause_s = 0.0
