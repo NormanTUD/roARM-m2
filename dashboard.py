@@ -944,6 +944,14 @@ RichLog {
     margin: 0 0 1 0;
 }
 
+#roarm-file-viewer {
+    width: 1fr;
+    height: 1fr;
+    border: solid $accent;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
 #log-viewer {
     height: 1fr;
     border: solid $primary;
@@ -1289,6 +1297,108 @@ class TimelineWidget(Static):
 # ============================================================
 # MAIN APP
 # ============================================================
+
+class RoarmFileViewer(Static):
+    """Zeigt die .roarm-Datei live an mit Cursor auf der aktuellen Zeile."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._lines: list[str] = []
+        self._current_line_idx: int = -1
+        self._context_lines: int = 8  # Zeilen über/unter der aktuellen Zeile
+
+    def load_file(self, filepath: str):
+        """Lädt die .roarm-Datei."""
+        with open(filepath, 'r') as f:
+            self._lines = f.readlines()
+        self._current_line_idx = -1
+        self._refresh_display()
+
+    def set_current_time(self, elapsed: float):
+        """Findet die Zeile die dem aktuellen Zeitpunkt entspricht und zeigt sie an."""
+        best_idx = -1
+        for i, line in enumerate(self._lines):
+            stripped = line.strip()
+            if stripped.startswith("MOVE") or stripped.startswith("GRIPPER") or stripped.startswith("LED"):
+                # t= Wert extrahieren
+                t_val = self._extract_time(stripped)
+                if t_val is not None and t_val <= elapsed:
+                    best_idx = i
+                elif t_val is not None and t_val > elapsed:
+                    break  # Zeilen sind chronologisch sortiert
+
+        if best_idx != self._current_line_idx:
+            self._current_line_idx = best_idx
+            self._refresh_display()
+
+    def _extract_time(self, line: str) -> Optional[float]:
+        """Extrahiert den t=... Wert aus einer Zeile."""
+        for part in line.split():
+            if part.startswith("t="):
+                try:
+                    return float(part.split("=")[1])
+                except ValueError:
+                    return None
+        return None
+
+    def _refresh_display(self):
+        """Rendert die Datei mit Kontext um die aktuelle Zeile."""
+        if not self._lines:
+            self.update("[dim]Keine Datei geladen[/]")
+            return
+
+        idx = self._current_line_idx
+        total = len(self._lines)
+
+        # Fenster berechnen: context_lines über und unter der aktuellen Zeile
+        start = max(0, idx - self._context_lines)
+        end = min(total, idx + self._context_lines + 1)
+
+        # Falls noch kein aktiver Index, zeige den Anfang
+        if idx < 0:
+            start = 0
+            end = min(total, self._context_lines * 2)
+
+        output_parts = []
+        output_parts.append(
+            f"[bold cyan]📄 .roarm Datei[/] "
+            f"[dim]Zeile {idx + 1 if idx >= 0 else '-'}/{total}[/]\n"
+        )
+        output_parts.append("─" * 50 + "\n")
+
+        for i in range(start, end):
+            line_content = self._lines[i].rstrip()
+            line_num = f"{i + 1:4d}"
+
+            if i == idx:
+                # ▶ Aktuelle Zeile hervorheben
+                output_parts.append(
+                    f"[bold white on dark_green] ▶ {line_num} │ {line_content} [/]\n"
+                )
+            elif i == idx + 1:
+                # Nächste Zeile (kommt als nächstes)
+                output_parts.append(
+                    f"[yellow]   {line_num} │ {line_content}[/]\n"
+                )
+            elif self._lines[i].strip().startswith("#"):
+                # Kommentare/Header
+                output_parts.append(
+                    f"[dim]   {line_num} │ {line_content}[/]\n"
+                )
+            else:
+                # Bereits abgespielte oder kommende Zeilen
+                if i < idx:
+                    output_parts.append(
+                        f"[dim green]   {line_num} │ ✓ {line_content}[/]\n"
+                    )
+                else:
+                    output_parts.append(
+                        f"[dim]   {line_num} │   {line_content}[/]\n"
+                    )
+
+        output_parts.append("─" * 50)
+
+        self.update("".join(output_parts))
 
 class RoArmDashboard(App):
     """RoArm-M2-S Unified TUI Dashboard v2."""
@@ -1865,7 +1975,9 @@ class RoArmDashboard(App):
                                 yield Label("📁 Recordings:", classes="joint-label")
                                 yield DataTable(id="recordings-table")
 
-                        yield RichLog(id="play-log", highlight=True, markup=True)
+                        with Horizontal():
+                            yield RichLog(id="play-log", highlight=True, markup=True)
+                            yield RoarmFileViewer(id="roarm-file-viewer")
 
                 # --- TAB 3: CALIBRATE ---
                 with TabPane("🎯 Calibrate [3]", id="calibrate"):
@@ -2873,6 +2985,13 @@ class RoArmDashboard(App):
             return
 
         self._play_data = parse_roarm_file(str(filepath))
+
+        try:
+            viewer = self.query_one("#roarm-file-viewer", RoarmFileViewer)
+            viewer.load_file(str(filepath))
+        except NoMatches:
+            pass
+
         wps = self._play_data["waypoints"]
         if not wps or len(wps) < 4:
             self._log_play("[red]Zu wenige Wegpunkte für Spline![/]")
@@ -3304,6 +3423,12 @@ class RoArmDashboard(App):
             if tabs.active == "play":
                 widget = self.query_one("#play-arm-view", Arm3DWidget)
                 widget.update_pose(pos["b"], pos["s"], pos["e"])
+        except NoMatches:
+            pass
+
+        try:
+            file_viewer = self.query_one("#roarm-file-viewer", RoarmFileViewer)
+            file_viewer.set_current_time(ui_elapsed)
         except NoMatches:
             pass
 
