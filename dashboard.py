@@ -3020,6 +3020,29 @@ class RoArmDashboard(App):
                         self.call_from_thread(
                             self._log_play,
                             f"[bold red]  ↑ E-STOP bei Zeile L{current_wp_idx+1:03d} "
+                            f"(t={waypoints[min(current_wp_idx, len(waypoints)-1)]['t']:.2f}s)[/]"
+                        )
+                        break
+
+                sent, commands_sent, skipped = (
+                    self._send_if_changed(
+                        arm, corrected, last_pos,
+                        commands_sent, skipped,
+                        rate_limiter, is_sim, interval))
+                if sent:
+                    last_pos = corrected.copy()
+                    self._last_play_commanded = corrected.copy()
+
+                if commands_sent % max(1, STREAM_HZ // 5) == 0:
+                    self._update_playback_ui(arm, corrected, elapsed, is_sim)
+
+                sleep_time = interval - (time.time() - loop_start)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        finally:
+            if not is_sim and self._safe_arm:
+                self._safe_arm.end_streaming()
+
 
     def _move_to_start_position(self, arm, first_wp: dict, cal_model, is_sim: bool):
         """Moves arm to the first waypoint and VERIFIES arrival before streaming."""
