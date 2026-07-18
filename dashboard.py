@@ -1412,11 +1412,12 @@ class RoArmDashboard(App):
             self._log_play, f"[bold red]🚨 E-STOP: {reason}[/]"
         )
 
-
     def _teach_read_position(self, arm) -> Optional[dict]:
         """Reads position during teach, using gravity comp if enabled."""
         if self._gravity_comp_enabled and not self._is_sim:
             return self._read_with_gravity_comp(arm)
+        if hasattr(arm, 'read_position_deg_single'):
+            return arm.read_position_deg_single()
         return arm.read_position_deg()
 
 
@@ -2816,18 +2817,16 @@ class RoArmDashboard(App):
             self.call_from_thread(self._update_arm_views, corrected)
         self.call_from_thread(self._update_play_timeline, elapsed)
 
-    def _finalize_playback(self, arm, is_sim: bool, cal_model, duration: float):
-        """Finalizes playback: verify endpoint, log summary, reset UI."""
+    def _finalize_playback(self, arm, is_sim, cal_model, duration):
         self.playing = False
         if not is_sim and self._last_play_commanded:
             final_target = self._last_play_commanded
             err = self._verify_endpoint(arm, final_target)
-        self.call_from_thread(self._stop_activity, "✅ Playback complete")
+        self.call_from_thread(
+            self._stop_activity, "✅ Playback complete")
         self.call_from_thread(self._playback_finished)
         self.call_from_thread(
-            self.set_timer, 3.0, lambda: self._stop_activity()
-        )
-
+            self.set_timer, 3.0, lambda: self._stop_activity())
 
     def _arm_is_estopped(self) -> bool:
         """Checks if the safety layer has triggered an emergency stop."""
@@ -2877,55 +2876,62 @@ class RoArmDashboard(App):
         else:
             self._precision_endpoint_real(arm, final_corrected)
 
-    def _streaming_loop(self, arm, trajectory: 'SmoothTrajectory',
-                        duration: float, cal_model, events: list, is_sim: bool):
-        """Main streaming loop: samples trajectory and sends commands."""
+    def _streaming_loop(self, arm, trajectory, duration,
+                        cal_model, events, is_sim):
+        """Main streaming loop with safety start/end."""
         from safety import RateLimiter
         interval = 1.0 / STREAM_HZ
-        rate_limiter = RateLimiter(max_hz=STREAM_HZ + 10) if not is_sim else None
+        rate_limiter = (
+            RateLimiter(max_hz=STREAM_HZ + 10)
+            if not is_sim else None)
+        # Safety: Streaming-Start
+        if not is_sim and self._safe_arm:
+            self._safe_arm.start_streaming()
         playback_start = time.time()
         last_pos = None
         commands_sent = 0
         skipped = 0
         event_idx = 0
         self._last_play_commanded = None
-
-        while self.playing:
-            loop_start = time.time()
-            elapsed = loop_start - playback_start
-            if elapsed >= duration:
-                break
-            # Events (gripper, LED)
-            event_idx, pause = self._process_pending_events(
-                arm, events, event_idx, elapsed)
-            if pause > 0:
-                playback_start += pause
-                elapsed = time.time() - playback_start
+        try:
+            while self.playing:
+                loop_start = time.time()
+                elapsed = loop_start - playback_start
                 if elapsed >= duration:
                     break
-            # Sample trajectory ONCE
-            target = trajectory.sample(elapsed)
-            corrected = self._apply_calibration_static(cal_model, target)
-            # Safety checks (real arm only)
-            if not is_sim and self._current_monitor:
-                err = self._check_tracking_error(arm, corrected, commands_sent)
-                if not self.playing:
-                    break
-            # Send
-            sent, commands_sent, skipped = self._send_if_changed(
-                arm, corrected, last_pos, commands_sent, skipped,
-                rate_limiter, is_sim, interval
-            )
-            if sent:
-                last_pos = corrected.copy()
-                self._last_play_commanded = corrected.copy()
-            # UI update (every 200ms)
-            if commands_sent % max(1, STREAM_HZ // 5) == 0:
-                self._update_playback_ui(arm, corrected, elapsed, is_sim)
-            # Timing
-            sleep_time = interval - (time.time() - loop_start)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                event_idx, pause = self._process_pending_events(
+                    arm, events, event_idx, elapsed)
+                if pause > 0:
+                    playback_start += pause
+                    elapsed = time.time() - playback_start
+                    if elapsed >= duration:
+                        break
+                target = trajectory.sample(elapsed)
+                corrected = self._apply_calibration_static(
+                    cal_model, target)
+                if not is_sim and self._current_monitor:
+                    self._check_tracking_error(
+                        arm, corrected, commands_sent)
+                    if not self.playing:
+                        break
+                sent, commands_sent, skipped = (
+                    self._send_if_changed(
+                        arm, corrected, last_pos,
+                        commands_sent, skipped,
+                        rate_limiter, is_sim, interval))
+                if sent:
+                    last_pos = corrected.copy()
+                    self._last_play_commanded = corrected.copy()
+                if commands_sent % max(1, STREAM_HZ // 5) == 0:
+                    self._update_playback_ui(
+                        arm, corrected, elapsed, is_sim)
+                sleep_time = interval - (time.time() - loop_start)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        finally:
+            # Safety: Streaming-Ende
+            if not is_sim and self._safe_arm:
+                self._safe_arm.end_streaming()
 
 
     def _move_to_start_position(self, arm, first_wp: dict, cal_model, is_sim: bool):
@@ -2947,7 +2953,6 @@ class RoArmDashboard(App):
         else:
             time.sleep(2.0)
 
-
     @work(thread=True)
     def _run_playback(self, waypoints: list):
         """Full playback with SmoothTrajectory, safety, tracking."""
@@ -2964,24 +2969,40 @@ class RoArmDashboard(App):
         if not is_sim:
             ok, violations = self._validate_trajectory(trajectory)
             if not ok:
-                trajectory = self._attempt_trajectory_repair(trajectory, violations)
+                trajectory = self._attempt_trajectory_repair(
+                    trajectory, violations)
                 if trajectory is None:
                     self.call_from_thread(
-                        self._log_play, "[red]❌ Trajektorie unsicher![/]")
+                        self._log_play,
+                        "[red]Trajektorie unsicher![/]")
                     self.playing = False
                     self.call_from_thread(self._playback_finished)
                     return
-        duration = trajectory.get_duration()
-        self._move_to_start_position(arm, waypoints[0], cal_model, is_sim)
-        self.call_from_thread(
-            self._start_activity, f"Playing ({duration:.1f}s)", "▶️")
-        events = sorted(self._play_data.get("events", []), key=lambda x: x["t"])
-        self._streaming_loop(arm, trajectory, duration, cal_model, events, is_sim)
-        if self.playing:
-            self._do_precision_endpoint(arm, trajectory, duration, cal_model, is_sim)
-        self._finalize_playback(arm, is_sim, cal_model, duration)
-        if self._is_loop_enabled():
-            self._run_loop(waypoints, arm, is_sim)
+        try:
+            duration = trajectory.get_duration()
+            self._move_to_start_position(
+                arm, waypoints[0], cal_model, is_sim)
+            self.call_from_thread(
+                self._start_activity,
+                f"Playing ({duration:.1f}s)", "▶️")
+            events = sorted(
+                self._play_data.get("events", []),
+                key=lambda x: x["t"])
+            self._streaming_loop(
+                arm, trajectory, duration,
+                cal_model, events, is_sim)
+            if self.playing:
+                self._do_precision_endpoint(
+                    arm, trajectory, duration, cal_model, is_sim)
+            self._finalize_playback(arm, is_sim, cal_model, duration)
+            if self._is_loop_enabled():
+                self._run_loop(waypoints, arm, is_sim)
+        except Exception as e:
+            self.playing = False
+            self.call_from_thread(
+                self._log_play,
+                f"[bold red]Playback-Fehler: {e}[/]")
+            self.call_from_thread(self._playback_finished)
 
     def _update_play_timeline(self, elapsed: float):
         """Aktualisiert die Timeline-Position."""
@@ -3022,18 +3043,35 @@ class RoArmDashboard(App):
             if not self._sim_arm.is_moving:
                 break
 
-    def _verify_endpoint(self, arm, final_target: dict) -> Optional[float]:
-        """Reads final position and returns max error in degrees."""
+    def _safe_read_error(self, pos: dict, target: dict) -> Optional[float]:
+        """Returns max error or None if read is implausible."""
+        MAX_PLAUSIBLE = 30.0
+        err = max(
+            abs(pos[j] - target[j])
+            for j in ["b", "s", "e", "h"])
+        if err > MAX_PLAUSIBLE:
+            return None
+        return err
+
+
+    def _verify_endpoint(self, arm, final_target):
+        """Reads final position and returns max error."""
         time.sleep(0.3)
-        pos = arm.read_position_deg()
+        # Flush serial buffer for fresh read
+        if hasattr(arm, 'flush_and_read'):
+            pos = arm.flush_and_read()
+        else:
+            pos = arm.read_position_deg()
         if pos is None:
             return None
-        err = max(abs(pos[j] - final_target[j]) for j in ["b", "s", "e", "h"])
+        err = max(
+            abs(pos[j] - final_target[j])
+            for j in ["b", "s", "e", "h"])
         self.call_from_thread(
             self._log_play,
             f"[dim]  Endposition: Fehler={err:.3f}° "
-            f"(b={pos['b']:.2f} s={pos['s']:.2f} e={pos['e']:.2f})[/]"
-        )
+            f"(b={pos['b']:.2f} s={pos['s']:.2f} "
+            f"e={pos['e']:.2f})[/]")
         return err
 
 
