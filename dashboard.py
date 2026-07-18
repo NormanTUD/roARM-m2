@@ -111,15 +111,19 @@ with spinner("Importing Pillow..."):
     from PIL import Image
 
 with spinner("Importing CalibrationModel..."):
-        from calibrate import (
-            CalibrationModel, POSE_SETS, JOINTS,
-            move_to_safe_up, move_from_safe_up_to_pose, validate_pose,
-            run_manual_verification, integrate_manual_points,
-            CalibrationModel, JOINTS
-        )
+    from calibrate import (
+        CalibrationModel, POSE_SETS, JOINTS,
+        move_to_safe_up, move_from_safe_up_to_pose, validate_pose,
+        run_manual_verification, integrate_manual_points,
+        CalibrationModel, JOINTS
+    )
+
 
 with spinner("Importing CubicSpline..."):
     from scipy.interpolate import CubicSpline
+
+with spinner("Importing safety..."):
+    from safety import SafeArm, SafetyLimits, SafetyWatchdog, CurrentMonitor, RateLimiter, TrajectoryValidator, SafetyLimits, TrajectorySmoother, GracefulStop
 
 parser = argparse.ArgumentParser(description="Robot Control Script")
 
@@ -1090,7 +1094,6 @@ class Arm3DWidget(Static):
         canvas.draw_line(origin[0], origin[1], ax_z[0], ax_z[1], "blue")
 
         # --- Arbeitsraum-Kreis ---
-        from visualize import UPPER_ARM, FOREARM, GRIPPER_LENGTH
         reach = UPPER_ARM + FOREARM + GRIPPER_LENGTH
         prev = None
         for i in range(65):
@@ -1566,7 +1569,7 @@ class RoArmDashboard(App):
 
     def _setup_safety_layer(self, arm: RoArmConnection):
         """Wraps the raw arm connection in safety layers."""
-        from safety import SafeArm, SafetyLimits, SafetyWatchdog, CurrentMonitor, RateLimiter
+
         limits = SafetyLimits(
             max_delta_per_cmd=20.0,
             max_continuous_move_s=90.0,
@@ -1591,14 +1594,14 @@ class RoArmDashboard(App):
 
     def _validate_trajectory(self, trajectory: 'SmoothTrajectory') -> tuple:
         """Validates trajectory for acceleration violations. Returns (ok, violations)."""
-        from safety import TrajectoryValidator, SafetyLimits
+
         validator = TrajectoryValidator(SafetyLimits())
         return validator.validate_full_trajectory(trajectory)
 
     def _attempt_trajectory_repair(self, trajectory: 'SmoothTrajectory',
                                     violations: list) -> Optional['SmoothTrajectory']:
         """Attempts to repair a trajectory by local time-stretching."""
-        from safety import TrajectorySmoother, SafetyLimits, TrajectoryValidator
+
         smoother = TrajectorySmoother(SafetyLimits())
         new_wps, n_fixed, added_time = smoother.smooth_trajectory(trajectory)
         if new_wps is None:
@@ -3768,7 +3771,6 @@ class RoArmDashboard(App):
 
     def _graceful_stop(self, arm_raw, last_commanded: dict):
         """Executes a graceful stop instead of hard torque-off."""
-        from safety import GracefulStop
         if not last_commanded or not arm_raw:
             return
         # SafeArm hat ._arm_raw, RoArmConnection ist direkt nutzbar
