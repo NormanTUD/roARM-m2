@@ -2833,21 +2833,12 @@ class RoArmDashboard(App):
                             for j in ["b", "s", "e", "h"])
             if max_delta < MIN_DELTA_DEG:
                 return False, commands_sent, skipped + 1
-            
-            # GESCHWINDIGKEITSBEGRENZUNG: Wenn Delta zu groß, interpolieren
-            if max_delta > MAX_DEG_PER_TICK:
-                # Clamp: Bewege nur MAX_DEG_PER_TICK in Richtung Ziel
-                scale = MAX_DEG_PER_TICK / max_delta
-                corrected = {
-                    j: last_pos[j] + (corrected[j] - last_pos[j]) * scale
-                    for j in ["b", "s", "e", "h"]
-                }
-                corrected = {j: round(v, 2) for j, v in corrected.items()}
-                max_delta = MAX_DEG_PER_TICK
-            
-            # Dynamische Speed basierend auf Delta
-            spd = min(80, max(30, int(max_delta * 15)))
-            acc = min(50, max(20, int(max_delta * 10)))
+
+            # Dynamische Speed/Acc basierend auf Delta
+            # Kein Clamping mehr! Die Auto-Speed-Reduktion sorgt dafür
+            # dass max_delta nie zu groß wird.
+            spd = min(80, max(30, int(max_delta * 20)))
+            acc = min(50, max(20, int(max_delta * 12)))
         else:
             spd, acc = 50, 30
 
@@ -2934,27 +2925,80 @@ class RoArmDashboard(App):
 
     def _streaming_loop(self, arm, trajectory, duration,
                         cal_model, events, is_sim):
-        """Main streaming loop with safety start/end."""
+        """Main streaming loop with live line display."""
         from safety import RateLimiter
         interval = 1.0 / STREAM_HZ
         rate_limiter = (
             RateLimiter(max_hz=STREAM_HZ + 10)
             if not is_sim else None)
-        # Safety: Streaming-Start
+
         if not is_sim and self._safe_arm:
             self._safe_arm.start_streaming()
+
         playback_start = time.time()
         last_pos = None
         commands_sent = 0
         skipped = 0
         event_idx = 0
         self._last_play_commanded = None
+
+        # Waypoint-Index tracking für Live-Anzeige
+        waypoints = self._play_data["waypoints"]
+        current_wp_idx = 0
+        last_logged_wp_idx = -1
+
         try:
             while self.playing:
                 loop_start = time.time()
                 elapsed = loop_start - playback_start
                 if elapsed >= duration:
                     break
+
+                # ============================================================
+                # LIVE LINE TRACKING: Welcher Waypoint ist gerade aktiv?
+                # ============================================================
+                # Finde den nächsten Waypoint basierend auf elapsed time
+                # (berücksichtigt speed_factor über die trajectory)
+                orig_t = float(trajectory._time_map(min(elapsed, duration)))
+                while (current_wp_idx < len(waypoints) - 1 and
+                       waypoints[current_wp_idx]["t"] < orig_t):
+                    current_wp_idx += 1
+
+                # Logge alle 10 Waypoints oder bei großen Sprüngen
+                if current_wp_idx != last_logged_wp_idx and (
+                    current_wp_idx % 5 == 0 or
+                    current_wp_idx - last_logged_wp_idx > 3
+                ):
+                    wp = waypoints[min(current_wp_idx, len(waypoints)-1)]
+                    line_nr = current_wp_idx + 1  # 1-basiert
+                    # Berechne aktuelle Geschwindigkeit
+                    if current_wp_idx > 0:
+                        prev_wp = waypoints[current_wp_idx - 1]
+                        dt_wp = wp["t"] - prev_wp["t"]
+                        if dt_wp > 0.001:
+                            max_spd = max(
+                                abs(wp[j] - prev_wp[j]) / dt_wp
+                                for j in ["b", "s", "e", "h"]
+                            )
+                        else:
+                            max_spd = 0
+                    else:
+                        max_spd = 0
+
+                    spd_color = "red" if max_spd > 50 else "yellow" if max_spd > 30 else "green"
+                    self.call_from_thread(
+                        self._log_play,
+                        f"[dim]  L{line_nr:03d}[/] "
+                        f"t={wp['t']:.2f}s "
+                        f"b={wp['b']:+6.1f} s={wp['s']:+6.1f} "
+                        f"e={wp['e']:+6.1f} h={wp['h']:+6.1f} "
+                        f"[{spd_color}]{max_spd:.0f}°/s[/]"
+                    )
+                    last_logged_wp_idx = current_wp_idx
+
+                # ============================================================
+                # Events verarbeiten
+                # ============================================================
                 event_idx, pause = self._process_pending_events(
                     arm, events, event_idx, elapsed)
                 if pause > 0:
@@ -2962,33 +3006,20 @@ class RoArmDashboard(App):
                     elapsed = time.time() - playback_start
                     if elapsed >= duration:
                         break
-                target = trajectory.sample(elapsed)
-                corrected = self._apply_calibration_static(
-                    cal_model, target)
-                if not is_sim and self._current_monitor:
-                    self._check_tracking_error(
-                        arm, corrected, commands_sent)
-                    if not self.playing:
-                        break
-                sent, commands_sent, skipped = (
-                    self._send_if_changed(
-                        arm, corrected, last_pos,
-                        commands_sent, skipped,
-                        rate_limiter, is_sim, interval))
-                if sent:
-                    last_pos = corrected.copy()
-                    self._last_play_commanded = corrected.copy()
-                if commands_sent % max(1, STREAM_HZ // 5) == 0:
-                    self._update_playback_ui(
-                        arm, corrected, elapsed, is_sim)
-                sleep_time = interval - (time.time() - loop_start)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-        finally:
-            # Safety: Streaming-Ende
-            if not is_sim and self._safe_arm:
-                self._safe_arm.end_streaming()
 
+                # ============================================================
+                # Trajectory samplen und senden
+                # ============================================================
+                target = trajectory.sample(elapsed)
+                corrected = self._apply_calibration_static(cal_model, target)
+
+                if not is_sim and self._current_monitor:
+                    self._check_tracking_error(arm, corrected, commands_sent)
+                    if not self.playing:
+                        # Bei E-STOP: Zeige welche Zeile schuld war
+                        self.call_from_thread(
+                            self._log_play,
+                            f"[bold red]  ↑ E-STOP bei Zeile L{current_wp_idx+1:03d} "
 
     def _move_to_start_position(self, arm, first_wp: dict, cal_model, is_sim: bool):
         """Moves arm to the first waypoint and VERIFIES arrival before streaming."""
@@ -3060,50 +3091,80 @@ class RoArmDashboard(App):
         is_sim = self._is_sim
         speed = self._get_play_speed()
         cal_model = self._load_calibration_model(is_sim)
+
+        # ============================================================
+        # AUTO-SPEED: Analysiere Recording und reduziere Speed wenn nötig
+        # ============================================================
+        SERVO_MAX_SPEED = 50.0  # °/s - konservativ (real ~60, aber Sicherheit)
+
+        max_speed_in_recording = 0.0
+        worst_line_idx = 0
+        worst_joint = ""
+        for i in range(1, len(waypoints)):
+            dt = waypoints[i]["t"] - waypoints[i-1]["t"]
+            if dt > 0.001:
+                for j in ["b", "s", "e", "h"]:
+                    spd_deg_s = abs(waypoints[i][j] - waypoints[i-1][j]) / dt
+                    if spd_deg_s > max_speed_in_recording:
+                        max_speed_in_recording = spd_deg_s
+                        worst_line_idx = i
+                        worst_joint = j
+
+        self.call_from_thread(
+            self._log_play,
+            f"[dim]  📊 Max Speed im Recording: {max_speed_in_recording:.1f}°/s "
+            f"(Zeile {worst_line_idx+1}, Joint {worst_joint.upper()}, "
+            f"t={waypoints[worst_line_idx]['t']:.2f}s)[/]"
+        )
+
+        if max_speed_in_recording > SERVO_MAX_SPEED:
+            auto_speed = SERVO_MAX_SPEED / max_speed_in_recording
+            # Nur reduzieren, nie erhöhen über User-Wunsch
+            if auto_speed < speed:
+                old_speed = speed
+                speed = auto_speed
+                self.call_from_thread(
+                    self._log_play,
+                    f"[yellow]⚠ Speed auto-reduziert: {old_speed:.2f}x → {speed:.2f}x "
+                    f"(Recording: {max_speed_in_recording:.0f}°/s > "
+                    f"Servo-Max: {SERVO_MAX_SPEED}°/s)[/]"
+                )
+
+        # ============================================================
+        # TRAJECTORY ERSTELLEN (mit korrigiertem Speed)
+        # ============================================================
         trajectory = SmoothTrajectory(waypoints, speed)
+
         if not is_sim:
             ok, violations = self._validate_trajectory(trajectory)
             if not ok:
-                trajectory = self._attempt_trajectory_repair(
-                    trajectory, violations)
+                trajectory = self._attempt_trajectory_repair(trajectory, violations)
                 if trajectory is None:
                     self.call_from_thread(
-                        self._log_play,
-                        "[red]Trajektorie unsicher![/]")
+                        self._log_play, "[red]Trajektorie unsicher![/]")
                     self.playing = False
                     self.call_from_thread(self._playback_finished)
                     return
+
         try:
             duration = trajectory.get_duration()
-            self._move_to_start_position(
-                arm, waypoints[0], cal_model, is_sim)
+            self.call_from_thread(
+                self._log_play,
+                f"[green]▶ Playback: {len(waypoints)} WPs, "
+                f"{duration:.1f}s (speed={speed:.2f}x)[/]"
+            )
+
+            self._move_to_start_position(arm, waypoints[0], cal_model, is_sim)
+            if not self.playing:
+                self.call_from_thread(self._playback_finished)
+                return
+
             self.call_from_thread(
                 self._start_activity,
                 f"Playing ({duration:.1f}s)", "▶️")
             events = sorted(
                 self._play_data.get("events", []),
                 key=lambda x: x["t"])
-
-            max_speed_in_recording = 0.0
-            for i in range(1, len(waypoints)):
-                dt = waypoints[i]["t"] - waypoints[i-1]["t"]
-                if dt > 0.001:
-                    for j in ["b", "s", "e", "h"]:
-                        speed = abs(waypoints[i][j] - waypoints[i-1][j]) / dt
-                        max_speed_in_recording = max(max_speed_in_recording, speed)
-
-            SERVO_MAX_SPEED = 60.0  # °/s - konservatives Servo-Limit
-            if max_speed_in_recording > SERVO_MAX_SPEED:
-                auto_speed = SERVO_MAX_SPEED / max_speed_in_recording
-                if auto_speed < speed:
-                    speed = auto_speed
-                    self.call_from_thread(
-                        self._log_play,
-                        f"[yellow]⚠ Speed auto-reduziert auf {speed:.2f}x "
-                        f"(Recording enthält {max_speed_in_recording:.0f}°/s, "
-                        f"Servo-Max: {SERVO_MAX_SPEED}°/s)[/]"
-                    )
-                    trajectory = SmoothTrajectory(waypoints, speed)
 
             self._streaming_loop(
                 arm, trajectory, duration,
@@ -3120,6 +3181,7 @@ class RoArmDashboard(App):
                 self._log_play,
                 f"[bold red]Playback-Fehler: {e}[/]")
             self.call_from_thread(self._playback_finished)
+
 
     def _update_play_timeline(self, elapsed: float):
         """Aktualisiert die Timeline-Position."""
