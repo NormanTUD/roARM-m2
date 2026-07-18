@@ -77,7 +77,7 @@ def setup_command_logger(log_dir: str = "logs") -> logging.Logger:
     logger.info(f"Python: {sys.version}")
     logger.info(f"Log-Datei: {log_file}")
 
-    print(f"  📝 Command-Log: {log_file}")
+    logger.ingo(f"📝 Command-Log: {log_file}")
 
     return logger
 
