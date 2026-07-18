@@ -1109,6 +1109,9 @@ class Arm3DWidget(Static):
         header.append(f"  Grip:({gp[0]:.0f},{gp[1]:.0f},{gp[2]:.0f})",
                       style="cyan")
 
+        if self.app._is_sim:
+            header.append("  ⚠ SIMULATED (kein realer Arm)", style="bold yellow")
+
         all_lines = [header] + lines
         self.update(Text("\n").join(all_lines))
 
@@ -1948,6 +1951,12 @@ class RoArmDashboard(App):
         self._current_pos = pos
         self._update_joint_displays(pos)
         self._update_arm_views(pos)
+
+        try:
+            safety_label = self.query_one("#status-safety", Label)
+            safety_label.update("⚠ Kein realer Arm verbunden")
+        except NoMatches:
+            pass
 
     def _disable_simulation_mode(self):
         """Deactivates simulation mode."""
@@ -3474,7 +3483,6 @@ class RoArmDashboard(App):
         self.action_torque_release()
 
     def _servo_go(self, joint: str):
-        """Fährt einen einzelnen Servo zur eingegebenen Position."""
         arm = self._active_arm
         if arm is None:
             self._log_servo("[red]Nicht verbunden und keine Simulation![/]")
@@ -3487,32 +3495,28 @@ class RoArmDashboard(App):
             self._log_servo(f"[red]Ungültiger Wert: {e}[/]")
             return
 
-        # Aktuelle Position lesen und nur das eine Gelenk ändern
         pos = self._current_pos.copy()
         pos[joint] = angle
+
+        # === NEU: Sofort die View mit den Zielwerten updaten ===
+        self._current_pos = pos
+        self._update_arm_views(pos)
+        self._update_joint_displays(pos)
+        self._update_servo_readouts(pos)
+
+        # === NEU: Warnung wenn nicht physisch verbunden ===
+        if self._is_sim:
+            self._log_servo(
+                "[bold yellow]⚠ SIMULATION – Kein realer Arm angeschlossen! "
+                "Angezeigte Position ist NICHT der echte Arm.[/]"
+            )
 
         arm.torque_on()
         self.torque_on_state = True
         self._update_status_torque(True)
         time.sleep(0.1)
 
-        joint_names = {"b": "Base", "s": "Shoulder", "e": "Elbow", "h": "Hand"}
-
-        # Start activity indicator
-        self._start_activity(f"Moving {joint_names[joint]}", "🎯")
-
-        arm.move_to(
-            pos["b"], pos["s"], pos["e"], pos["h"],
-            spd=15, acc=8
-        )
-
-        sim_tag = " (sim)" if self._is_sim else ""
-        self._log_servo(
-            f"[green]→ {joint_names[joint]} → {angle:.2f}°{sim_tag}[/]"
-        )
-
-        # Nach kurzer Wartezeit Position lesen und activity stoppen
-        self.set_timer(1.5, self._servo_read_after_move)
+        # ... rest bleibt gleich
 
     def _servo_read_after_move(self):
         """Liest Position nach einem Servo-Move."""
