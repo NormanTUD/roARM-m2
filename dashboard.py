@@ -409,72 +409,87 @@ class BrailleCanvas:
 # ============================================================
 
 def parse_roarm_file(filepath: str) -> dict:
-    """Parst eine .roarm Recording-Datei."""
+    """Parses a .roarm recording file including LED events."""
     waypoints = []
-    gripper_cmds = []
-    config = {"hz": 20, "threshold": 0.3}
+    events = []
+    config = {"hz": 20, "threshold": 0.3, "gravity_comp": 1}
     start_pos = None
-    offset = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
 
     with open(filepath, 'r') as f:
         for line in f:
             line = line.strip()
-            if not line:
+            if not line or line.startswith("#OFFSET"):
                 continue
             if line.startswith("#CONFIG"):
-                parts = line.split(" ", 1)
-                if len(parts) == 2:
-                    key, val = parts[1].split("=", 1)
-                    config[key.strip()] = float(val.strip())
+                _parse_config_line(line, config)
+            elif line.startswith("#START_POS"):
+                start_pos = _parse_start_pos_line(line)
+            elif line.startswith("#"):
                 continue
-            if line.startswith("#START_POS"):
-                parts = line.split()[1:]
-                vals = {}
-                for p in parts:
-                    k, v = p.split("=")
-                    vals[k] = float(v)
-                start_pos = vals
-                continue
-            if line.startswith("#OFFSET"):
-                parts = line.split()[1:]
-                for p in parts:
-                    k, v = p.split("=")
-                    offset[k.strip()] = float(v.strip())
-                continue
-            if line.startswith("#"):
-                continue
-            if line.startswith("MOVE"):
-                parts = line.split()
-                vals = {}
-                for p in parts[1:]:
-                    k, v = p.split("=")
-                    vals[k] = float(v)
-                waypoints.append({
-                    "t": vals.get("t", 0.0),
-                    "b": vals.get("b", 0.0),
-                    "s": vals.get("s", 0.0),
-                    "e": vals.get("e", 90.0),
-                    "h": vals.get("h", 180.0),
-                })
+            elif line.startswith("MOVE"):
+                waypoints.append(_parse_move_line(line))
             elif line.startswith("GRIPPER"):
-                parts = line.split()
-                cmd = parts[1] if len(parts) > 1 else "OPEN"
-                t = 0.0
-                for p in parts[1:]:
-                    if p.startswith("t="):
-                        t = float(p.split("=")[1])
-                gripper_cmds.append({"t": t, "cmd": cmd})
+                events.append(_parse_gripper_line(line))
+            elif line.startswith("LED"):
+                events.append(_parse_led_line(line))
 
     if start_pos is None:
         start_pos = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
-
     return {
         "waypoints": waypoints,
-        "gripper_cmds": gripper_cmds,
+        "events": events,
         "config": config,
         "start_pos": start_pos,
-        "offset": offset,
     }
+
+def _parse_config_line(line: str, config: dict):
+    """Parses a #CONFIG line into the config dict."""
+    parts = line.split(" ", 1)
+    if len(parts) == 2:
+        key, val = parts[1].split("=", 1)
+        config[key.strip()] = float(val.strip())
+
+def _parse_start_pos_line(line: str) -> dict:
+    """Parses a #START_POS line into a position dict."""
+    vals = {}
+    for p in line.split()[1:]:
+        k, v = p.split("=")
+        vals[k] = float(v)
+    return vals
+
+def _parse_move_line(line: str) -> dict:
+    """Parses a MOVE line into a waypoint dict."""
+    vals = {}
+    for p in line.split()[1:]:
+        k, v = p.split("=")
+        vals[k] = float(v)
+    return {
+        "t": vals.get("t", 0.0), "b": vals.get("b", 0.0),
+        "s": vals.get("s", 0.0), "e": vals.get("e", 90.0),
+        "h": vals.get("h", 180.0),
+    }
+
+def _parse_gripper_line(line: str) -> dict:
+    """Parses a GRIPPER line into an event dict."""
+    parts = line.split()
+    cmd = parts[1] if len(parts) > 1 else "OPEN"
+    t = _extract_time_from_parts(parts)
+    return {"t": t, "cmd": cmd}
+
+
+def _parse_led_line(line: str) -> dict:
+    """Parses a LED line into an event dict."""
+    parts = line.split()
+    cmd = "LED_ON" if (len(parts) > 1 and parts[1] == "ON") else "LED_OFF"
+    t = _extract_time_from_parts(parts)
+    return {"t": t, "cmd": cmd}
+
+def _extract_time_from_parts(parts: list) -> float:
+    """Extracts t=... value from a list of key=value parts."""
+    for p in parts:
+        if p.startswith("t="):
+            return float(p.split("=")[1])
+    return 0.0
 
 # ============================================================
 # SPARKLINE HISTORY TRACKER
@@ -1102,6 +1117,8 @@ class RoArmDashboard(App):
     playing = reactive(False)
     torque_on_state = reactive(True)
 
+    GRAVITY_COMP_SETTLE_MS = 30
+
     def __init__(self):
         super().__init__()
         self._arm: Optional[RoArmConnection] = None
@@ -1131,6 +1148,48 @@ class RoArmDashboard(App):
 
         # Recording elapsed timer
         self._recording_elapsed_timer: Optional[Timer] = None
+
+        self._teach_waypoints = []
+        self._teach_start_time = 0.0
+        self._teach_timer: Optional[Timer] = None
+        self._gripper_open = True
+        self._led_on = False
+        self._gravity_comp_enabled = True
+        self._speed_factor = 1.0
+        self._loop_enabled = False
+        self._loop_pause_s = 0.0
+
+    def action_led_toggle(self) -> None:
+        """Toggles the LED on/off and records the event."""
+        arm = self._active_arm
+        if arm is None:
+            return
+        self._led_on = not getattr(self, '_led_on', False)
+        brightness = 255 if self._led_on else 0
+        if hasattr(arm, 'send_cmd'):
+            arm.send_cmd({"T": 114, "led": brightness})
+        self._log_teach(f"[bold]💡 LED {'AN' if self._led_on else 'AUS'}[/]")
+        if self.recording:
+            elapsed = time.time() - self._teach_start_time
+            cmd = "LED_ON" if self._led_on else "LED_OFF"
+            self._teach_waypoints.append({"t": round(elapsed, 4), "cmd": cmd})
+
+
+    def _teach_read_position(self, arm) -> Optional[dict]:
+        """Reads position during teach, using gravity comp if enabled."""
+        if self._gravity_comp_enabled and not self._is_sim:
+            return self._read_with_gravity_comp(arm)
+        return arm.read_position_deg()
+
+
+    def _read_with_gravity_comp(self, arm) -> Optional[dict]:
+        """Reads position with brief torque pulse to counter gravity drift."""
+        arm.torque_on_fast()
+        time.sleep(GRAVITY_COMP_SETTLE_MS / 1000.0)
+        pos = arm.read_position_deg()
+        arm.torque_off_fast()
+        return pos
+
 
     def action_emergency_stop(self):
         """Immediate halt: stop all motion, torque off, cancel all workers."""
@@ -2200,22 +2259,33 @@ class RoArmDashboard(App):
 
         self.remove_class("recording-active")
 
-    def _save_recording(self) -> Optional[str]:
-        move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
-        if not move_wps:
-            return None
+    def _format_waypoint_line(self, wp: dict) -> str:
+        """Formats a single waypoint or command as a .roarm file line."""
+        if "cmd" not in wp:
+            return (f"MOVE b={wp['b']:.2f} s={wp['s']:.2f} "
+                    f"e={wp['e']:.2f} h={wp['h']:.2f} t={wp['t']:.4f}")
+        cmd = wp["cmd"]
+        if cmd == "GRIPPER_CLOSE":
+            return f"GRIPPER CLOSE t={wp['t']:.4f}"
+        elif cmd == "GRIPPER_OPEN":
+            return f"GRIPPER OPEN t={wp['t']:.4f}"
+        elif cmd == "LED_ON":
+            return f"LED ON t={wp['t']:.4f}"
+        elif cmd == "LED_OFF":
+            return f"LED OFF t={wp['t']:.4f}"
+        return ""
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = RECORDINGS_DIR / f"recording_{ts}.roarm"
-
-        lines = [
-            f"# RoArm-M2-S Recording (Dashboard v2)",
+    def _build_recording_header(self, move_wps: list) -> list:
+        """Builds the header lines for a .roarm recording file."""
+        return [
+            f"# RoArm-M2-S Recording (Dashboard v3)",
             f"# Datum: {datetime.now().isoformat()}",
             f"# Wegpunkte: {len(move_wps)}",
             f"# Dauer: {move_wps[-1]['t']:.2f}s",
             f"#",
             f"#CONFIG hz={RECORD_HZ}",
             f"#CONFIG threshold={MOVE_THRESHOLD_DEG}",
+            f"#CONFIG gravity_comp={'1' if self._gravity_comp_enabled else '0'}",
             f"#START_POS b={START_POSITION_DEG['b']:.2f} "
             f"s={START_POSITION_DEG['s']:.2f} "
             f"e={START_POSITION_DEG['e']:.2f} "
@@ -2223,21 +2293,21 @@ class RoArmDashboard(App):
             "",
         ]
 
-        for wp in self._teach_waypoints:
-            if "cmd" in wp:
-                if wp["cmd"] == "GRIPPER_CLOSE":
-                    lines.append(f"GRIPPER CLOSE t={wp['t']:.4f}")
-                elif wp["cmd"] == "GRIPPER_OPEN":
-                    lines.append(f"GRIPPER OPEN t={wp['t']:.4f}")
-            else:
-                lines.append(
-                    f"MOVE b={wp['b']:.2f} s={wp['s']:.2f} "
-                    f"e={wp['e']:.2f} h={wp['h']:.2f} t={wp['t']:.4f}"
-                )
 
+    def _save_recording(self) -> Optional[str]:
+        """Saves the current recording to a .roarm file."""
+        move_wps = [wp for wp in self._teach_waypoints if "cmd" not in wp]
+        if not move_wps:
+            return None
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = RECORDINGS_DIR / f"recording_{ts}.roarm"
+        lines = self._build_recording_header(move_wps)
+        for wp in self._teach_waypoints:
+            line = self._format_waypoint_line(wp)
+            if line:
+                lines.append(line)
         with open(filename, 'w') as f:
             f.write("\n".join(lines) + "\n")
-
         return str(filename)
 
     @work(thread=True)
