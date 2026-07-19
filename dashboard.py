@@ -1226,26 +1226,22 @@ class JointSparklineWidget(Static):
         self._refresh()
 
     def _refresh(self):
-        color = self.JOINT_COLORS.get(self.joint, "white")
+        color = "#00ff41"  # Einheitlich grün
         name = self.JOINT_NAMES.get(self.joint, self.joint)
-
         sparkline = self._make_sparkline()
 
-        # Safety-Farbe
-        limits = {"b": 135, "s": 90, "e": 180, "h": 360}
-        limit = limits.get(self.joint, 180)
-        pct = abs(self._value) / limit
-        if pct > 0.9:
-            safety_color = "red"
-        elif pct > 0.7:
-            safety_color = "yellow"
-        else:
-            safety_color = "green"
-
+        # Hex-Adresse als Prefix (wie ein Memory-Dump)
+        addr = f"0x{id(self) & 0xFFFF:04X}"
+        
+        # Wert als Hex UND Dezimal
+        raw_val = int((self._value + 180) / 360 * 4095)  # Simuliert 12-bit ADC
+        
         text = (
-            f"[{color}]{name}[/] "
-            f"[bold {safety_color}]{self._value:+7.2f}°[/] "
-            f"[dim]{sparkline}[/]"
+            f"[dim green]{addr}[/] "
+            f"[bold #00ff41]{name}[/] "
+            f"[bold white]{self._value:+7.2f}°[/] "
+            f"[dim green]0x{raw_val:03X}[/] "
+            f"[#00aa00]{sparkline}[/]"
         )
         self.update(text)
 
