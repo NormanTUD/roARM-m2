@@ -21,6 +21,7 @@ Auto-Connect wenn USB-Port gefunden.
 #     "rich",
 #     "Pillow",
 #     "pyyaml",
+#     "psutil",
 # ]
 # ///
 
@@ -29,6 +30,7 @@ os.environ["TEXTUAL_RUNNING"] = "1"
 
 import sys
 import re
+import psutil
 
 from bootstrap import ensure_uv
 ensure_uv()
@@ -1501,7 +1503,7 @@ class RoArmDashboard(App):
     """RoArm-M2-S Unified TUI Dashboard v2."""
 
     TITLE = "RoArm-M2-S Dashboard"
-    SUB_TITLE = "Teach · Play · Calibrate · Servo · Logs"
+    SUB_TITLE = ""
     CSS = CSS
 
     BINDINGS = [
@@ -2256,6 +2258,27 @@ class RoArmDashboard(App):
 
         # Periodischer Position-Poll (wenn verbunden oder simuliert)
         self.set_interval(0.5, self._periodic_position_poll)
+        self._header_timer = self.set_interval(1.0, self._update_header)
+
+    def _update_header(self):
+        """Updates header with real system stats."""
+        import psutil
+        cpu = psutil.cpu_percent()
+        mem = psutil.virtual_memory().percent
+
+        port_info = "DISCONNECTED"
+        if self._arm and hasattr(self._arm, '_ser'):
+            port_info = f"{self._arm._ser.port}@{BAUDRATE}"
+        elif self._simulation_mode:
+            port_info = "SIM"
+
+        uptime = time.time() - getattr(self, '_start_time', time.time())
+
+        self.sub_title = (
+            f"PID:{os.getpid()} | {port_info} | "
+            f"CPU:{cpu:.0f}% MEM:{mem:.0f}% | "
+            f"UP:{uptime:.0f}s | HZ:{STREAM_HZ}"
+        )
 
     def _enable_simulation_mode(self):
         """Activates simulation mode with a virtual arm."""
