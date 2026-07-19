@@ -777,7 +777,8 @@ class ActivityIndicator:
 
 CSS = """
 Screen {
-    background: $surface;
+    background: black;
+    color: #00ff00;
 }
 
 #main-container {
@@ -812,9 +813,22 @@ TabPane {
     min-height: 20;
     padding: 0 1;
     overflow: hidden;
+    border: solid #00ff00;
+    background: black;
+}
+
+Header {
+    background: #003300;
+    color: #00ff00;
+}
+
+Footer {
+    background: #001a00;
+    color: #00aa00;
 }
 
 .status-bar {
+    background: #001100;
     dock: bottom;
     height: 3;
     background: $panel;
