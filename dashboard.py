@@ -1130,14 +1130,27 @@ class Arm3DWidget(Static):
                 canvas.draw_line(prev[0], prev[1], pt[0], pt[1], "cyan")
             prev = pt
 
-        # --- Trail ---
+        # In Arm3DWidget._refresh_display(), Trail-Sektion:
         if self._trail and len(self._trail) > 1:
             for i in range(1, len(self._trail)):
                 p1 = self._project_3d(*self._trail[i-1], pw, ph)
                 p2 = self._project_3d(*self._trail[i], pw, ph)
-                # Fade: ältere Punkte dunkler
-                alpha_color = "bright_red" if i > len(self._trail) * 0.7 else "red"
-                canvas.draw_line(p1[0], p1[1], p2[0], p2[1], alpha_color)
+                
+                # Geschwindigkeit = Distanz zwischen aufeinanderfolgenden Punkten
+                dist = np.linalg.norm(self._trail[i] - self._trail[i-1])
+                
+                # Farb-Mapping: langsam=cyan, mittel=grün, schnell=gelb, zu schnell=rot
+                if dist < 2.0:
+                    color = "cyan"
+                elif dist < 5.0:
+                    color = "green"
+                elif dist < 10.0:
+                    color = "yellow"
+                else:
+                    color = "bright_red"  # Nah am Servo-Limit
+                
+                canvas.draw_line(p1[0], p1[1], p2[0], p2[1], color)
+
 
         # --- Target ---
         if self._target:
