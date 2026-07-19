@@ -2273,19 +2273,56 @@ class RoArmDashboard(App):
         self.set_interval(0.5, self._periodic_position_poll)
         self._header_timer = self.set_interval(1.0, self._update_header)
 
+    def _measure_serial_latency(self) -> Optional[float]:
+        """Misst die tatsächliche Roundtrip-Zeit zum Servo-Controller."""
+        if not self._arm or self._is_sim:
+            return None
+        try:
+            start = time.perf_counter()
+            # T:105 = Read Position (leichtester Command)
+            pos = self._arm.read_position_deg()
+            if pos is None:
+                return None
+            latency_ms = (time.perf_counter() - start) * 1000
+            return latency_ms
+        except Exception:
+            return None
+
     def _update_header(self):
-        """Updates header with real system stats."""
-        import psutil
+        """Updates header with real system stats including serial latency."""
         cpu = psutil.cpu_percent()
         mem = psutil.virtual_memory().percent
-
+        
+        # Serial-Latenz nur alle 5s messen (blockiert kurz)
+        latency_str = ""
+        if hasattr(self, '_last_latency_check'):
+            if time.time() - self._last_latency_check > 5.0:
+                lat = self._measure_serial_latency()
+                if lat is not None:
+                    self._cached_latency = lat
+                self._last_latency_check = time.time()
+        else:
+            self._last_latency_check = time.time()
+            self._cached_latency = None
+        
+        if hasattr(self, '_cached_latency') and self._cached_latency:
+            lat = self._cached_latency
+            # Farb-Coding: <10ms=gut, 10-30ms=ok, >30ms=problem
+            if lat < 10:
+                latency_str = f"LAT:{lat:.0f}ms✓"
+            elif lat < 30:
+                latency_str = f"LAT:{lat:.0f}ms"
+            else:
+                latency_str = f"LAT:{lat:.0f}ms⚠"
+        
         uptime = time.time() - getattr(self, '_start_time', time.time())
 
-        self.sub_title = (
-            f"PID:{os.getpid()} | "
-            f"CPU:{cpu:.0f}% MEM:{mem:.0f}% | "
-            f"UP:{uptime:.0f}s | HZ:{STREAM_HZ}"
-        )
+        new_sub_title = f"PID:{os.getpid()} | CPU:{cpu:.0f}% MEM:{mem:.0f}% | UP:{uptime:.0f}s | HZ:{STREAM_HZ}"
+
+        if latency_str:
+            new_sub_title += f"| {latency_str}"
+        
+        self.sub_title = (new_sub_title)
 
     def _enable_simulation_mode(self):
         """Activates simulation mode with a virtual arm."""
