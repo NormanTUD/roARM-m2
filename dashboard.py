@@ -2266,16 +2266,10 @@ class RoArmDashboard(App):
         cpu = psutil.cpu_percent()
         mem = psutil.virtual_memory().percent
 
-        port_info = "DISCONNECTED"
-        if self._arm and hasattr(self._arm, '_ser'):
-            port_info = f"{self._arm._ser.port}@{BAUDRATE}"
-        elif self._simulation_mode:
-            port_info = "SIM"
-
         uptime = time.time() - getattr(self, '_start_time', time.time())
 
         self.sub_title = (
-            f"PID:{os.getpid()} | {port_info} | "
+            f"PID:{os.getpid()} | "
             f"CPU:{cpu:.0f}% MEM:{mem:.0f}% | "
             f"UP:{uptime:.0f}s | HZ:{STREAM_HZ}"
         )
