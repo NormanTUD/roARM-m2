@@ -2461,7 +2461,7 @@ class RoArmDashboard(App):
     def _update_status_connection(self, port: str = None):
         try:
             label = self.query_one("#status-connection", Label)
-            label.update(f"🔌 {port}" if port else "🔌 Disconnected")
+            label.update(f"🔌 {port}@{BAUDRATE}" if port else "🔌 Disconnected")
         except NoMatches:
             pass
 
