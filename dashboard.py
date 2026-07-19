@@ -817,6 +817,16 @@ TabPane {
     background: black;
 }
 
+#teach-log, #play-log, #calibrate-log, #servo-log {
+    border: solid #005500;
+    background: #0a0a0a;
+}
+
+.joint-display {
+    border: solid #00aa00;
+    background: #050505;
+}
+
 Header {
     background: #003300;
     color: #00ff00;
