@@ -808,7 +808,7 @@ def _run_playback(d, waypoints: list):
             cal_model, events, is_sim)
         if d.playing:
             _do_precision_endpoint(
-                arm, trajectory, duration, cal_model, is_sim)
+                d, arm, trajectory, duration, cal_model, is_sim)
         _finalize_playback(d, arm, is_sim, cal_model, duration)
         if _is_loop_enabled(d):
             _run_loop(d, waypoints, arm, is_sim)
