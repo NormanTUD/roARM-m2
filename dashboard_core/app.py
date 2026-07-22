@@ -1022,7 +1022,8 @@ class RoArmDashboard(App):
         }
 
         if not active:
-            if now - self._last_joint_move_time < 0.3:
+            if self._joint_virtual_vel != {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}:
+                self._joint_virtual_vel = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
                 if self._is_sim and self._sim_arm:
                     self._sim_arm.move_to(
                         self._joint_target["b"], self._joint_target["s"],
@@ -1037,30 +1038,39 @@ class RoArmDashboard(App):
                     )
             return
 
-        dt = 0.02
-        spd = self._joint_speed
-
-        delta = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
+        vel = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
 
         if "w" in active:
-            delta["s"] -= spd
+            vel["s"] -= self._joint_speed
         if "s" in active:
-            delta["s"] += spd
+            vel["s"] += self._joint_speed
         if "a" in active:
-            delta["b"] -= spd
+            vel["b"] -= self._joint_speed
         if "d" in active:
-            delta["b"] += spd
+            vel["b"] += self._joint_speed
         if "x" in active:
-            delta["e"] -= spd
+            vel["e"] -= self._joint_speed
         if "c" in active:
-            delta["e"] += spd
+            vel["e"] += self._joint_speed
         if "r" in active:
-            delta["h"] -= spd
+            vel["h"] -= self._joint_speed
         if "f" in active:
-            delta["h"] += spd
+            vel["h"] += self._joint_speed
 
+        self._joint_virtual_vel = vel
+
+        dt = 0.02
         for j in ["b", "s", "e", "h"]:
-            self._joint_target[j] += delta[j]
+            self._joint_virtual_pos[j] += vel[j] * dt
+
+        self._joint_virtual_pos["e"] = max(0.0, min(180.0, self._joint_virtual_pos["e"]))
+        self._joint_virtual_pos["h"] = max(0.0, min(360.0, self._joint_virtual_pos["h"]))
+        for j in ["b", "s"]:
+            self._joint_virtual_pos[j] = max(-180.0, min(180.0, self._joint_virtual_pos[j]))
+
+        _LOOKAHEAD_S = 0.3
+        for j in ["b", "s", "e", "h"]:
+            self._joint_target[j] = self._joint_virtual_pos[j] + vel[j] * _LOOKAHEAD_S
 
         self._joint_target["e"] = max(0.0, min(180.0, self._joint_target["e"]))
         self._joint_target["h"] = max(0.0, min(360.0, self._joint_target["h"]))
@@ -1071,17 +1081,17 @@ class RoArmDashboard(App):
             self._sim_arm.move_to(
                 self._joint_target["b"], self._joint_target["s"],
                 self._joint_target["e"], self._joint_target["h"],
-                spd=50, acc=50,
+                spd=0, acc=0,
             )
         elif self._arm:
             self._arm.move_to_fast(
                 self._joint_target["b"], self._joint_target["s"],
                 self._joint_target["e"], self._joint_target["h"],
-                spd=50, acc=50,
+                spd=0, acc=0,
             )
 
         self._last_joint_move_time = now
-        pos = self._joint_target.copy()
+        pos = self._joint_virtual_pos.copy()
         self._current_pos = pos
         self._update_joint_displays(pos)
         self._update_arm_views(pos)
