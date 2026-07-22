@@ -912,10 +912,7 @@ class RoArmDashboard(App):
                 )
 
     def action_go_home(self) -> None:
-        @work(thread=True)
-        def _go_home():
-            mode_teach.go_home(self)
-        _go_home()
+        self.run_worker(lambda: mode_teach.go_home(self), thread=True)
 
     def action_read_position(self) -> None:
         arm = self._active_arm
