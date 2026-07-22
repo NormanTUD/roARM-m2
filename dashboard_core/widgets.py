@@ -26,6 +26,7 @@ class Arm3DWidget(Static):
         self._cam_azimuth = 45.0
         self._cam_elevation = 25.0
         self._cam_distance = 600.0
+        self._joint_control_active = False
 
     def on_resize(self, event) -> None:
         self._refresh_display()
@@ -46,6 +47,10 @@ class Arm3DWidget(Static):
     def rotate(self, d_azimuth: float = 0, d_elevation: float = 0):
         self._cam_azimuth = (self._cam_azimuth + d_azimuth) % 360
         self._cam_elevation = max(-80, min(80, self._cam_elevation + d_elevation))
+        self._refresh_display()
+
+    def set_joint_control_mode(self, active: bool):
+        self._joint_control_active = active
         self._refresh_display()
 
     def clear_trail(self):
@@ -188,6 +193,18 @@ class Arm3DWidget(Static):
             header.append("  \u26a0 SIMULATED (kein realer Arm)", style="bold yellow")
 
         all_lines = [header] + lines
+
+        if self._joint_control_active:
+            overlay = (
+                " [bold cyan]\u2502[/] "
+                "[bold white]W/S[/]:Base  "
+                "[bold white]A/D[/]:Shoulder  "
+                "[bold white]X/C[/]:Elbow  "
+                "[bold white]R/F[/]:Hand  "
+                "[bold white]G[/]:Gripper"
+            )
+            all_lines.append(Text(overlay))
+
         self.update(Text("\n").join(all_lines))
 
     def on_mount(self):

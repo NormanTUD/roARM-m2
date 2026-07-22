@@ -268,8 +268,8 @@ def go_home(d):
     )
     if d._is_sim:
         for _ in range(100):
-            time.sleep(0.02)
-            d._sim_arm.step_simulation(0.02)
+            time.sleep(0.01)
+            d._sim_arm.step_simulation(0.01)
             pos = d._sim_arm.read_position_deg()
             d.call_from_thread(d._update_joint_displays, pos)
             d.call_from_thread(d._update_arm_views, pos)

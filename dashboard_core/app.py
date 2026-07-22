@@ -68,13 +68,10 @@ class RoArmDashboard(App):
         Binding("space", "toggle_action", "Start/Stop", show=True),
         Binding("g", "gripper_toggle", "Gripper", show=True),
         Binding("h", "go_home", "Home", show=True),
-        Binding("a", "rotate_left", "Rot\u2190", show=False),
-        Binding("d", "rotate_right", "Rot\u2192", show=False),
-        Binding("w", "rotate_up", "Rot\u2191", show=False),
-        Binding("s", "rotate_down", "Rot\u2193", show=False),
         Binding("r", "read_position", "Read Pos", show=True),
         Binding("escape", "emergency_stop", "E-STOP", show=True, priority=True),
         Binding("l", "led_toggle", "LED", show=False),
+        Binding("j", "toggle_joint_control", "Joy Mode", show=True),
     ]
 
     connected = reactive(False)
@@ -135,6 +132,14 @@ class RoArmDashboard(App):
         self._watchdog: Optional[object] = None
         self._current_monitor: Optional[object] = None
 
+        # Joint control mode (keyboard driving)
+        self._joint_control_mode = False
+        self._key_timestamps: dict = {}
+        self._joint_ctrl_timer: Optional[Timer] = None
+        self._joint_speed = 3.0
+        self._joint_target = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
+        self._key_release_timeout = 0.12
+
     def _reset_file_viewer(self):
         try:
             file_viewer = self.query_one("#roarm-file-viewer", RoarmFileViewer)
@@ -167,6 +172,11 @@ class RoArmDashboard(App):
     def action_emergency_stop(self):
         self.playing = False
         self.recording = False
+        self._joint_control_mode = False
+        self._key_timestamps.clear()
+        if self._joint_ctrl_timer is not None:
+            self._joint_ctrl_timer.stop()
+            self._joint_ctrl_timer = None
         if self._teach_timer:
             self._teach_timer.stop()
             self._teach_timer = None
@@ -499,7 +509,7 @@ class RoArmDashboard(App):
         self._sim_arm = SimulatedArm()
         self._simulation_mode = True
 
-        self._sim_timer = self.set_interval(0.02, self._sim_step)
+        self._sim_timer = self.set_interval(0.01, self._sim_step)
 
         self._log_teach(
             "[bold cyan]\U0001f916 SIMULATION MODE[/] \u2014 Kein Roboter verbunden"
@@ -544,14 +554,13 @@ class RoArmDashboard(App):
     def _sim_step(self):
         if not self._simulation_mode or not self._sim_arm:
             return
-        self._sim_arm.step_simulation(0.02)
+        self._sim_arm.step_simulation(0.01)
 
-        if self._sim_arm.is_moving:
-            pos = self._sim_arm.read_position_deg()
-            self._current_pos = pos
-            self._update_joint_displays(pos)
-            self._update_arm_views(pos)
-            self._update_servo_readouts(pos)
+        pos = self._sim_arm.read_position_deg()
+        self._current_pos = pos
+        self._update_joint_displays(pos)
+        self._update_arm_views(pos)
+        self._update_servo_readouts(pos)
 
     def _try_auto_connect(self):
         port = find_arm_port()
@@ -589,11 +598,11 @@ class RoArmDashboard(App):
         if self.recording or self.playing:
             return
 
-        arm = self._active_arm
-        if arm is None:
+        if self._is_sim and self._sim_arm:
             return
 
-        if self._is_sim and self._sim_arm and self._sim_arm.is_moving:
+        arm = self._active_arm
+        if arm is None:
             return
 
         try:
@@ -950,6 +959,150 @@ class RoArmDashboard(App):
                 pass
 
     # ============================================================
+    # JOINT CONTROL MODE (Keyboard Driving)
+    # ============================================================
+
+    _JOINT_KEYS = {"w", "a", "s", "d", "x", "c", "r", "f"}
+
+    def on_key(self, event) -> None:
+        key = event.key
+        focused = self.focused
+        is_input_focused = isinstance(focused, Input)
+
+        if self._joint_control_mode and key in self._JOINT_KEYS and not is_input_focused:
+            event.stop()
+            self._key_timestamps[key] = time.time()
+            if self._joint_ctrl_timer is None:
+                self._joint_ctrl_timer = self.set_interval(
+                    0.05, self._joint_ctrl_step
+                )
+        elif not self._joint_control_mode and key in ("w", "a", "s", "d") and not is_input_focused:
+            if key == "w":
+                self._rotate_all_views(d_elevation=10)
+            elif key == "s":
+                self._rotate_all_views(d_elevation=-10)
+            elif key == "a":
+                self._rotate_all_views(d_azimuth=-15)
+            elif key == "d":
+                self._rotate_all_views(d_azimuth=15)
+
+    def action_toggle_joint_control(self) -> None:
+        self._joint_control_mode = not self._joint_control_mode
+        self._key_timestamps.clear()
+        if self._joint_ctrl_timer is not None:
+            self._joint_ctrl_timer.stop()
+            self._joint_ctrl_timer = None
+
+        if self._joint_control_mode:
+            self._joint_target = self._current_pos.copy()
+            self.add_class("joint-control-active")
+            self._log_teach(
+                "[bold cyan]\U0001f3ae JOINT CONTROL MODE[/] "
+                "[dim]\u2014 WASD/Base+Shoulder XC/Elbow RF/Hand[/]"
+            )
+            self._log_teach(
+                "[dim]  [j] exits | Hold keys = move | [g] gripper still works[/]"
+            )
+        else:
+            self.remove_class("joint-control-active")
+            self._log_teach("[dim]\U0001f3ae Joint control mode OFF[/]")
+
+        self._set_arm_views_joint_control(self._joint_control_mode)
+        self._update_joint_control_status()
+
+    def _joint_ctrl_step(self) -> None:
+        if not self._joint_control_mode:
+            return
+        arm = self._active_arm
+        if arm is None:
+            return
+
+        now = time.time()
+        active = {
+            k for k, t in self._key_timestamps.items()
+            if now - t < self._key_release_timeout
+        }
+
+        if not active:
+            return
+
+        dt = 0.05
+        spd = self._joint_speed
+
+        delta = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
+
+        if "w" in active:
+            delta["b"] -= spd
+        if "s" in active:
+            delta["b"] += spd
+        if "a" in active:
+            delta["s"] -= spd
+        if "d" in active:
+            delta["s"] += spd
+        if "x" in active:
+            delta["e"] -= spd
+        if "c" in active:
+            delta["e"] += spd
+        if "r" in active:
+            delta["h"] -= spd
+        if "f" in active:
+            delta["h"] += spd
+
+        for j in ["b", "s", "e", "h"]:
+            self._joint_target[j] += delta[j]
+
+        self._joint_target["e"] = max(0.0, min(180.0, self._joint_target["e"]))
+        self._joint_target["h"] = max(0.0, min(360.0, self._joint_target["h"]))
+        for j in ["b", "s"]:
+            self._joint_target[j] = max(-180.0, min(180.0, self._joint_target[j]))
+
+        if self._is_sim and self._sim_arm:
+            self._sim_arm.move_to(
+                self._joint_target["b"], self._joint_target["s"],
+                self._joint_target["e"], self._joint_target["h"],
+                spd=50, acc=30,
+            )
+        elif self._arm:
+            self._arm.move_to_fast(
+                self._joint_target["b"], self._joint_target["s"],
+                self._joint_target["e"], self._joint_target["h"],
+                spd=50, acc=30,
+            )
+
+        pos = self._joint_target.copy()
+        self._current_pos = pos
+        self._update_joint_displays(pos)
+        self._update_arm_views(pos)
+        self._update_servo_readouts(pos)
+
+    def _update_joint_control_status(self) -> None:
+        try:
+            mode_label = self.query_one("#status-mode", Label)
+            if self._joint_control_mode:
+                mode_label.update("\U0001f3ae JOY CTRL")
+            elif self.recording:
+                mode_label.update("\U0001f534 REC")
+            elif self.playing:
+                mode_label.update("\u25b6\ufe0f PLAY")
+            elif self.connected:
+                mode_label.update("\u23f1\ufe0f Ready")
+            elif self._simulation_mode:
+                mode_label.update("\U0001f916 Sim Ready")
+            else:
+                mode_label.update("\u23f1\ufe0f --")
+        except NoMatches:
+            pass
+
+    def _set_arm_views_joint_control(self, active: bool) -> None:
+        for view_id in ["teach-arm-view", "play-arm-view",
+                        "calibrate-arm-view", "servo-arm-view"]:
+            try:
+                widget = self.query_one(f"#{view_id}", Arm3DWidget)
+                widget.set_joint_control_mode(active)
+            except NoMatches:
+                pass
+
+    # ============================================================
     # TEACH MODE (wired to mode_teach)
     # ============================================================
 
@@ -1052,37 +1205,10 @@ class RoArmDashboard(App):
     # ============================================================
 
     def watch_connected(self, connected: bool) -> None:
-        try:
-            mode_label = self.query_one("#status-mode", Label)
-            if connected:
-                mode_label.update("\u23f1\ufe0f Ready")
-            elif self._simulation_mode:
-                mode_label.update("\U0001f916 Sim Ready")
-            else:
-                mode_label.update("\u23f1\ufe0f --")
-        except NoMatches:
-            pass
+        self._update_joint_control_status()
 
     def watch_recording(self, recording: bool) -> None:
-        try:
-            mode_label = self.query_one("#status-mode", Label)
-            if recording:
-                mode_label.update("\U0001f534 REC")
-            elif self.playing:
-                mode_label.update("\u25b6\ufe0f PLAY")
-            elif self.connected:
-                mode_label.update("\u23f1\ufe0f Ready")
-        except NoMatches:
-            pass
+        self._update_joint_control_status()
 
     def watch_playing(self, playing: bool) -> None:
-        try:
-            mode_label = self.query_one("#status-mode", Label)
-            if playing:
-                mode_label.update("\u25b6\ufe0f PLAY")
-            elif self.recording:
-                mode_label.update("\U0001f534 REC")
-            elif self.connected:
-                mode_label.update("\u23f1\ufe0f Ready")
-        except NoMatches:
-            pass
+        self._update_joint_control_status()

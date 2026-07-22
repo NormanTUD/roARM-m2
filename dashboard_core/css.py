@@ -223,4 +223,6 @@ RichLog {
 }
 
 .recording-active { border: heavy red; }
+
+.joint-control-active .arm-view { border: heavy cyan; }
 """
