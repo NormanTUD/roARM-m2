@@ -136,9 +136,10 @@ class RoArmDashboard(App):
         self._joint_control_mode = False
         self._key_timestamps: dict = {}
         self._joint_ctrl_timer: Optional[Timer] = None
-        self._joint_speed = 3.0
+        self._joint_speed = 1.5
         self._joint_target = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
         self._key_release_timeout = 0.12
+        self._last_joint_move_time: float = 0.0
 
     def _reset_file_viewer(self):
         try:
@@ -971,7 +972,7 @@ class RoArmDashboard(App):
             self._key_timestamps[key] = time.time()
             if self._joint_ctrl_timer is None:
                 self._joint_ctrl_timer = self.set_interval(
-                    0.05, self._joint_ctrl_step
+                    0.02, self._joint_ctrl_step
                 )
         elif not self._joint_control_mode and key in ("w", "a", "s", "d") and not is_input_focused:
             if key == "w":
@@ -1021,9 +1022,22 @@ class RoArmDashboard(App):
         }
 
         if not active:
+            if now - self._last_joint_move_time < 0.3:
+                if self._is_sim and self._sim_arm:
+                    self._sim_arm.move_to(
+                        self._joint_target["b"], self._joint_target["s"],
+                        self._joint_target["e"], self._joint_target["h"],
+                        spd=5, acc=10,
+                    )
+                elif self._arm:
+                    self._arm.move_to_fast(
+                        self._joint_target["b"], self._joint_target["s"],
+                        self._joint_target["e"], self._joint_target["h"],
+                        spd=5, acc=10,
+                    )
             return
 
-        dt = 0.05
+        dt = 0.02
         spd = self._joint_speed
 
         delta = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
@@ -1057,15 +1071,16 @@ class RoArmDashboard(App):
             self._sim_arm.move_to(
                 self._joint_target["b"], self._joint_target["s"],
                 self._joint_target["e"], self._joint_target["h"],
-                spd=50, acc=30,
+                spd=50, acc=50,
             )
         elif self._arm:
             self._arm.move_to_fast(
                 self._joint_target["b"], self._joint_target["s"],
                 self._joint_target["e"], self._joint_target["h"],
-                spd=50, acc=30,
+                spd=50, acc=50,
             )
 
+        self._last_joint_move_time = now
         pos = self._joint_target.copy()
         self._current_pos = pos
         self._update_joint_displays(pos)
