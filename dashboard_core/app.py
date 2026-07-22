@@ -1029,13 +1029,13 @@ class RoArmDashboard(App):
         delta = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
 
         if "w" in active:
-            delta["b"] -= spd
-        if "s" in active:
-            delta["b"] += spd
-        if "a" in active:
             delta["s"] -= spd
-        if "d" in active:
+        if "s" in active:
             delta["s"] += spd
+        if "a" in active:
+            delta["b"] -= spd
+        if "d" in active:
+            delta["b"] += spd
         if "x" in active:
             delta["e"] -= spd
         if "c" in active:
