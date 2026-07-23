@@ -136,9 +136,10 @@ class RoArmDashboard(App):
         self._joint_control_mode = False
         self._key_timestamps: dict = {}
         self._joint_ctrl_timer: Optional[Timer] = None
-        self._joint_speed = 1.5
+        self._joint_speed = 30.0
         self._joint_target = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
         self._joint_virtual_pos = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
+        self._joint_virtual_vel = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
         self._key_release_timeout = 0.12
         self._last_joint_move_time: float = 0.0
 
@@ -995,6 +996,7 @@ class RoArmDashboard(App):
         if self._joint_control_mode:
             self._joint_target = self._current_pos.copy()
             self._joint_virtual_pos = self._current_pos.copy()
+            self._joint_virtual_vel = {"b": 0.0, "s": 0.0, "e": 0.0, "h": 0.0}
             self.add_class("joint-control-active")
             self._log_teach(
                 "[bold cyan]\U0001f3ae JOINT CONTROL MODE[/] "
