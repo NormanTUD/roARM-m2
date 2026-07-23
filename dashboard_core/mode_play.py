@@ -595,15 +595,22 @@ def _streaming_loop(d, arm, trajectory, duration,
             corrected = _apply_calibration_static(cal_model, target)
 
             should_send = True
+            adaptive_spd = STREAM_SPD
+            adaptive_acc = STREAM_ACC
+
             if last_pos is not None:
                 max_delta = max(abs(corrected[j] - last_pos[j])
                                 for j in ["b", "s", "e", "h"])
                 if max_delta < MIN_DELTA_DEG:
-                    should_send = False
-                    skipped += 1
+                    # Instead of skipping, reduce servo speed proportionally
+                    # This keeps motion continuous (MR Ch.9: continuous velocity profile)
+                    ratio = max(max_delta / MIN_DELTA_DEG, 0.1)
+                    adaptive_spd = max(int(STREAM_SPD * ratio), 5)
+                    adaptive_acc = max(int(STREAM_ACC * ratio), 3)
+                    skipped += 1  # still count for stats, but we DO send
 
             time_since_last_send = loop_start - last_send_time
-            if should_send and time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
+            if time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
                 should_send = False
                 skipped += 1
 
@@ -622,8 +629,8 @@ def _streaming_loop(d, arm, trajectory, duration,
                         "s": round(corrected["s"], 2),
                         "e": round(corrected["e"], 2),
                         "h": round(corrected["h"], 2),
-                        "spd": STREAM_SPD,
-                        "acc": STREAM_ACC,
+                        "spd": adaptive_spd,
+                        "acc": adaptive_acc,
                     }
                     msg = json.dumps(cmd, separators=(',', ':'))
                     arm._ser.write(msg.encode() + b'\n')
