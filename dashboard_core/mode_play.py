@@ -606,54 +606,47 @@ def _streaming_loop(d, arm, trajectory, duration,
             target = trajectory.sample(sample_time)
             corrected = _apply_calibration_static(cal_model, target)
 
+            # === FIXED STREAMING LOGIC ===
+            # FIX #3, #4, #5: Always send commands at a FIXED rate.
+            # Never skip. The servo needs a constant stream of positions
+            # to maintain continuous velocity (MR Ch.9, Ch.11).
+            # The key insight: the servo's internal motion planner works
+            # best when it receives evenly-spaced position commands at a
+            # constant rate, regardless of how fast the trajectory is moving.
+
+            if commands_sent < RAMP_UP_COMMANDS:
+                ramp_progress = commands_sent / RAMP_UP_COMMANDS
+                current_lookahead = 0.05 + ramp_progress * (LOOKAHEAD_S - 0.05)
+            else:
+                current_lookahead = LOOKAHEAD_S
+
+            sample_time = min(elapsed + current_lookahead, duration)
+            target = trajectory.sample(sample_time)
+            corrected = _apply_calibration_static(cal_model, target)
+
+            # FIX #3: Always send. No skip logic. No min_interval gating.
+            # The servo needs a steady stream to maintain smooth motion.
+            # Only gate on the absolute minimum serial timing.
             should_send = True
-
-            if last_pos is not None:
-                max_delta = max(abs(corrected[j] - last_pos[j])
-                                for j in ["b", "s", "e", "h"])
-                # Only skip if delta is truly negligible AND we sent recently
-                if max_delta < 0.02:
-                    should_send = False
-                    skipped += 1
-
             time_since_last_send = loop_start - last_send_time
-            if time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
+            if time_since_last_send < 0.005:  # 5ms = serial write time
                 should_send = False
-                skipped += 1
 
             if should_send:
-                # MR Ch.11: For continuous motion, the commanded target must
-                # always be far enough ahead that the servo never plans to
-                # decelerate to zero. We enforce a MINIMUM command delta so
-                # the servo always stays in its constant-velocity phase.
-                MIN_CMD_DELTA_DEG = 0.4
-                send_target = corrected.copy()
-                
-                if last_pos is not None:
-                    max_delta = max(abs(send_target[j] - last_pos[j])
-                                    for j in ["b", "s", "e", "h"])
-                    if 0.02 < max_delta < MIN_CMD_DELTA_DEG:
-                        # Scale up the delta so the servo has enough runway
-                        # to maintain continuous velocity (MR Ch.9 Sec 9.2.2)
-                        scale = MIN_CMD_DELTA_DEG / max(max_delta, 0.001)
-                        for j in ["b", "s", "e", "h"]:
-                            delta = send_target[j] - last_pos[j]
-                            send_target[j] = last_pos[j] + delta * scale
-
                 if is_sim:
                     arm.move_to_fast(
-                        send_target["b"], send_target["s"],
-                        send_target["e"], send_target["h"],
+                        corrected["b"], corrected["s"],
+                        corrected["e"], corrected["h"],
                         spd=80, acc=50
                     )
                     d._sim_arm.step_simulation(interval)
                 else:
                     cmd = {
                         "T": 122,
-                        "b": round(send_target["b"], 2),
-                        "s": round(send_target["s"], 2),
-                        "e": round(send_target["e"], 2),
-                        "h": round(send_target["h"], 2),
+                        "b": round(corrected["b"], 2),
+                        "s": round(corrected["s"], 2),
+                        "e": round(corrected["e"], 2),
+                        "h": round(corrected["h"], 2),
                         "spd": STREAM_SPD,
                         "acc": STREAM_ACC,
                     }

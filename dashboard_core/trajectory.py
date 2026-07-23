@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.interpolate import CubicSpline
+from scipy.ndimage import uniform_filter1d
 
 from .kinematics import (
     MIN_SPEED_FACTOR, MAX_SPEED_FACTOR,
@@ -40,13 +41,22 @@ class SmoothTrajectory:
             d2 = self._splines[joint](t_original, 2)
             curvature += d2 ** 2
         curvature = np.sqrt(curvature)
-        kernel = np.ones(20) / 20
-        return np.convolve(curvature, kernel, mode='same')
+        # FIX #2: Use a much wider smoothing kernel to eliminate
+        # oscillations from densely-packed waypoints.
+        # MR Ch.9: trajectory smoothness requires continuous acceleration.
+        # A narrow kernel preserves spline oscillations; a wide one
+        # produces a smooth speed profile that won't cause judder.
+        kernel_size = max(40, len(t_original) // 10)
+        return uniform_filter1d(curvature, size=kernel_size, mode='nearest')
 
     def _curvature_to_speed_profile(self, curvature: np.ndarray) -> np.ndarray:
         max_curv = np.percentile(curvature, 95) if curvature.max() > 0 else 1.0
         norm = np.clip(curvature / max(max_curv, 1e-6), 0, 1)
-        return MAX_SPEED_FACTOR - norm * (MAX_SPEED_FACTOR - MIN_SPEED_FACTOR)
+        # FIX #2b: Don't slow down as aggressively. The servo firmware
+        # needs continuous motion to stay smooth. Going below 0.75 causes
+        # the command rate to drop too low for smooth servo interpolation.
+        effective_min = max(MIN_SPEED_FACTOR, 0.75)
+        return MAX_SPEED_FACTOR - norm * (MAX_SPEED_FACTOR - effective_min)
 
     def _apply_ramps(self, speed_profile: np.ndarray) -> np.ndarray:
         n = len(speed_profile)
@@ -67,6 +77,13 @@ class SmoothTrajectory:
         curvature = self._compute_curvature(t_original)
         speed_profile = self._curvature_to_speed_profile(curvature)
         speed_profile = self._apply_ramps(speed_profile)
+        
+        # FIX #2c: Smooth the speed profile itself to prevent rapid
+        # speed changes that cause variable command rates.
+        # MR Ch.9 Sec 9.2.2: time scaling must have continuous first derivative.
+        speed_profile = uniform_filter1d(speed_profile, size=30, mode='nearest')
+        speed_profile = np.clip(speed_profile, MIN_SPEED_FACTOR, MAX_SPEED_FACTOR)
+        
         dt = t_original[1] - t_original[0]
         dt_new = dt / (speed_profile * self._speed_factor)
         t_new = np.cumsum(dt_new)
