@@ -594,6 +594,18 @@ def _streaming_loop(d, arm, trajectory, duration,
             target = trajectory.sample(sample_time)
             corrected = _apply_calibration_static(cal_model, target)
 
+            # After computing current_lookahead, before sampling:
+            speed_at_t = trajectory.get_speed_at(elapsed)
+            if speed_at_t < 0.7:
+                # In slow (high-curvature) regions, look further ahead
+                # so each command is a meaningful move the servo can execute
+                # smoothly without restarting its motion profile
+                current_lookahead = current_lookahead + (1.0 - speed_at_t) * 0.2
+
+            sample_time = min(elapsed + current_lookahead, duration)
+            target = trajectory.sample(sample_time)
+            corrected = _apply_calibration_static(cal_model, target)
+
             should_send = True
             adaptive_spd = STREAM_SPD
             adaptive_acc = STREAM_ACC
@@ -602,17 +614,14 @@ def _streaming_loop(d, arm, trajectory, duration,
                 max_delta = max(abs(corrected[j] - last_pos[j])
                                 for j in ["b", "s", "e", "h"])
                 if max_delta < MIN_DELTA_DEG:
-                    # Instead of skipping, reduce servo speed proportionally
-                    # This keeps motion continuous (MR Ch.9: continuous velocity profile)
-                    ratio = max(max_delta / MIN_DELTA_DEG, 0.1)
-                    adaptive_spd = max(int(STREAM_SPD * ratio), 5)
-                    adaptive_acc = max(int(STREAM_ACC * ratio), 3)
-                    skipped += 1  # still count for stats, but we DO send
+                    should_send = False
+                    skipped += 1
 
             time_since_last_send = loop_start - last_send_time
             if time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
                 should_send = False
                 skipped += 1
+
 
             if should_send:
                 if is_sim:
