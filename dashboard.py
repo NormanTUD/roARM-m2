@@ -25,23 +25,23 @@ Auto-Connect wenn USB-Port gefunden.
 # ]
 # ///
 
-import os
-os.environ["TEXTUAL_RUNNING"] = "1"
+try:
+    import os
+    os.environ["TEXTUAL_RUNNING"] = "1"
 
-import sys
+    import sys
 
-from bootstrap import ensure_uv
-ensure_uv()
+    from bootstrap import ensure_uv
+    ensure_uv()
 
-from dashboard_core.app import RoArmDashboard
+    from dashboard_core.app import RoArmDashboard
 
 
-def main():
-    app = RoArmDashboard()
-    app.run()
+    def main():
+        app = RoArmDashboard()
+        app.run()
 
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(0)
+    if __name__ == "__main__":
+            main()
+except KeyboardInterrupt:
+    sys.exit(0)
