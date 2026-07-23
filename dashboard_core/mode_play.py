@@ -606,6 +606,8 @@ def _streaming_loop(d, arm, trajectory, duration,
             target = trajectory.sample(sample_time)
             corrected = _apply_calibration_static(cal_model, target)
 
+            # === REPLACE the section from "should_send = True" to the end of the loop ===
+
             should_send = True
             adaptive_spd = STREAM_SPD
             adaptive_acc = STREAM_ACC
@@ -618,10 +620,20 @@ def _streaming_loop(d, arm, trajectory, duration,
                     skipped += 1
 
             time_since_last_send = loop_start - last_send_time
-            if time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
+            # KEY FIX: In slow regions, enforce a LONGER minimum interval
+            # so the servo can complete each move without restarting its profile.
+            # MR Ch.9: trajectory must have continuous velocity - fewer, larger
+            # commands are smoother than many tiny ones that restart the profile.
+            speed_at_t = trajectory.get_speed_at(elapsed)
+            min_interval = STREAM_MIN_SEND_INTERVAL_S
+            if speed_at_t < 0.7:
+                # Scale interval inversely with speed: slower = longer between cmds
+                # At speed 0.5 (minimum), interval becomes ~60ms instead of 8ms
+                min_interval = STREAM_MIN_SEND_INTERVAL_S + (1.0 - speed_at_t) * 0.1
+            
+            if time_since_last_send < min_interval:
                 should_send = False
                 skipped += 1
-
 
             if should_send:
                 if is_sim:
