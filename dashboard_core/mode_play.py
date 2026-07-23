@@ -303,18 +303,12 @@ def _run_loop(d, waypoints: list, arm, is_sim: bool):
         d.playing = False
 
 
-def _do_precision_endpoint(d, arm, trajectory: 'SmoothTrajectory',
-                           duration: float, cal_model, is_sim: bool):
-    d.call_from_thread(d._start_activity, "Precision settle", "\U0001f3af")
+def _do_precision_endpoint(d, arm, trajectory, duration, cal_model, is_sim):
     final_target = trajectory.sample(duration)
     final_corrected = _apply_calibration_static(cal_model, final_target)
-    if is_sim:
-        _precision_endpoint_sim(d, arm, final_corrected)
-    else:
-        _precision_endpoint_real(arm, final_corrected)
-
 
 def _precision_endpoint_real(arm, final_corrected: dict):
+    time.sleep(0.3)  # Wait for servo to finish processing streaming buffer
     for spd, acc in ENDPOINT_SPEEDS:
         arm.move_to(
             final_corrected["b"], final_corrected["s"],
@@ -322,7 +316,6 @@ def _precision_endpoint_real(arm, final_corrected: dict):
             spd=spd, acc=acc
         )
         time.sleep(ENDPOINT_SETTLE_WAIT)
-
 
 def _precision_endpoint_sim(d, arm, final_corrected: dict):
     arm.move_to(
@@ -669,7 +662,7 @@ def _streaming_loop(d, arm, trajectory, duration,
     finally:
         if not is_sim:
             arm._ser.flush()
-            time.sleep(0.02)
+            time.sleep(0.15)
 
             if hasattr(arm, 'exit_streaming_mode'):
                 arm.exit_streaming_mode()
