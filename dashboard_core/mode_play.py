@@ -606,52 +606,56 @@ def _streaming_loop(d, arm, trajectory, duration,
             target = trajectory.sample(sample_time)
             corrected = _apply_calibration_static(cal_model, target)
 
-            # === REPLACE the section from "should_send = True" to the end of the loop ===
-
             should_send = True
-            adaptive_spd = STREAM_SPD
-            adaptive_acc = STREAM_ACC
 
             if last_pos is not None:
                 max_delta = max(abs(corrected[j] - last_pos[j])
                                 for j in ["b", "s", "e", "h"])
-                if max_delta < MIN_DELTA_DEG:
+                # Only skip if delta is truly negligible AND we sent recently
+                if max_delta < 0.02:
                     should_send = False
                     skipped += 1
 
             time_since_last_send = loop_start - last_send_time
-            # KEY FIX: In slow regions, enforce a LONGER minimum interval
-            # so the servo can complete each move without restarting its profile.
-            # MR Ch.9: trajectory must have continuous velocity - fewer, larger
-            # commands are smoother than many tiny ones that restart the profile.
-            speed_at_t = trajectory.get_speed_at(elapsed)
-            min_interval = STREAM_MIN_SEND_INTERVAL_S
-            if speed_at_t < 0.7:
-                # Scale interval inversely with speed: slower = longer between cmds
-                # At speed 0.5 (minimum), interval becomes ~60ms instead of 8ms
-                min_interval = STREAM_MIN_SEND_INTERVAL_S + (1.0 - speed_at_t) * 0.1
-            
-            if time_since_last_send < min_interval:
+            if time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
                 should_send = False
                 skipped += 1
 
             if should_send:
+                # MR Ch.11: For continuous motion, the commanded target must
+                # always be far enough ahead that the servo never plans to
+                # decelerate to zero. We enforce a MINIMUM command delta so
+                # the servo always stays in its constant-velocity phase.
+                MIN_CMD_DELTA_DEG = 0.4
+                send_target = corrected.copy()
+                
+                if last_pos is not None:
+                    max_delta = max(abs(send_target[j] - last_pos[j])
+                                    for j in ["b", "s", "e", "h"])
+                    if 0.02 < max_delta < MIN_CMD_DELTA_DEG:
+                        # Scale up the delta so the servo has enough runway
+                        # to maintain continuous velocity (MR Ch.9 Sec 9.2.2)
+                        scale = MIN_CMD_DELTA_DEG / max(max_delta, 0.001)
+                        for j in ["b", "s", "e", "h"]:
+                            delta = send_target[j] - last_pos[j]
+                            send_target[j] = last_pos[j] + delta * scale
+
                 if is_sim:
                     arm.move_to_fast(
-                        corrected["b"], corrected["s"],
-                        corrected["e"], corrected["h"],
+                        send_target["b"], send_target["s"],
+                        send_target["e"], send_target["h"],
                         spd=80, acc=50
                     )
                     d._sim_arm.step_simulation(interval)
                 else:
                     cmd = {
                         "T": 122,
-                        "b": round(corrected["b"], 2),
-                        "s": round(corrected["s"], 2),
-                        "e": round(corrected["e"], 2),
-                        "h": round(corrected["h"], 2),
-                        "spd": adaptive_spd,
-                        "acc": adaptive_acc,
+                        "b": round(send_target["b"], 2),
+                        "s": round(send_target["s"], 2),
+                        "e": round(send_target["e"], 2),
+                        "h": round(send_target["h"], 2),
+                        "spd": STREAM_SPD,
+                        "acc": STREAM_ACC,
                     }
                     msg = json.dumps(cmd, separators=(',', ':'))
                     arm._ser.write(msg.encode() + b'\n')
