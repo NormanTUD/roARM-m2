@@ -20,6 +20,7 @@ from .trajectory import SmoothTrajectory
 from .recording import parse_roarm_file
 from .widgets import TimelineWidget, RoarmFileViewer
 
+MIN_DELTA_DEG = 0.15
 
 def start_playback(d):
     arm = d._active_arm
@@ -597,11 +598,9 @@ def _streaming_loop(d, arm, trajectory, duration,
             if last_pos is not None:
                 max_delta = max(abs(corrected[j] - last_pos[j])
                                 for j in ["b", "s", "e", "h"])
-                if max_delta < 0.05:
+                if max_delta < MIN_DELTA_DEG:
                     should_send = False
                     skipped += 1
-                    if skipped % 4 == 0:
-                        should_send = True
 
             time_since_last_send = loop_start - last_send_time
             if should_send and time_since_last_send < STREAM_MIN_SEND_INTERVAL_S:
