@@ -309,7 +309,7 @@ def _run_calibration_worker(d, pose_set: str, repeats: int,
     _cal_repeatability_test(d, valid_poses, diagnostics)
 
     commanded, errors = _cal_run_manual_verification(
-        d._arm, commanded, errors, diagnostics
+        d, d._arm, commanded, errors, diagnostics
     )
 
     model, residuals = _cal_fit_model(d, commanded, errors, repeats)
