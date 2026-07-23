@@ -557,6 +557,7 @@ def _streaming_loop(d, arm, trajectory, duration,
             if elapsed >= duration:
                 break
 
+            # --- Event processing ---
             if event_idx < len(events) and events[event_idx]["t"] <= elapsed:
                 while event_idx < len(events) and events[event_idx]["t"] <= elapsed:
                     ev = events[event_idx]
@@ -584,49 +585,28 @@ def _streaming_loop(d, arm, trajectory, duration,
                 if elapsed >= duration:
                     break
 
+            # --- SINGLE, UNIFIED lookahead + sampling computation ---
+            # Step 1: Base lookahead (with ramp-up for first commands)
             if commands_sent < RAMP_UP_COMMANDS:
                 ramp_progress = commands_sent / RAMP_UP_COMMANDS
                 current_lookahead = 0.05 + ramp_progress * (LOOKAHEAD_S - 0.05)
             else:
                 current_lookahead = LOOKAHEAD_S
 
-            sample_time = min(elapsed + current_lookahead, duration)
-            target = trajectory.sample(sample_time)
-            corrected = _apply_calibration_static(cal_model, target)
-
-            # After computing current_lookahead, before sampling:
+            # Step 2: Speed-adaptive lookahead adjustment.
+            # In slow (high-curvature) regions, look further ahead so each
+            # command represents a meaningful position delta that the servo
+            # can execute smoothly without restarting its motion profile.
             speed_at_t = trajectory.get_speed_at(elapsed)
             if speed_at_t < 0.7:
-                # In slow (high-curvature) regions, look further ahead
-                # so each command is a meaningful move the servo can execute
-                # smoothly without restarting its motion profile
                 current_lookahead = current_lookahead + (1.0 - speed_at_t) * 0.2
 
+            # Step 3: Sample the trajectory at the computed lookahead time
             sample_time = min(elapsed + current_lookahead, duration)
             target = trajectory.sample(sample_time)
             corrected = _apply_calibration_static(cal_model, target)
 
-            # === FIXED STREAMING LOGIC ===
-            # FIX #3, #4, #5: Always send commands at a FIXED rate.
-            # Never skip. The servo needs a constant stream of positions
-            # to maintain continuous velocity (MR Ch.9, Ch.11).
-            # The key insight: the servo's internal motion planner works
-            # best when it receives evenly-spaced position commands at a
-            # constant rate, regardless of how fast the trajectory is moving.
-
-            if commands_sent < RAMP_UP_COMMANDS:
-                ramp_progress = commands_sent / RAMP_UP_COMMANDS
-                current_lookahead = 0.05 + ramp_progress * (LOOKAHEAD_S - 0.05)
-            else:
-                current_lookahead = LOOKAHEAD_S
-
-            sample_time = min(elapsed + current_lookahead, duration)
-            target = trajectory.sample(sample_time)
-            corrected = _apply_calibration_static(cal_model, target)
-
-            # FIX #3: Always send. No skip logic. No min_interval gating.
-            # The servo needs a steady stream to maintain smooth motion.
-            # Only gate on the absolute minimum serial timing.
+            # --- Send decision: only gate on minimum serial timing ---
             should_send = True
             time_since_last_send = loop_start - last_send_time
             if time_since_last_send < 0.005:  # 5ms = serial write time
@@ -707,7 +687,6 @@ def _streaming_loop(d, arm, trajectory, duration,
             f"{skipped} skipped, {total_time:.2f}s actual, "
             f"{actual_hz:.0f}Hz effective[/]"
         )
-
 
 def _finalize_playback(d, arm, is_sim, cal_model, duration):
     d.playing = False
