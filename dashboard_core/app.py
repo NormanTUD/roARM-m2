@@ -381,8 +381,8 @@ class RoArmDashboard(App):
                                     yield Button("\u23f9 Stop [Space]", id="btn-play-stop",
                                                  classes="btn-stop", variant="warning", disabled=True)
                                     yield Button("\U0001f501 Loop", id="btn-play-loop", variant="default")
-                                    yield Label("Speed:", classes="joint-label")
-                                    yield Input(value="1.0", id="play-speed-input", type="number")
+                                    yield Label("Speed (0.1\u20132.0):", classes="joint-label")
+                                    yield Input(value="0.5", id="play-speed-input", type="number")
                                     yield Label("Loop Pause (s):", classes="joint-label")
                                     yield Input(value="0", id="play-loop-pause-input", type="number")
 

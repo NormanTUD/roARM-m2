@@ -302,8 +302,7 @@ def _run_loop(d, waypoints: list, arm, is_sim: bool):
         cal_model = _load_calibration_model(d, is_sim)
         trajectory = SmoothTrajectory(waypoints, _get_play_speed(d))
         duration = trajectory.get_duration()
-        _move_to_start_position(d, arm, waypoints[0], cal_model, is_sim,
-                                   spd=WAYPOINT_STREAM_SPD, acc=WAYPOINT_STREAM_ACC)
+        _move_to_start_position(d, arm, waypoints[0], cal_model, is_sim)
         events = sorted(d._play_data.get("events", []), key=lambda x: x["t"])
         _streaming_loop(d, arm, trajectory, duration, cal_model, events, is_sim)
         if d.playing:
@@ -832,7 +831,8 @@ def _run_waypoint_loop(d, trajectory, waypoints, arm, is_sim: bool):
         d.playing = True
         cal_model = _load_calibration_model(d, is_sim)
         duration = trajectory.get_duration()
-        _move_to_start_position(d, arm, waypoints[0], cal_model, is_sim)
+        _move_to_start_position(d, arm, waypoints[0], cal_model, is_sim,
+                                spd=WAYPOINT_STREAM_SPD, acc=WAYPOINT_STREAM_ACC)
         events = sorted(
             d._play_data.get("events", []),
             key=lambda x: x["t"])
