@@ -429,14 +429,15 @@ def _lightweight_ui_update(d, pos: dict, elapsed: float):
         pass
 
 
-def _move_to_start_position(d, arm, first_wp: dict, cal_model, is_sim: bool):
+def _move_to_start_position(d, arm, first_wp: dict, cal_model, is_sim: bool,
+                           spd: int = 20, acc: int = 10):
     start_corrected = _apply_calibration_static(cal_model, first_wp)
     arm.torque_on()
     time.sleep(0.2)
     arm.move_to(
         start_corrected["b"], start_corrected["s"],
         start_corrected["e"], start_corrected["h"],
-        spd=20, acc=10
+        spd=spd, acc=acc
     )
     if is_sim:
         for _ in range(150):
@@ -835,7 +836,9 @@ def _run_waypoint_loop(d, trajectory, waypoints, arm, is_sim: bool):
             key=lambda x: x["t"])
         _streaming_loop(
             d, arm, trajectory, duration,
-            cal_model, events, is_sim)
+            cal_model, events, is_sim,
+            stream_spd=WAYPOINT_STREAM_SPD,
+            stream_acc=WAYPOINT_STREAM_ACC)
         if d.playing:
             _do_precision_endpoint(
                 d, arm, trajectory, duration, cal_model, is_sim)
