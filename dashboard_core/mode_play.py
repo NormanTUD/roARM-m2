@@ -76,8 +76,19 @@ def start_playback(d):
         pass
 
     wps = d._play_data["waypoints"]
-    if not wps or len(wps) < 4:
+    is_wp = is_waypoint_recording(d._play_data)
+
+    if not wps:
+        d._log_play("[red]Keine Wegpunkte im Recording![/]")
+        return
+
+    # Continuous recordings need >= 4 waypoints for spline interpolation.
+    # Waypoint recordings use trapezoidal profiles and only need >= 2.
+    if not is_wp and len(wps) < 4:
         d._log_play("[red]Zu wenige Wegpunkte fuer Spline![/]")
+        return
+    if is_wp and len(wps) < 2:
+        d._log_play("[red]Waypoint-Aufnahme braucht mindestens 2 Wegpunkte![/]")
         return
 
     try:
@@ -785,6 +796,22 @@ def _run_waypoint_playback(d, trajectory, waypoints: list):
             f"{len(waypoints)} WPs, {duration:.1f}s, "
             f"{len(seg_durs)} Segmente (max {max_seg:.2f}s)[/]"
         )
+
+        # Update the timeline so waypoint markers reflect actual playback time
+        # (instead of the artificial 0,1,2,... indices saved in the file).
+        if duration > 0:
+            timeline_wps = []
+            cumulative = 0.0
+            dwell = trajectory.get_dwell_s()
+            for i in range(len(waypoints)):
+                wp = dict(waypoints[i])
+                wp["t"] = cumulative
+                timeline_wps.append(wp)
+                if i < len(seg_durs):
+                    cumulative += seg_durs[i] + dwell
+            d.call_from_thread(
+                _set_timeline_waypoints, d, timeline_wps
+            )
 
         _move_to_start_position(d, arm, waypoints[0], cal_model, is_sim,
                                    spd=WAYPOINT_STREAM_SPD, acc=WAYPOINT_STREAM_ACC)
