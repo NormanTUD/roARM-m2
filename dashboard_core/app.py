@@ -67,7 +67,8 @@ class RoArmDashboard(App):
         Binding("c", "connect", "Connect", show=True),
         Binding("t", "torque_release", "Torque Off", show=True),
         Binding("T", "torque_lock", "Torque On", show=True),
-        Binding("space", "toggle_action", "Start/Stop", show=True),
+        Binding("space", "toggle_action", "Start/Capture", show=True),
+        Binding("enter", "waypoint_finish", "Save", show=True),
         Binding("g", "gripper_toggle", "Gripper", show=True),
         Binding("h", "go_home", "Home", show=True),
         Binding("r", "read_position", "Read Pos", show=True),
@@ -327,16 +328,17 @@ class RoArmDashboard(App):
                                 )
                                 yield Label(
                                     "[dim]Ablauf:[/]\n"
-                                    "  1. [b]Start[/] dr\u00fccken \u2014 "
-                                    "Torque geht aus.\n"
+                                    "  1. [b]Start[/] oder [b]Space[/] \u2014 "
+                                    "Torque geht aus, Arm ist frei.\n"
                                     "  2. Arm von Hand in Pose bringen.\n"
                                     "  3. [b]Space / Capture[/] \u2014 Torque "
                                     "pulst kurz, liest Position, Torque aus.\n"
                                     "  4. Wiederholen f\u00fcr jede Pose.\n"
-                                    "  5. [b]Stop & Save[/] speichert als "
-                                    "[cyan].roarm[/] mit "
+                                    "  5. [b]Enter[/] oder [b]Stop & Save[/] "
+                                    "\u2014 speichert als [cyan].roarm[/] mit "
                                     "[cyan]mode=waypoint[/].\n"
-                                    "  6. Im [b]Play[/]-Tab abspielen \u2014 "
+                                    "  6. [b]Discard[/] verwirft alles.\n"
+                                    "  7. Im [b]Play[/]-Tab abspielen \u2014 "
                                     "die Bewegung zwischen den Wegpunkten wird "
                                     "automatisch optimiert (Trapez-Profil).",
                                     classes="info-panel",
@@ -983,6 +985,18 @@ class RoArmDashboard(App):
                 mode_play.start_playback(self)
         elif active == "calibrate":
             mode_calibrate.start_calibration(self)
+
+    def action_waypoint_finish(self) -> None:
+        """Enter-key: stop & save the current waypoint capture session."""
+        try:
+            tabs = self.query_one(TabbedContent)
+            active = tabs.active
+        except NoMatches:
+            return
+        if active != "waypoint":
+            return
+        if self.waypoint_capturing:
+            mode_waypoint.stop_session(self)
 
     def action_led_toggle(self) -> None:
         arm = self._active_arm

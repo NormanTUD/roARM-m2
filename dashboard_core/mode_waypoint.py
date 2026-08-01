@@ -76,8 +76,8 @@ def start_session(d):
         "eines Wegpunkts.[/]"
     )
     d._log_waypoint(
-        "[dim]  Stop & Save [Space-2 / Stop-Button] | [g] Gripper | "
-        "[Esc] Verwerfen[/]"
+        "[dim]  [Enter] = Save & Stop | [Discard] = Verwerfen | "
+        "[g] Gripper | [Esc] Notfall-Stop[/]"
     )
     d._start_activity("Waypoint capture", "\U0001f3af")
     update_waypoint_status_label(d)
@@ -342,9 +342,14 @@ def update_waypoint_status_label(d):
     n = len(d._waypoints)
     if d._waypoint_capture_busy:
         msg = "[bold yellow]\u23fa Measuring\u2026[/]"
+    elif n == 0:
+        msg = (
+            "[bold cyan]\u25c6 Ready[/] "
+            "[dim]| Space = Capture | Enter = Save[/]"
+        )
     else:
         msg = (
             f"[bold cyan]\u25c6 {n} WP[/] "
-            f"[dim]| Space = Capture | Stop = Save[/]"
+            f"[dim]| Space = Capture | Enter = Save[/]"
         )
     label.update(msg)
