@@ -366,7 +366,7 @@ class RoArmDashboard(App):
                             id="waypoint-log", highlight=True, markup=True)
 
                 # --- TAB 3: PLAY ---
-                with TabPane("\u25b6\ufe0f Play [2]", id="play"):
+                with TabPane("\u25b6\ufe0f Play [3]", id="play"):
                     with Vertical(classes="tab-content"):
                         with Horizontal():
                             with Vertical():
@@ -394,8 +394,8 @@ class RoArmDashboard(App):
                             yield RichLog(id="play-log", highlight=True, markup=True)
                             yield RoarmFileViewer(id="roarm-file-viewer")
 
-                # --- TAB 3: CALIBRATE ---
-                with TabPane("\U0001f3af Calibrate [3]", id="calibrate"):
+                # --- TAB 4: CALIBRATE ---
+                with TabPane("\U0001f3af Calibrate [4]", id="calibrate"):
                     with Vertical(classes="tab-content"):
                         with Horizontal():
                             with Vertical():
@@ -442,8 +442,8 @@ class RoArmDashboard(App):
 
                         yield RichLog(id="calibrate-log", highlight=True, markup=True)
 
-                # --- TAB 4: SERVO CONTROL ---
-                with TabPane("\U0001f527 Servo [4]", id="servo"):
+                # --- TAB 5: SERVO CONTROL ---
+                with TabPane("\U0001f527 Servo [5]", id="servo"):
                     with Vertical(classes="tab-content"):
                         with Horizontal():
                             with Vertical():
