@@ -1,8 +1,8 @@
 def parse_roarm_file(filepath: str) -> dict:
-    """Parses a .roarm file including LED events."""
+    """Parses a .roarm file including LED events and waypoint-mode detection."""
     waypoints = []
     events = []
-    config = {"hz": 20, "threshold": 0.3, "gravity_comp": 1}
+    config = {"hz": 20, "threshold": 0.3, "gravity_comp": 1, "mode": "continuous"}
     start_pos = None
 
     with open(filepath, 'r') as f:
@@ -25,6 +25,9 @@ def parse_roarm_file(filepath: str) -> dict:
 
     if start_pos is None:
         start_pos = {"b": 0.0, "s": 0.0, "e": 90.0, "h": 180.0}
+
+    config["mode"] = str(config.get("mode", "continuous")).strip().lower()
+
     return {
         "waypoints": waypoints,
         "events": events,
@@ -33,11 +36,34 @@ def parse_roarm_file(filepath: str) -> dict:
     }
 
 
+def is_waypoint_recording(parsed: dict) -> bool:
+    """True if the recording was captured in waypoint mode."""
+    return parsed.get("config", {}).get("mode", "continuous") == "waypoint"
+
+
+def waypoint_poses(parsed: dict) -> list:
+    """Return waypoints as a list of pure joint poses (no timing data).
+
+    For continuous recordings, the playback timing already comes from
+    `parsed['waypoints']`; this helper strips the timestamps and returns
+    just {b,s,e,h} dicts, suitable for TrapezoidTrajectory.
+    """
+    return [
+        {"b": wp["b"], "s": wp["s"], "e": wp["e"], "h": wp["h"]}
+        for wp in parsed.get("waypoints", [])
+    ]
+
+
 def _parse_config_line(line: str, config: dict):
     parts = line.split(" ", 1)
     if len(parts) == 2:
         key, val = parts[1].split("=", 1)
-        config[key.strip()] = float(val.strip())
+        key = key.strip()
+        val = val.strip()
+        try:
+            config[key] = float(val)
+        except ValueError:
+            config[key] = val
 
 
 def _parse_start_pos_line(line: str) -> dict:

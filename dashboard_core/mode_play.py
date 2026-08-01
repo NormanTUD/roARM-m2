@@ -17,7 +17,13 @@ from .kinematics import (
     RECORDINGS_DIR,
 )
 from .trajectory import SmoothTrajectory
-from .recording import parse_roarm_file
+from .trapezoid_trajectory import TrapezoidTrajectory
+from .recording import (
+    parse_roarm_file, is_waypoint_recording, waypoint_poses,
+)
+from .kinematics import (
+    WAYPOINT_V_MAX_DEG_S, WAYPOINT_A_MAX_DEG_S2, WAYPOINT_SETTLE_S,
+)
 from .widgets import TimelineWidget, RoarmFileViewer
 
 MIN_DELTA_DEG = 0.15
@@ -704,6 +710,130 @@ def _finalize_playback(d, arm, is_sim, cal_model, duration):
         d.set_timer, 3.0, lambda: d._stop_activity())
 
 
+# ---------------------------------------------------------------
+# Waypoint-mode playback
+# ---------------------------------------------------------------
+
+def _build_waypoint_trajectory(d, waypoints: list, speed: float):
+    """Construct a TrapezoidTrajectory from a list of pure joint poses."""
+    if not waypoints or len(waypoints) < 2:
+        d.call_from_thread(
+            d._log_play,
+            "[red]Waypoint-Aufnahme braucht mindestens 2 Wegpunkte![/]"
+        )
+        return None
+    poses = waypoint_poses(d._play_data or {})
+    if len(poses) < 2:
+        d.call_from_thread(
+            d._log_play,
+            "[red]Konnte Waypoint-Posen nicht extrahieren![/]"
+        )
+        return None
+
+    v_max = WAYPOINT_V_MAX_DEG_S
+    a_max = WAYPOINT_A_MAX_DEG_S2
+    config = (d._play_data or {}).get("config", {})
+    try:
+        if config.get("v_max"):
+            v_max = float(config["v_max"])
+        if config.get("a_max"):
+            a_max = float(config["a_max"])
+        if config.get("speed"):
+            speed_factor = float(config["speed"])
+            speed = speed * speed_factor
+    except Exception:
+        pass
+
+    try:
+        return TrapezoidTrajectory(
+            poses,
+            v_max=v_max,
+            a_max=a_max,
+            speed_factor=speed,
+            dwell_s=WAYPOINT_SETTLE_S,
+        )
+    except Exception as e:
+        d.call_from_thread(
+            d._log_play, f"[red]Trajektorie ungueltig: {e}[/]")
+        return None
+
+
+def _run_waypoint_playback(d, trajectory, waypoints: list):
+    """Drive the streaming loop with a TrapezoidTrajectory."""
+    arm = d._active_arm
+    if arm is None:
+        d.playing = False
+        d.call_from_thread(lambda: _playback_finished(d))
+        return
+    is_sim = d._is_sim
+    cal_model = _load_calibration_model(d, is_sim)
+
+    try:
+        duration = trajectory.get_duration()
+        seg_durs = trajectory.get_segment_durations()
+        max_seg = max(seg_durs) if seg_durs else 0.0
+        d.call_from_thread(
+            d._log_play,
+            f"[green]\u25b6 Playback (waypoint): "
+            f"{len(waypoints)} WPs, {duration:.1f}s, "
+            f"{len(seg_durs)} Segmente (max {max_seg:.2f}s)[/]"
+        )
+
+        _move_to_start_position(d, arm, waypoints[0], cal_model, is_sim)
+        if not d.playing:
+            d.call_from_thread(lambda: _playback_finished(d))
+            return
+
+        d.call_from_thread(
+            d._start_activity,
+            f"Playing ({duration:.1f}s)", "\u25b6\ufe0f")
+        events = sorted(
+            d._play_data.get("events", []),
+            key=lambda x: x["t"])
+
+        _streaming_loop(
+            d, arm, trajectory, duration,
+            cal_model, events, is_sim)
+        if d.playing:
+            _do_precision_endpoint(
+                d, arm, trajectory, duration, cal_model, is_sim)
+        _finalize_playback(d, arm, is_sim, cal_model, duration)
+        if _is_loop_enabled(d):
+            _run_waypoint_loop(d, trajectory, waypoints, arm, is_sim)
+    except Exception as e:
+        d.playing = False
+        d.call_from_thread(
+            d._log_play, f"[bold red]Playback-Fehler: {e}[/]")
+        d.call_from_thread(lambda: _playback_finished(d))
+
+
+def _run_waypoint_loop(d, trajectory, waypoints, arm, is_sim: bool):
+    pause_s = _get_loop_pause(d)
+    while _is_loop_enabled(d) and not _arm_is_estopped(d):
+        if pause_s > 0:
+            d.call_from_thread(
+                d._log_play, f"[dim]\u23f8 Loop-Pause: {pause_s:.1f}s[/]")
+            time.sleep(pause_s)
+        try:
+            d.call_from_thread(d._reset_file_viewer)
+        except Exception:
+            pass
+        d.playing = True
+        cal_model = _load_calibration_model(d, is_sim)
+        duration = trajectory.get_duration()
+        _move_to_start_position(d, arm, waypoints[0], cal_model, is_sim)
+        events = sorted(
+            d._play_data.get("events", []),
+            key=lambda x: x["t"])
+        _streaming_loop(
+            d, arm, trajectory, duration,
+            cal_model, events, is_sim)
+        if d.playing:
+            _do_precision_endpoint(
+                d, arm, trajectory, duration, cal_model, is_sim)
+        d.playing = False
+
+
 @work(thread=True)
 def _run_playback(d, waypoints: list):
     arm = d._active_arm
@@ -715,6 +845,24 @@ def _run_playback(d, waypoints: list):
     is_sim = d._is_sim
     speed = _get_play_speed(d)
     cal_model = _load_calibration_model(d, is_sim)
+
+    is_wp = is_waypoint_recording(d._play_data or {})
+
+    if is_wp:
+        trajectory = _build_waypoint_trajectory(d, waypoints, speed)
+        if trajectory is None:
+            d.playing = False
+            d.call_from_thread(lambda: _playback_finished(d))
+            return
+
+        d.call_from_thread(
+            d._log_play,
+            f"[cyan]\u25b8 Waypoint-Modus:[/] "
+            f"{len(waypoints)} Wegpunkte, "
+            f"Trapez-Profil v_max={WAYPOINT_V_MAX_DEG_S:.0f}\u00b0/s "
+            f"a_max={WAYPOINT_A_MAX_DEG_S2:.0f}\u00b0/s\u00b2"
+        )
+        return _run_waypoint_playback(d, trajectory, waypoints)
 
     SERVO_MAX_SPEED = 50.0
 

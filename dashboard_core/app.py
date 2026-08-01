@@ -46,6 +46,7 @@ from . import mode_teach
 from . import mode_play
 from . import mode_calibrate
 from . import mode_servo
+from . import mode_waypoint
 
 
 class RoArmDashboard(App):
@@ -58,10 +59,11 @@ class RoArmDashboard(App):
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("1", "switch_tab('teach')", "Teach", show=True),
-        Binding("2", "switch_tab('play')", "Play", show=True),
-        Binding("3", "switch_tab('calibrate')", "Calibrate", show=True),
-        Binding("4", "switch_tab('servo')", "Servo", show=True),
-        Binding("5", "switch_tab('logs')", "Logs", show=True),
+        Binding("2", "switch_tab('waypoint')", "Waypoints", show=True),
+        Binding("3", "switch_tab('play')", "Play", show=True),
+        Binding("4", "switch_tab('calibrate')", "Calibrate", show=True),
+        Binding("5", "switch_tab('servo')", "Servo", show=True),
+        Binding("6", "switch_tab('logs')", "Logs", show=True),
         Binding("c", "connect", "Connect", show=True),
         Binding("t", "torque_release", "Torque Off", show=True),
         Binding("T", "torque_lock", "Torque On", show=True),
@@ -77,6 +79,7 @@ class RoArmDashboard(App):
     connected = reactive(False)
     recording = reactive(False)
     playing = reactive(False)
+    waypoint_capturing = reactive(False)
     torque_on_state = reactive(True)
 
     def __init__(self):
@@ -94,6 +97,11 @@ class RoArmDashboard(App):
         self._teach_start_time = 0.0
         self._teach_timer: Optional[Timer] = None
         self._gripper_open = True
+
+        # Waypoint capture state
+        self._waypoints: list = []
+        self._waypoint_start_pos: Optional[dict] = None
+        self._waypoint_capture_busy = False
 
         # Play state
         self._play_data = None
@@ -175,6 +183,7 @@ class RoArmDashboard(App):
     def action_emergency_stop(self):
         self.playing = False
         self.recording = False
+        self.waypoint_capturing = False
         self._joint_control_mode = False
         self._key_timestamps.clear()
         if self._joint_ctrl_timer is not None:
@@ -188,11 +197,15 @@ class RoArmDashboard(App):
         self._stop_activity("\U0001f6a8 E-STOP")
         self._stop_recording_timer()
         self._log_teach("[bold red]\U0001f6a8 EMERGENCY STOP[/]")
+        self._log_waypoint("[bold red]\U0001f6a8 EMERGENCY STOP[/]")
         try:
             self.query_one("#btn-teach-record", Button).disabled = False
             self.query_one("#btn-teach-stop", Button).disabled = True
             self.query_one("#btn-play-start", Button).disabled = False
             self.query_one("#btn-play-stop", Button).disabled = True
+            self.query_one("#btn-waypoint-start", Button).disabled = False
+            self.query_one("#btn-waypoint-stop", Button).disabled = True
+            self.query_one("#btn-waypoint-capture", Button).disabled = True
         except NoMatches:
             pass
 
@@ -269,7 +282,88 @@ class RoArmDashboard(App):
 
                         yield RichLog(id="teach-log", highlight=True, markup=True)
 
-                # --- TAB 2: PLAY ---
+                # --- TAB 2: WAYPOINT CAPTURE ---
+                with TabPane("\U0001f3af Waypoints [2]", id="waypoint"):
+                    with Vertical(classes="tab-content"):
+                        with Horizontal():
+                            with Vertical(id="waypoint-left"):
+                                yield Arm3DWidget(
+                                    id="waypoint-arm-view",
+                                    classes="arm-view"
+                                )
+                                with Horizontal(classes="control-buttons"):
+                                    yield Button(
+                                        "\u25b6 Start [Space]",
+                                        id="btn-waypoint-start",
+                                        classes="btn-record",
+                                        variant="error",
+                                    )
+                                    yield Button(
+                                        "\u23f9 Stop & Save",
+                                        id="btn-waypoint-stop",
+                                        classes="btn-stop",
+                                        variant="warning",
+                                        disabled=True,
+                                    )
+                                    yield Button(
+                                        "\U0001f4cf Capture [Space]",
+                                        id="btn-waypoint-capture",
+                                        variant="success",
+                                        disabled=True,
+                                    )
+                                    yield Button(
+                                        "\u2716 Discard",
+                                        id="btn-waypoint-discard",
+                                        variant="default",
+                                    )
+                                    yield Button(
+                                        "\U0001f3e0 Home [h]",
+                                        id="btn-waypoint-home",
+                                        variant="default",
+                                    )
+                                yield Static(
+                                    "", id="waypoint-status",
+                                    classes="recording-timer"
+                                )
+                                yield Label(
+                                    "[dim]Ablauf:[/]\n"
+                                    "  1. [b]Start[/] dr\u00fccken \u2014 "
+                                    "Torque geht aus.\n"
+                                    "  2. Arm von Hand in Pose bringen.\n"
+                                    "  3. [b]Space / Capture[/] \u2014 Torque "
+                                    "pulst kurz, liest Position, Torque aus.\n"
+                                    "  4. Wiederholen f\u00fcr jede Pose.\n"
+                                    "  5. [b]Stop & Save[/] speichert als "
+                                    "[cyan].roarm[/] mit "
+                                    "[cyan]mode=waypoint[/].\n"
+                                    "  6. Im [b]Play[/]-Tab abspielen \u2014 "
+                                    "die Bewegung zwischen den Wegpunkten wird "
+                                    "automatisch optimiert (Trapez-Profil).",
+                                    classes="info-panel",
+                                )
+
+                            with Vertical(id="waypoint-right"):
+                                yield JointSparklineWidget(
+                                    "b", id="waypoint-joint-b",
+                                    classes="joint-display"
+                                )
+                                yield JointSparklineWidget(
+                                    "s", id="waypoint-joint-s",
+                                    classes="joint-display"
+                                )
+                                yield JointSparklineWidget(
+                                    "e", id="waypoint-joint-e",
+                                    classes="joint-display"
+                                )
+                                yield JointSparklineWidget(
+                                    "h", id="waypoint-joint-h",
+                                    classes="joint-display"
+                                )
+
+                        yield RichLog(
+                            id="waypoint-log", highlight=True, markup=True)
+
+                # --- TAB 3: PLAY ---
                 with TabPane("\u25b6\ufe0f Play [2]", id="play"):
                     with Vertical(classes="tab-content"):
                         with Horizontal():
@@ -661,6 +755,12 @@ class RoArmDashboard(App):
         except NoMatches:
             pass
 
+    def _log_waypoint(self, msg: str):
+        try:
+            self.query_one("#waypoint-log", RichLog).write(msg)
+        except NoMatches:
+            pass
+
     def _log_calibrate(self, msg: str):
         try:
             self.query_one("#calibrate-log", RichLog).write(msg)
@@ -704,7 +804,8 @@ class RoArmDashboard(App):
 
     def _update_arm_views(self, pos: dict):
         for view_id in ["teach-arm-view", "play-arm-view",
-                        "calibrate-arm-view", "servo-arm-view"]:
+                        "calibrate-arm-view", "servo-arm-view",
+                        "waypoint-arm-view"]:
             try:
                 widget = self.query_one(f"#{view_id}", Arm3DWidget)
                 widget.update_pose(pos["b"], pos["s"], pos["e"])
@@ -868,6 +969,13 @@ class RoArmDashboard(App):
                 mode_teach.stop_recording(self)
             else:
                 mode_teach.start_recording(self)
+        elif active == "waypoint":
+            if not self.waypoint_capturing:
+                mode_waypoint.start_session(self)
+            elif self._waypoint_capture_busy:
+                return
+            else:
+                mode_waypoint.capture_waypoint(self)
         elif active == "play":
             if self.playing:
                 mode_play.stop_playback(self)
@@ -1108,6 +1216,8 @@ class RoArmDashboard(App):
                 mode_label.update("\U0001f3ae JOY CTRL")
             elif self.recording:
                 mode_label.update("\U0001f534 REC")
+            elif self.waypoint_capturing:
+                mode_label.update("\U0001f3af WP CAP")
             elif self.playing:
                 mode_label.update("\u25b6\ufe0f PLAY")
             elif self.connected:
@@ -1121,7 +1231,8 @@ class RoArmDashboard(App):
 
     def _set_arm_views_joint_control(self, active: bool) -> None:
         for view_id in ["teach-arm-view", "play-arm-view",
-                        "calibrate-arm-view", "servo-arm-view"]:
+                        "calibrate-arm-view", "servo-arm-view",
+                        "waypoint-arm-view"]:
             try:
                 widget = self.query_one(f"#{view_id}", Arm3DWidget)
                 widget.set_joint_control_mode(active)
@@ -1147,6 +1258,30 @@ class RoArmDashboard(App):
     @on(Button.Pressed, "#btn-gripper")
     def on_gripper_press(self) -> None:
         self.action_gripper_toggle()
+
+    # ============================================================
+    # WAYPOINT MODE (wired to mode_waypoint)
+    # ============================================================
+
+    @on(Button.Pressed, "#btn-waypoint-start")
+    def on_waypoint_start(self) -> None:
+        mode_waypoint.start_session(self)
+
+    @on(Button.Pressed, "#btn-waypoint-stop")
+    def on_waypoint_stop(self) -> None:
+        mode_waypoint.stop_session(self)
+
+    @on(Button.Pressed, "#btn-waypoint-capture")
+    def on_waypoint_capture(self) -> None:
+        mode_waypoint.capture_waypoint(self)
+
+    @on(Button.Pressed, "#btn-waypoint-discard")
+    def on_waypoint_discard(self) -> None:
+        mode_waypoint.cancel_session(self)
+
+    @on(Button.Pressed, "#btn-waypoint-home")
+    def on_waypoint_home(self) -> None:
+        self.action_go_home()
 
     # ============================================================
     # PLAY MODE (wired to mode_play)
@@ -1238,3 +1373,10 @@ class RoArmDashboard(App):
 
     def watch_playing(self, playing: bool) -> None:
         self._update_joint_control_status()
+
+    def watch_waypoint_capturing(self, capturing: bool) -> None:
+        self._update_joint_control_status()
+        if capturing:
+            mode_waypoint.update_waypoint_status_label(self)
+        else:
+            mode_waypoint.update_waypoint_status_label(self)

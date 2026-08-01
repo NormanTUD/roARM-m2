@@ -59,6 +59,31 @@ RECORD_HZ = 50
 MOVE_THRESHOLD_DEG = 0.3
 STREAM_HZ = 100
 
+# ============================================================
+# WAYPOINT CAPTURE / PLAYBACK
+# ============================================================
+
+# How long torque is enabled for the gravity-compensated position read
+# when the user presses Space in waypoint capture mode.
+WAYPOINT_TORQUE_PULSE_S = 0.25
+
+# Settle time after torque-on before reading the position.
+WAYPOINT_CAPTURE_SETTLE_S = 0.10
+
+# Default trapezoidal motion profile limits for waypoint playback.
+# v_max = peak joint velocity (deg/s), a_max = peak joint acceleration (deg/s^2).
+# The dominant joint determines segment duration; smaller joints are stretched
+# to the same duration so all joints arrive simultaneously.
+WAYPOINT_V_MAX_DEG_S = 90.0
+WAYPOINT_A_MAX_DEG_S2 = 220.0
+
+# Pause at each captured waypoint so the arm has time to settle before
+# the next motion command stream starts.
+WAYPOINT_SETTLE_S = 0.35
+
+# User-settable playback speed (multiplier on the default v_max).
+WAYPOINT_DEFAULT_SPEED = 1.0
+
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
