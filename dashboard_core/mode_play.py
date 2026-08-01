@@ -154,6 +154,15 @@ def _apply_calibration_static(cal_model, target: dict) -> dict:
     }
 
 
+def _set_timeline_waypoints(d, waypoints: list):
+    """Update the playback timeline widget with properly-timed waypoints."""
+    try:
+        timeline = d.query_one("#play-timeline", TimelineWidget)
+        timeline.set_recording(waypoints, d._play_data.get("gripper_cmds"))
+    except NoMatches:
+        pass
+
+
 def _show_calibration_info(d):
     cal_path = Path("calibration") / "roarm_calibration.cal"
     if not cal_path.exists():
