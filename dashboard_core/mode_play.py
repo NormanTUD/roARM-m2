@@ -799,12 +799,20 @@ def _run_waypoint_playback(d, trajectory, waypoints: list):
         duration = trajectory.get_duration()
         seg_durs = trajectory.get_segment_durations()
         max_seg = max(seg_durs) if seg_durs else 0.0
+        speed = _get_play_speed(d)
         d.call_from_thread(
             d._log_play,
             f"[green]\u25b6 Playback (waypoint): "
             f"{len(waypoints)} WPs, {duration:.1f}s, "
-            f"{len(seg_durs)} Segmente (max {max_seg:.2f}s)[/]"
+            f"{len(seg_durs)} Segmente (max {max_seg:.2f}s), "
+            f"speed={speed:.2f}x[/]"
         )
+        if speed > 1.0:
+            d.call_from_thread(
+                d._log_play,
+                f"[yellow]\u26a0 Hoher Speed-Faktor ({speed:.2f}x) \u2014 "
+                f"Arm kann schnell/straff werden![/]"
+            )
 
         # Update the timeline so waypoint markers reflect actual playback time
         # (instead of the artificial 0,1,2,... indices saved in the file).
