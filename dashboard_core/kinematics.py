@@ -71,18 +71,24 @@ WAYPOINT_TORQUE_PULSE_S = 0.25
 WAYPOINT_CAPTURE_SETTLE_S = 0.10
 
 # Default trapezoidal motion profile limits for waypoint playback.
-# v_max = peak joint velocity (deg/s), a_max = peak joint acceleration (deg/s^2).
-# The dominant joint determines segment duration; smaller joints are stretched
-# to the same duration so all joints arrive simultaneously.
-WAYPOINT_V_MAX_DEG_S = 90.0
-WAYPOINT_A_MAX_DEG_S2 = 220.0
+# Conservative defaults: smooth and gentle motion suitable for putting the
+# gripper near fragile objects without overshoot. Increase via the speed
+# multiplier in the play tab if you need to go faster.
+WAYPOINT_V_MAX_DEG_S = 40.0
+WAYPOINT_A_MAX_DEG_S2 = 90.0
+
+# Servo-side speed/acceleration used during waypoint streaming.
+# Much lower than STREAM_SPD/STREAM_ACC (50/30) so the servo doesn't
+# apply its own aggressive profile on top of our trapezoid target.
+WAYPOINT_STREAM_SPD = 15
+WAYPOINT_STREAM_ACC = 8
 
 # Pause at each captured waypoint so the arm has time to settle before
 # the next motion command stream starts.
-WAYPOINT_SETTLE_S = 0.35
+WAYPOINT_SETTLE_S = 0.5
 
 # User-settable playback speed (multiplier on the default v_max).
-WAYPOINT_DEFAULT_SPEED = 1.0
+WAYPOINT_DEFAULT_SPEED = 0.7
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(parents=True, exist_ok=True)

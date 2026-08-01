@@ -23,6 +23,7 @@ from .recording import (
 )
 from .kinematics import (
     WAYPOINT_V_MAX_DEG_S, WAYPOINT_A_MAX_DEG_S2, WAYPOINT_SETTLE_S,
+    WAYPOINT_STREAM_SPD, WAYPOINT_STREAM_ACC,
 )
 from .widgets import TimelineWidget, RoarmFileViewer
 
@@ -499,7 +500,12 @@ def _playback_finished(d):
 
 
 def _streaming_loop(d, arm, trajectory, duration,
-                    cal_model, events, is_sim):
+                    cal_model, events, is_sim,
+                    stream_spd: int = None, stream_acc: int = None):
+    if stream_spd is None:
+        stream_spd = STREAM_SPD
+    if stream_acc is None:
+        stream_acc = STREAM_ACC
     interval = 1.0 / STREAM_HZ
 
     if not is_sim and hasattr(arm, 'enter_streaming_mode'):
@@ -537,8 +543,8 @@ def _streaming_loop(d, arm, trajectory, duration,
                 "s": round(pre_corrected["s"], 2),
                 "e": round(pre_corrected["e"], 2),
                 "h": round(pre_corrected["h"], 2),
-                "spd": STREAM_SPD,
-                "acc": STREAM_ACC,
+                "spd": stream_spd,
+                "acc": stream_acc,
             }
             msg = json.dumps(cmd, separators=(',', ':'))
             arm._ser.write(msg.encode() + b'\n')
@@ -626,8 +632,8 @@ def _streaming_loop(d, arm, trajectory, duration,
                         "s": round(corrected["s"], 2),
                         "e": round(corrected["e"], 2),
                         "h": round(corrected["h"], 2),
-                        "spd": STREAM_SPD,
-                        "acc": STREAM_ACC,
+                        "spd": stream_spd,
+                        "acc": stream_acc,
                     }
                     msg = json.dumps(cmd, separators=(',', ':'))
                     arm._ser.write(msg.encode() + b'\n')
@@ -793,7 +799,9 @@ def _run_waypoint_playback(d, trajectory, waypoints: list):
 
         _streaming_loop(
             d, arm, trajectory, duration,
-            cal_model, events, is_sim)
+            cal_model, events, is_sim,
+            stream_spd=WAYPOINT_STREAM_SPD,
+            stream_acc=WAYPOINT_STREAM_ACC)
         if d.playing:
             _do_precision_endpoint(
                 d, arm, trajectory, duration, cal_model, is_sim)
